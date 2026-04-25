@@ -1,7 +1,7 @@
 <div align="center">
 
 
-<img src="https://github.com/Ars1027/astrbot_plugin_twitter/blob/master/logo.png" width="128" alt="icon">
+<img src="https://github.com/Ars1027/astrbot_plugin_twitter/blob/master/logo.png" width="256" alt="icon">
 
 # Twitter 推文转发插件
 
