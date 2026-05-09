@@ -39,12 +39,32 @@
         "type": "bool",
         "default": false
       },
+      "twitter_text_render_mode": {
+        "description": "推文正文渲染方式",
+        "type": "string",
+        "default": "text",
+        "options": ["text", "screenshot"],
+        "hint": "text=普通文字推送；screenshot=使用 AstrBot html_render 渲染 X 官方暗色时间线风格截图"
+      },
+      "twitter_screenshot_theme": {
+        "description": "截图模式主题",
+        "type": "string",
+        "default": "dark",
+        "options": ["dark", "light"],
+        "hint": "dark=黑色背景 X 风格；light=白色背景 X 风格，仅在截图模式下生效"
+      },
       "twitter_image_quality": {
         "description": "推文图片质量",
         "type": "string",
         "default": "orig",
         "options": ["large", "orig"],
         "hint": "large=缩略图，orig=原图（默认）"
+      },
+      "twitter_video_max_size_mb": {
+        "description": "视频直发大小上限（MB）",
+        "type": "int",
+        "default": 256,
+        "hint": "发送视频前会探测文件大小；超过上限时改为发送说明和视频链接。默认=256"
       },
       "twitter_collective_forward": {
         "description": "推文集体转发（将多个推主的推文合并到一条转发消息中）",

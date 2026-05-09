@@ -1,0 +1,395 @@
+<!doctype html>
+<html class="theme-{{ theme|default('dark') }}">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=760, initial-scale=1">
+    <style>
+    {% set render_scale = render_scale|default(1) %}
+    * { box-sizing: border-box; }
+    html.theme-dark {
+      --bg: #000;
+      --text: #e7e9ea;
+      --muted: #71767b;
+      --border: #2f3336;
+      --surface: #16181c;
+      --media-bg: #16181c;
+      --brand: #1d9bf0;
+    }
+    html.theme-light {
+      --bg: #fff;
+      --text: #0f1419;
+      --muted: #536471;
+      --border: #cfd9de;
+      --surface: #eff3f4;
+      --media-bg: #f7f9f9;
+      --brand: #1d9bf0;
+    }
+    html {
+      width: calc(760px * {{ render_scale }});
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      overflow: hidden;
+    }
+    body {
+      width: calc(760px * {{ render_scale }});
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
+    }
+    .shot {
+      width: 760px;
+      zoom: {{ render_scale }};
+      background: var(--bg);
+      border: 1px solid var(--border);
+      padding: 10px 10px 8px;
+      overflow: hidden;
+    }
+    .retweet-line {
+      margin: 0 0 4px 38px;
+      color: var(--muted);
+      font-size: 15px;
+      font-weight: 700;
+      line-height: 22px;
+    }
+    .retweet-mark {
+      display: inline-block;
+      width: 22px;
+      color: var(--muted);
+      font-size: 18px;
+      text-align: center;
+      vertical-align: -1px;
+    }
+    .tweet {
+      display: grid;
+      grid-template-columns: 56px minmax(0, 1fr);
+      gap: 12px;
+      padding-bottom: 12px;
+    }
+    .avatar {
+      width: 48px;
+      height: 48px;
+      border-radius: 999px;
+      object-fit: cover;
+      background: var(--surface);
+      display: block;
+    }
+    .avatar-fallback {
+      width: 48px;
+      height: 48px;
+      border-radius: 999px;
+      background: var(--brand);
+      display: grid;
+      place-items: center;
+      color: #fff;
+      font-weight: 800;
+      font-size: 24px;
+    }
+    .tweet-main { min-width: 0; }
+    .tweet-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 24px;
+    }
+    .author-line {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+      font-size: 18px;
+      line-height: 24px;
+      white-space: nowrap;
+    }
+    .name {
+      color: var(--text);
+      font-weight: 800;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 290px;
+    }
+    .verified {
+      flex: 0 0 auto;
+      margin: 0 4px;
+      width: 18px;
+      height: 18px;
+      border-radius: 999px;
+      background: var(--brand);
+      color: #fff;
+      display: inline-grid;
+      place-items: center;
+      font-size: 12px;
+      font-weight: 900;
+      line-height: 18px;
+    }
+    .handle, .date, .dot {
+      color: var(--muted);
+      font-size: 18px;
+      font-weight: 400;
+    }
+    .handle {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 190px;
+    }
+    .tools {
+      color: var(--muted);
+      font-size: 22px;
+      letter-spacing: 2px;
+      flex: 0 0 auto;
+      line-height: 24px;
+    }
+    .tweet-text {
+      margin-top: 2px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      color: var(--text);
+      font-size: 20px;
+      line-height: 1.35;
+    }
+    .translation-note {
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 15px;
+      line-height: 1.4;
+    }
+    .media-grid {
+      margin-top: 12px;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      overflow: hidden;
+      background: var(--border);
+    }
+    .media-grid.one { display: block; }
+    .media-grid.two,
+    .media-grid.three,
+    .media-grid.four {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 2px;
+    }
+    .media {
+      position: relative;
+      background: var(--media-bg);
+      overflow: hidden;
+    }
+    .media img {
+      width: 100%;
+      height: auto;
+      display: block;
+      object-fit: contain;
+    }
+    .media-grid.two .media,
+    .media-grid.three .media,
+    .media-grid.four .media {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .video-overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0, 0, 0, 0.06);
+    }
+    .play {
+      width: 64px;
+      height: 64px;
+      border-radius: 999px;
+      background: rgba(29, 155, 240, 0.92);
+      color: #fff;
+      display: grid;
+      place-items: center;
+      font-size: 30px;
+      padding-left: 4px;
+    }
+    .duration {
+      position: absolute;
+      left: 12px;
+      bottom: 10px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      background: rgba(0, 0, 0, 0.72);
+      color: #fff;
+      font-size: 14px;
+      line-height: 20px;
+    }
+    .video-placeholder {
+      min-height: 250px;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      font-size: 18px;
+      font-weight: 700;
+    }
+    .quote-card {
+      margin-top: 14px;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      overflow: hidden;
+      background: var(--bg);
+    }
+    .quote-body { padding: 12px 14px; }
+    .quote-author {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+      font-size: 16px;
+      line-height: 22px;
+      white-space: nowrap;
+    }
+    .quote-avatar {
+      width: 24px;
+      height: 24px;
+      border-radius: 999px;
+      object-fit: cover;
+      background: var(--surface);
+      flex: 0 0 auto;
+    }
+    .quote-name {
+      font-weight: 800;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 220px;
+    }
+    .quote-handle, .quote-date, .quote-dot {
+      color: var(--muted);
+      font-weight: 400;
+    }
+    .quote-text {
+      margin-top: 8px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-size: 18px;
+      line-height: 1.32;
+    }
+    .quote-card .media-grid {
+      margin-top: 12px;
+      border: 0;
+      border-top: 1px solid var(--border);
+      border-radius: 0;
+    }
+    .actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 16px;
+      line-height: 24px;
+      max-width: 620px;
+    }
+    .action {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+      white-space: nowrap;
+    }
+    .action-label {
+      color: var(--muted);
+      font-weight: 700;
+      margin-right: 4px;
+    }
+    .action-count {
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <div class="shot">
+    {% if tweet.retweet_label %}
+      <div class="retweet-line"><span class="retweet-mark">&#x21bb;</span>{{ tweet.retweet_label|e }}</div>
+    {% endif %}
+    <article class="tweet">
+      <aside>
+        {% if tweet.avatar %}
+          <img class="avatar" src="{{ tweet.avatar|e }}" alt="">
+        {% else %}
+          <div class="avatar-fallback">@</div>
+        {% endif %}
+      </aside>
+      <main class="tweet-main">
+        <div class="tweet-top">
+          <div class="author-line">
+            <span class="name">{{ tweet.name|e }}</span>
+            {% if tweet.verified %}<span class="verified">&#x2713;</span>{% endif %}
+            <span class="handle">@{{ tweet.username|e }}</span>
+            {% if tweet.date %}<span class="dot"> &middot; </span><span class="date">{{ tweet.date|e }}</span>{% endif %}
+          </div>
+          <div class="tools">&#x25cc; &middot;&middot;&middot;</div>
+        </div>
+
+        {% if tweet.text %}
+          <div class="tweet-text">{{ tweet.text|e }}</div>
+        {% endif %}
+        {% if tweet.translation_note %}
+          <div class="translation-note">({{ tweet.translation_note|e }})</div>
+        {% endif %}
+
+        {% if tweet.quote %}
+          <section class="quote-card">
+            <div class="quote-body">
+              <div class="quote-author">
+                {% if tweet.quote.avatar %}<img class="quote-avatar" src="{{ tweet.quote.avatar|e }}" alt="">{% endif %}
+                <span class="quote-name">{{ tweet.quote.name|e }}</span>
+                {% if tweet.quote.verified %}<span class="verified">&#x2713;</span>{% endif %}
+                {% if tweet.quote.username %}<span class="quote-handle">@{{ tweet.quote.username|e }}</span>{% endif %}
+                {% if tweet.quote.date %}<span class="quote-dot"> &middot; </span><span class="quote-date">{{ tweet.quote.date|e }}</span>{% endif %}
+              </div>
+              {% if tweet.quote.text %}<div class="quote-text">{{ tweet.quote.text|e }}</div>{% endif %}
+            </div>
+            {% if tweet.quote.media %}
+              <div class="media-grid {{ tweet.quote.media_class }}">
+                {% for item in tweet.quote.media %}
+                  <div class="media">
+                    {% if item.url %}
+                      <img src="{{ item.url|e }}" alt="">
+                    {% else %}
+                      <div class="video-placeholder">VIDEO</div>
+                    {% endif %}
+                    {% if item.kind == "video" %}
+                      <div class="video-overlay"><div class="play">&#x25b6;</div>{% if item.duration %}<div class="duration">{{ item.duration|e }}</div>{% endif %}</div>
+                    {% endif %}
+                  </div>
+                {% endfor %}
+              </div>
+            {% endif %}
+          </section>
+        {% endif %}
+
+        {% if tweet.media %}
+          <div class="media-grid {{ tweet.media_class }}">
+            {% for item in tweet.media %}
+              <div class="media">
+                {% if item.url %}
+                  <img src="{{ item.url|e }}" alt="">
+                {% else %}
+                  <div class="video-placeholder">VIDEO</div>
+                {% endif %}
+                {% if item.kind == "video" %}
+                  <div class="video-overlay"><div class="play">&#x25b6;</div>{% if item.duration %}<div class="duration">{{ item.duration|e }}</div>{% endif %}</div>
+                {% endif %}
+              </div>
+            {% endfor %}
+          </div>
+        {% endif %}
+
+        <div class="actions">
+          {% for action in tweet.actions %}
+            <div class="action"><span class="action-label">{{ action.label|e }}</span><span class="action-count">{{ action.count|e }}</span></div>
+          {% endfor %}
+        </div>
+      </main>
+    </article>
+  </div>
+</body>
+</html>

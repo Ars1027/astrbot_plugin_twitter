@@ -45,6 +45,11 @@ from astrbot.api.star import Context, Star
 import astrbot.api.message_components as Comp
 
 from .twitter_api import TwitterAPI, WEBSITE_LIST, get_next_website
+from .twitter_renderer import (
+    build_tweet_card_context,
+    load_tweet_card_template,
+    tweet_card_render_options,
+)
 
 # Twitter/X 链接正则
 TWITTER_LINK_PATTERN = re.compile(
@@ -116,6 +121,42 @@ class TwitterPlugin(Star):
                 True,
                 "twitter_retweet_include_link",
             )
+        )
+        self.text_render_mode = str(
+            self._cfg(
+                "message_format",
+                "twitter_text_render_mode",
+                "text",
+            )
+            or "text"
+        ).strip().lower()
+        if self.text_render_mode not in ("text", "screenshot"):
+            logger.warning(
+                f"未知推文文本渲染模式: {self.text_render_mode}，已回退为 text"
+            )
+            self.text_render_mode = "text"
+        self.screenshot_theme = str(
+            self._cfg(
+                "message_format",
+                "twitter_screenshot_theme",
+                "dark",
+            )
+            or "dark"
+        ).strip().lower()
+        if self.screenshot_theme not in ("dark", "light"):
+            logger.warning(
+                f"未知截图主题: {self.screenshot_theme}，已回退为 dark"
+            )
+            self.screenshot_theme = "dark"
+        self.video_max_size_mb = max(
+            1,
+            int(
+                self._cfg(
+                    "message_format",
+                    "twitter_video_max_size_mb",
+                    256,
+                )
+            ),
         )
         self.collective_max_authors = max(
             1,
@@ -224,11 +265,11 @@ class TwitterPlugin(Star):
     def _build_nickname(username: str, screen_name: str) -> str:
         """构建推主昵称显示
 
-        Args:
+        参数:
             username: 推主用户名（如 elonmusk）
             screen_name: 显示昵称（如 Elon Musk）
 
-        Returns:
+        返回:
             格式化后的昵称，如 "@elonmusk (Elon Musk)" 或 "@elonmusk"
         """
         nickname = f"@{username}"
@@ -265,7 +306,36 @@ class TwitterPlugin(Star):
         quote = tweet_info.get("quote") or {}
         return bool(quote.get("images") or quote.get("videos"))
 
-    def _append_media_components(
+    @staticmethod
+    def _is_stream_video_url(video_url: str) -> bool:
+        """判断视频 URL 是否为流媒体清单类资源。"""
+        url = str(video_url or "").lower()
+        return ".m3u8" in url or "vmap" in url
+
+    def _video_limit_message(self, video_url: str, size_bytes: int | None = None) -> str:
+        """构建超限视频降级为链接时展示给用户的文本。"""
+        size_note = ""
+        if size_bytes:
+            size_mb = size_bytes / 1024 / 1024
+            size_note = f"（约 {size_mb:.1f} MB）"
+        return (
+            f"\n视频大小超过 {self.video_max_size_mb} MB{size_note}，"
+            f"已改为发送链接：{video_url}"
+        )
+
+    async def _video_exceeds_size_limit(self, video_url: str) -> tuple[bool, int | None]:
+        """尽量检查视频大小；未知大小和流媒体 URL 默认放行。"""
+        if self._is_stream_video_url(video_url):
+            return False, None
+
+        size_bytes = await self.twitter_api.get_remote_file_size(video_url)
+        if size_bytes is None:
+            return False, None
+
+        limit_bytes = self.video_max_size_mb * 1024 * 1024
+        return size_bytes > limit_bytes, size_bytes
+
+    async def _append_media_components(
         self, chain: list, images: list, videos: list, context_label: str = "推文"
     ):
         """把图片和视频追加到消息链，供主贴和引用帖复用。"""
@@ -278,26 +348,35 @@ class TwitterPlugin(Star):
                 logger.warning(f"添加{context_label}图片失败: {img_url}, {e}")
 
         for v_url in videos:
+            video_url = str(v_url)
             try:
-                video_comp = Comp.Video.fromURL(str(v_url))
+                exceeds_limit, size_bytes = await self._video_exceeds_size_limit(video_url)
+                if exceeds_limit:
+                    logger.warning(
+                        f"{context_label}视频超过大小限制，已改为链接: {video_url}"
+                    )
+                    chain.append(Comp.Plain(str(self._video_limit_message(video_url, size_bytes))))
+                    continue
+
+                video_comp = Comp.Video.fromURL(video_url)
                 if video_comp is not None:
                     chain.append(video_comp)
             except Exception as e:
                 logger.warning(
-                    f"添加{context_label}视频失败，回退为链接: {v_url}, {e}"
+                    f"添加{context_label}视频失败，回退为链接: {video_url}, {e}"
                 )
-                chain.append(Comp.Plain(str(f"\n视频: {v_url}")))
+                chain.append(Comp.Plain(str(f"\n视频: {video_url}")))
 
     async def _maybe_translate(
         self, tweet_info: dict, umo: str
     ) -> tuple[str | None, str | None]:
         """根据翻译配置，翻译推文文本和引用推文文本
 
-        Args:
+        参数:
             tweet_info: 推文信息字典
             umo: 会话标识，用于获取 Provider
 
-        Returns:
+        返回:
             (主贴翻译后的文本, 翻译模型名称)；引用推文译文写入 quote.translated_text。
         """
         if not self.translate_enabled:
@@ -375,11 +454,11 @@ class TwitterPlugin(Star):
         - 使用 system_prompt 分离翻译指令与待翻译内容，提高翻译质量和可靠性
         - 翻译失败时简单重试一次
 
-        Args:
+        参数:
             text: 原始文本
             umo: 订阅者的会话标识，用于获取 Provider
 
-        Returns:
+        返回:
             (翻译后的文本, 执行翻译的模型名称)；翻译失败时返回 (原文, None)
         """
         if not text or not text.strip():
@@ -427,7 +506,7 @@ class TwitterPlugin(Star):
         logger.warning("翻译全部重试失败，使用原文")
         return text, None
 
-    def _build_tweet_chain(
+    async def _build_tweet_chain(
         self,
         username: str,
         tweet_info: dict,
@@ -437,7 +516,7 @@ class TwitterPlugin(Star):
     ) -> list:
         """构建推文消息链
 
-        Args:
+        参数:
             translated_text: 翻译后的文本，若提供则替换原文
             translate_model: 执行翻译的模型名称，用于末尾标注
         """
@@ -487,7 +566,7 @@ class TwitterPlugin(Star):
             )
             if quote_text:
                 chain.append(Comp.Plain(str(quote_text) + "\n"))
-            self._append_media_components(
+            await self._append_media_components(
                 chain,
                 quote.get("images") or [],
                 quote.get("videos") or [],
@@ -495,7 +574,7 @@ class TwitterPlugin(Star):
             )
 
         # 主贴媒体
-        self._append_media_components(
+        await self._append_media_components(
             chain, images, tweet_info.get("videos") or [], context_label="推文"
         )
 
@@ -515,6 +594,118 @@ class TwitterPlugin(Star):
         chain = [c for c in chain if c is not None]
         return chain
 
+    def _tweet_link_component(self, tweet_info: dict, fallback_username: str) -> Comp.Plain | None:
+        """构建可选的推文链接组件。"""
+        tweet_id = str(tweet_info.get("tweet_id") or "")
+        author_username = str(tweet_info.get("username") or fallback_username)
+        if not (tweet_id and self.include_tweet_link):
+            return None
+        return Comp.Plain(str(f"https://x.com/{author_username}/status/{tweet_id}"))
+
+    @staticmethod
+    def _rendered_image_component(rendered_url: str):
+        """把 html_render 的输出转换为图片组件。"""
+        rendered_url = str(rendered_url or "").strip()
+        if not rendered_url:
+            return None
+        if rendered_url.startswith(("http://", "https://")):
+            return Comp.Image.fromURL(rendered_url)
+        return Comp.Image.fromFileSystem(rendered_url)
+
+    async def _build_tweet_message_chain(
+        self,
+        username: str,
+        tweet_info: dict,
+        sub_config: dict | None = None,
+        translated_text: str | None = None,
+        translate_model: str | None = None,
+    ) -> list:
+        """按当前文本渲染模式构建推文消息链。"""
+        if self.text_render_mode != "screenshot":
+            return await self._build_tweet_chain(
+                username,
+                tweet_info,
+                sub_config,
+                translated_text=translated_text,
+                translate_model=translate_model,
+            )
+
+        try:
+            return await self._build_screenshot_tweet_chain(
+                username,
+                tweet_info,
+                sub_config,
+                translated_text=translated_text,
+                translate_model=translate_model,
+            )
+        except Exception as e:
+            logger.warning(f"推文截图渲染失败，已回退为文本消息: {e}")
+            return await self._build_tweet_chain(
+                username,
+                tweet_info,
+                sub_config,
+                translated_text=translated_text,
+                translate_model=translate_model,
+            )
+
+    async def _build_screenshot_tweet_chain(
+        self,
+        username: str,
+        tweet_info: dict,
+        sub_config: dict | None = None,
+        translated_text: str | None = None,
+        translate_model: str | None = None,
+    ) -> list:
+        """构建正文以 X 风格卡片截图展示的消息链。"""
+        if sub_config is None:
+            sub_config = {"r18": True, "media": False, "status": True}
+
+        chain: list = []
+        has_media = self._tweet_has_media(tweet_info)
+        render_text_card = not (self.no_text and has_media)
+
+        if render_text_card:
+            context = build_tweet_card_context(
+                username,
+                tweet_info,
+                translated_text=translated_text,
+                translate_model=translate_model,
+                theme=self.screenshot_theme,
+            )
+            rendered_url = await self.html_render(
+                load_tweet_card_template(),
+                context,
+                options=tweet_card_render_options(context),
+            )
+            image_comp = self._rendered_image_component(rendered_url)
+            if image_comp is None:
+                raise RuntimeError("html_render returned an empty image result")
+            chain.append(image_comp)
+
+        link_comp = self._tweet_link_component(tweet_info, username)
+        if link_comp is not None:
+            if chain:
+                chain.append(Comp.Plain("\n"))
+            chain.append(link_comp)
+
+        quote = tweet_info.get("quote") or None
+        if quote:
+            await self._append_media_components(
+                chain,
+                quote.get("images") or [],
+                quote.get("videos") or [],
+                context_label="引用推文",
+            )
+
+        await self._append_media_components(
+            chain,
+            tweet_info.get("images") or [],
+            tweet_info.get("videos") or [],
+            context_label="推文",
+        )
+
+        return [c for c in chain if c is not None]
+
     def _split_chain_for_nodes(
         self, chain: list, nickname: str
     ) -> tuple[list[Node], list[Comp.Video]]:
@@ -523,11 +714,11 @@ class TwitterPlugin(Star):
         视频不能放在 Node 中，否则下载+上传会超出 WebSocket API 超时时间，
         需要作为独立消息发送。
 
-        Args:
+        参数:
             chain: _build_tweet_chain 生成的消息链
             nickname: Node 显示的昵称
 
-        Returns:
+        返回:
             (Node 列表, 待独立发送的视频组件列表)
         """
         nodes: list[Node] = []
@@ -535,11 +726,19 @@ class TwitterPlugin(Star):
         text_parts: list = []
         image_parts: list[Comp.Image] = []
 
+        def flush_text_parts():
+            nonlocal text_parts
+            if text_parts:
+                nodes.append(Node(content=text_parts, name=nickname))
+                text_parts = []
+
         for comp in chain:
             if isinstance(comp, Comp.Video):
+                flush_text_parts()
                 video_parts.append(comp)
             elif isinstance(comp, Comp.Image):
-                image_parts.append(comp)
+                flush_text_parts()
+                nodes.append(Node(content=[comp], name=nickname))
             else:
                 text_parts.append(comp)
 
@@ -555,7 +754,7 @@ class TwitterPlugin(Star):
     async def _send_video_or_fallback(self, umo: str, vid_comp: Comp.Video):
         """发送视频组件，失败时回退为链接
 
-        Args:
+        参数:
             umo: 目标会话标识
             vid_comp: 视频组件
         """
@@ -666,7 +865,7 @@ class TwitterPlugin(Star):
     ):
         """向单个订阅者发送推文消息"""
         try:
-            chain = self._build_tweet_chain(
+            chain = await self._build_tweet_message_chain(
                 username, tweet_info, sub_config,
                 translated_text=translated_text,
                 translate_model=translate_model,
@@ -716,7 +915,8 @@ class TwitterPlugin(Star):
                 for comp in chain:
                     if isinstance(comp, Comp.Image):
                         # 图片无法在纯文本模式下展示，跳过
-                        pass
+                        if self.text_render_mode == "screenshot":
+                            plain_chain.append(comp)
                     elif isinstance(comp, Comp.Video):
                         vid_url = getattr(comp, "file", "") or getattr(
                             comp, "url", ""
@@ -793,7 +993,7 @@ class TwitterPlugin(Star):
 
                     for author in batch_authors:
                         for ct in seen_authors[author]:
-                            chain = self._build_tweet_chain(
+                            chain = await self._build_tweet_message_chain(
                                 ct.username, ct.tweet_info, ct.sub_config,
                                 translated_text=ct.translated_text,
                                 translate_model=ct.translate_model,
@@ -1301,7 +1501,7 @@ class TwitterPlugin(Star):
         )
 
         # 构建并返回消息
-        chain = self._build_tweet_chain(
+        chain = await self._build_tweet_message_chain(
             username, tweet_info,
             translated_text=translated_text,
             translate_model=translate_model,
@@ -1365,7 +1565,7 @@ class TwitterPlugin(Star):
             )
 
             # 构建推文消息链
-            chain = self._build_tweet_chain(
+            chain = await self._build_tweet_message_chain(
                 username,
                 tweet_info,
                 {"r18": True, "media": False, "status": True},

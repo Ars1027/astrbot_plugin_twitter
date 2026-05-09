@@ -58,6 +58,64 @@ class TwitterAPI:
             await self._client.aclose()
             self._client = None
 
+    @staticmethod
+    def _parse_content_length(value: str) -> Optional[int]:
+        """解析正数形式的 Content-Length 响应头。"""
+        try:
+            length = int(str(value or "").strip())
+        except (TypeError, ValueError):
+            return None
+        return length if length > 0 else None
+
+    @staticmethod
+    def _parse_content_range_total(value: str) -> Optional[int]:
+        """从 Content-Range 响应头解析文件总大小。"""
+        match = re.search(r"/(\d+)\s*$", str(value or ""))
+        if not match:
+            return None
+        try:
+            total = int(match.group(1))
+        except ValueError:
+            return None
+        return total if total > 0 else None
+
+    async def get_remote_file_size(self, url: str) -> Optional[int]:
+        """尽量在不下载正文的情况下探测远程文件大小。"""
+        url = str(url or "").strip()
+        if not url:
+            return None
+
+        client = await self._get_client()
+        try:
+            resp = await client.head(url, timeout=15.0)
+            if resp.status_code < 400:
+                size = self._parse_content_length(resp.headers.get("content-length", ""))
+                if size is not None:
+                    return size
+        except Exception as e:
+            logger.debug(f"HEAD 探测远程文件大小失败: {url}, {e}")
+
+        try:
+            async with client.stream(
+                "GET",
+                url,
+                headers={"Range": "bytes=0-0"},
+                timeout=15.0,
+            ) as resp:
+                if resp.status_code >= 400:
+                    return None
+                size = self._parse_content_range_total(
+                    resp.headers.get("content-range", "")
+                )
+                if size is not None:
+                    return size
+                if resp.status_code == 206:
+                    return None
+                return self._parse_content_length(resp.headers.get("content-length", ""))
+        except Exception as e:
+            logger.debug(f"Range 探测远程文件大小失败: {url}, {e}")
+            return None
+
     async def check_website_available(self, website_list: list[str]) -> Optional[str]:
         """检测可用的镜像站，返回第一个可用的 URL"""
         client = await self._get_client()
@@ -79,7 +137,7 @@ class TwitterAPI:
     async def get_user_info(self, username: str) -> dict:
         """获取 Twitter 用户信息
 
-        Returns:
+        返回:
             {"status": bool, "screen_name": str, "bio": str, "user_name": str}
         """
         if not self.nitter_url:
@@ -115,12 +173,12 @@ class TwitterAPI:
 
         Nitter 时间线按最新优先排列，返回结果按时间正序（最旧在前）。
 
-        Args:
+        参数:
             username: 推主用户名
             since_id: 已知最新推文 ID，仅返回比此 ID 更新的推文；
                       为空时仅返回最新一条推文 ID（用于首次订阅定位）
 
-        Returns:
+        返回:
             新推文 ID 列表（时间正序），无新推文时返回空列表
         """
         items = await self.get_user_timeline_items(
@@ -303,6 +361,77 @@ class TwitterAPI:
                     videos.append(data_url)
         return videos
 
+    def _extract_video_previews(
+        self, container: Tag, include_nested_quotes: bool = False
+    ) -> list[dict]:
+        """提取截图渲染用的视频封面图。"""
+        previews: list[dict] = []
+        seen_posters: set[str] = set()
+        video_elems = container.select("div.attachment video")
+        for video in video_elems:
+            if not include_nested_quotes and self._is_nested_quote_element(
+                video, container
+            ):
+                continue
+            poster = self._absolute_url(video.get("poster", ""))
+            if poster and poster not in seen_posters:
+                seen_posters.add(poster)
+                previews.append({"poster": poster, "duration": ""})
+
+        overlay_elems = container.select("div.video-overlay")
+        for overlay in overlay_elems:
+            if not include_nested_quotes and self._is_nested_quote_element(
+                overlay, container
+            ):
+                continue
+            attachment = overlay.find_parent("div", class_="attachment")
+            img = attachment.select_one("img") if attachment else None
+            poster = self._absolute_url(img.get("src", "")) if img else ""
+            duration_elem = overlay.select_one(".overlay-duration")
+            duration = duration_elem.get_text(strip=True) if duration_elem else ""
+            if poster and poster not in seen_posters:
+                seen_posters.add(poster)
+                previews.append({"poster": poster, "duration": duration})
+        return previews
+
+    def _extract_avatar(self, container: Tag) -> str:
+        """从 Nitter 推文容器提取头像 URL。"""
+        avatar_img = container.select_one("a.tweet-avatar img, img.avatar")
+        if not avatar_img:
+            return ""
+        return self._absolute_url(avatar_img.get("src", ""))
+
+    def _has_verified_badge(
+        self, container: Tag, include_nested_quotes: bool = False
+    ) -> bool:
+        """判断推文容器中是否存在可见的认证标记。"""
+        for badge in container.select(".verified-icon"):
+            if not include_nested_quotes and self._is_nested_quote_element(
+                badge, container
+            ):
+                continue
+            return True
+        return False
+
+    @staticmethod
+    def _extract_date(container: Tag) -> str:
+        """Extract the visible tweet date from a Nitter tweet container."""
+        date_link = container.select_one("span.tweet-date a")
+        if not date_link:
+            return ""
+        return date_link.get_text(strip=True) or date_link.get("title", "")
+
+    @staticmethod
+    def _extract_stats(container: Tag) -> dict:
+        """Extract visible tweet stats from Nitter's action row."""
+        stats = {"comments": "", "retweets": "", "likes": "", "views": ""}
+        stat_elems = container.select("div.tweet-stats span.tweet-stat")
+        stat_keys = ("comments", "retweets", "likes", "views")
+        for key, stat_elem in zip(stat_keys, stat_elems):
+            text = stat_elem.get_text(" ", strip=True)
+            stats[key] = text
+        return stats
+
     def _contains_live_stream(
         self, container: Tag, include_nested_quotes: bool = False
     ) -> bool:
@@ -320,7 +449,7 @@ class TwitterAPI:
     async def get_tweet(self, username: str, tweet_id: str) -> dict:
         """获取推文详细信息
 
-        Returns:
+        返回:
             推文信息字典，包含 text, images, videos, quote, is_r18,
             screen_name, retweet 等
         """
@@ -328,9 +457,14 @@ class TwitterAPI:
             "tweet_id": tweet_id,
             "username": username,
             "screen_name": username,
+            "avatar": "",
+            "verified": False,
+            "date": "",
+            "stats": {},
             "text": "",
             "images": [],
             "videos": [],
+            "video_previews": [],
             "quote": None,
             "retweet": None,
             "is_r18": False,
@@ -362,6 +496,15 @@ class TwitterAPI:
             if fullname_elem:
                 result["screen_name"] = fullname_elem.get_text(strip=True)
 
+            username_elem = main_tweet.select_one("a.username")
+            if username_elem:
+                result["username"] = username_elem.get_text(strip=True).lstrip("@")
+
+            result["avatar"] = self._extract_avatar(main_tweet)
+            result["verified"] = self._has_verified_badge(main_tweet)
+            result["date"] = self._extract_date(main_tweet)
+            result["stats"] = self._extract_stats(main_tweet)
+
             # 获取推文正文
             content_elem = main_tweet.select_one("div.tweet-content.media-body")
             if content_elem:
@@ -376,6 +519,7 @@ class TwitterAPI:
             #   2) m3u8/vmap格式: <video data-url=""> (无src/source)
             #   3) 播放被禁用: 仅有 <img> 缩略图 + <div class="video-overlay">
             result["videos"] = self._extract_videos(main_tweet)
+            result["video_previews"] = self._extract_video_previews(main_tweet)
 
             # 检测直播推文并过滤
             is_live_stream = self._contains_live_stream(main_tweet)
@@ -387,6 +531,7 @@ class TwitterAPI:
                 )
                 result["videos"] = []
                 result["images"] = []
+                result["video_previews"] = []
 
             # 检测视频附件但未提取到视频URL的情况
             if not is_live_stream:
@@ -420,6 +565,12 @@ class TwitterAPI:
                         if quote_username
                         else ""
                     ),
+                    "avatar": self._extract_avatar(quote_elem),
+                    "verified": self._has_verified_badge(
+                        quote_elem,
+                        include_nested_quotes=True,
+                    ),
+                    "date": self._extract_date(quote_elem),
                     "tweet_id": quote_id_match.group(1) if quote_id_match else "",
                     "text": quote_text_elem.get_text(strip=True) if quote_text_elem else "",
                     "images": (
@@ -434,6 +585,14 @@ class TwitterAPI:
                         []
                         if quote_live_stream
                         else self._extract_videos(
+                            quote_elem,
+                            include_nested_quotes=True,
+                        )
+                    ),
+                    "video_previews": (
+                        []
+                        if quote_live_stream
+                        else self._extract_video_previews(
                             quote_elem,
                             include_nested_quotes=True,
                         )
