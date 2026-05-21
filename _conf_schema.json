@@ -30,7 +30,7 @@
     "hint": "控制推文推送的消息样式、合并转发行为、媒体质量及帖子链接。",
     "items": {
       "twitter_use_node": {
-        "description": "使用合并转发消息发送推文",
+        "description": "单条推文使用合并转发消息发送",
         "type": "bool",
         "default": true
       },
@@ -67,10 +67,10 @@
         "hint": "发送视频前会探测文件大小；超过上限时改为发送说明和视频链接。默认=256"
       },
       "twitter_collective_forward": {
-        "description": "推文集体转发（将多个推主的推文合并到一条转发消息中）",
+        "description": "轮询时汇总多条新推文为一条合并转发消息",
         "type": "bool",
         "default": false,
-        "hint": "开启后，轮询周期内获取的所有推文将缓存，轮询结束后统一打包发送；需同时开启合并转发消息，否则不会生效"
+        "hint": "仅影响轮询推送。开启后会缓存本轮轮询期间获取到的新推文，轮询结束后统一打包发送；需同时开启“单条推文使用合并转发消息发送”，否则不会生效"
       },
       "twitter_collective_max_authors": {
         "description": "集体转发时单条消息包含的最大推主数",

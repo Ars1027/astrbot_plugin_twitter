@@ -532,6 +532,12 @@ class TwitterPlugin(Star):
         retweet = tweet_info.get("retweet") or None
 
         chain = []
+        text_sections: list[str] = []
+
+        def append_text_section(value: str) -> None:
+            value = str(value or "").strip()
+            if value:
+                text_sections.append(value)
 
         # 头部信息
         nickname = self._build_author_display(author_username, screen_name)
@@ -543,15 +549,15 @@ class TwitterPlugin(Star):
             retweeter = self._build_author_display(
                 retweeter_username, retweeter_screen_name
             )
-            chain.append(Comp.Plain(str(f"{retweeter} 转发了 {nickname} 的帖子\n")))
+            append_text_section(f"{retweeter} 转发了 {nickname} 的帖子")
         else:
-            chain.append(Comp.Plain(str(nickname) + "\n"))
+            append_text_section(nickname)
 
         # 推文正文
         has_media = self._tweet_has_media(tweet_info)
         if not (self.no_text and has_media):
             if text:
-                chain.append(Comp.Plain(str(text) + "\n"))
+                append_text_section(text)
 
         # 引用推文
         if quote:
@@ -561,11 +567,24 @@ class TwitterPlugin(Star):
             quote_display = self._build_author_display(
                 quote_author_username, quote_author
             )
-            chain.append(
-                Comp.Plain(str(f"\n{nickname} 引用了 {quote_display} 的帖子\n"))
-            )
+            append_text_section(f"{nickname} 引用了 {quote_display} 的帖子")
             if quote_text:
-                chain.append(Comp.Plain(str(quote_text) + "\n"))
+                append_text_section(quote_text)
+
+        # 推文链接
+        if tweet_id and self.include_tweet_link:
+            append_text_section(f"https://x.com/{author_username}/status/{tweet_id}")
+
+        # 翻译说明标注
+        quote_translated = bool((quote or {}).get("translated_text"))
+        if translate_model and (translated_text is not None or quote_translated):
+            append_text_section(f"（由 {translate_model} 翻译自原文）")
+
+        if text_sections:
+            self._append_to_last_plain(chain, "\n\n".join(text_sections))
+
+        # 引用媒体
+        if quote:
             await self._append_media_components(
                 chain,
                 quote.get("images") or [],
@@ -578,18 +597,6 @@ class TwitterPlugin(Star):
             chain, images, tweet_info.get("videos") or [], context_label="推文"
         )
 
-        # 推文链接
-        if tweet_id and self.include_tweet_link:
-            link = f"\nhttps://x.com/{author_username}/status/{tweet_id}"
-            chain.append(Comp.Plain(str(link)))
-
-        # 翻译说明标注
-        quote_translated = bool((quote or {}).get("translated_text"))
-        if translate_model and (translated_text is not None or quote_translated):
-            chain.append(
-                Comp.Plain(str(f"\n（由 {translate_model} 翻译自原文）"))
-            )
-
         # 过滤 None 值，防止类型验证错误
         chain = [c for c in chain if c is not None]
         return chain
@@ -601,6 +608,16 @@ class TwitterPlugin(Star):
         if not (tweet_id and self.include_tweet_link):
             return None
         return Comp.Plain(str(f"https://x.com/{author_username}/status/{tweet_id}"))
+
+    @staticmethod
+    def _append_to_last_plain(chain: list, text: str) -> None:
+        """尽量把文本追加到最后一个纯文本组件，避免适配器拼接组件时吞换行。"""
+        if chain and isinstance(chain[-1], Comp.Plain):
+            current_text = getattr(chain[-1], "text", None)
+            if isinstance(current_text, str):
+                chain[-1].text = current_text + text
+                return
+        chain.append(Comp.Plain(str(text)))
 
     @staticmethod
     def _rendered_image_component(rendered_url: str):
@@ -724,7 +741,6 @@ class TwitterPlugin(Star):
         nodes: list[Node] = []
         video_parts: list[Comp.Video] = []
         text_parts: list = []
-        image_parts: list[Comp.Image] = []
 
         def flush_text_parts():
             nonlocal text_parts
@@ -734,7 +750,6 @@ class TwitterPlugin(Star):
 
         for comp in chain:
             if isinstance(comp, Comp.Video):
-                flush_text_parts()
                 video_parts.append(comp)
             elif isinstance(comp, Comp.Image):
                 flush_text_parts()
@@ -745,11 +760,35 @@ class TwitterPlugin(Star):
         # 文本节点
         if text_parts:
             nodes.append(Node(content=text_parts, name=nickname))
-        # 每张图片一个节点
-        for img_comp in image_parts:
-            nodes.append(Node(content=[img_comp], name=nickname))
 
         return nodes, video_parts
+
+    @staticmethod
+    def _build_plain_chain(chain: list) -> list:
+        """构建普通消息链，保留图片并把视频转换为链接文本。"""
+        plain_chain = []
+        for comp in chain:
+            if isinstance(comp, Comp.Video):
+                vid_url = getattr(comp, "file", "") or getattr(comp, "url", "")
+                if vid_url:
+                    plain_chain.append(Comp.Plain(str(f"\n视频: {vid_url}")))
+            else:
+                plain_chain.append(comp)
+        return plain_chain
+
+    @staticmethod
+    def _split_plain_chain_and_videos(
+        chain: list,
+    ) -> tuple[list, list[Comp.Video]]:
+        """构建普通消息链，并分离需要独立发送的视频组件。"""
+        plain_chain = []
+        video_parts: list[Comp.Video] = []
+        for comp in chain:
+            if isinstance(comp, Comp.Video):
+                video_parts.append(comp)
+            else:
+                plain_chain.append(comp)
+        return plain_chain, video_parts
 
     async def _send_video_or_fallback(self, umo: str, vid_comp: Comp.Video):
         """发送视频组件，失败时回退为链接
@@ -894,42 +933,18 @@ class TwitterPlugin(Star):
                     logger.warning(
                         f"合并转发失败，回退到普通消息: {node_err}"
                     )
-                    fallback_chain = []
-                    for comp in chain:
-                        if isinstance(comp, Comp.Video):
-                            vid_url = getattr(comp, "file", "") or getattr(
-                                comp, "url", ""
-                            )
-                            if vid_url:
-                                fallback_chain.append(
-                                    Comp.Plain(str(f"\n视频: {vid_url}"))
-                                )
-                        else:
-                            fallback_chain.append(comp)
+                    fallback_chain = self._build_plain_chain(chain)
                     if fallback_chain:
                         message_chain = MessageChain(chain=fallback_chain)
                         await self.context.send_message(umo, message_chain)
             else:
-                # 纯文本模式：将消息链中非文本组件转为文本描述
-                plain_chain = []
-                for comp in chain:
-                    if isinstance(comp, Comp.Image):
-                        # 图片无法在纯文本模式下展示，跳过
-                        if self.text_render_mode == "screenshot":
-                            plain_chain.append(comp)
-                    elif isinstance(comp, Comp.Video):
-                        vid_url = getattr(comp, "file", "") or getattr(
-                            comp, "url", ""
-                        )
-                        if vid_url:
-                            plain_chain.append(
-                                Comp.Plain(str(f"\n视频: {vid_url}"))
-                            )
-                    else:
-                        plain_chain.append(comp)
+                # 普通消息模式：正文和图片先发，视频独立发送，避免混入普通链导致文本异常
+                plain_chain, video_parts = self._split_plain_chain_and_videos(chain)
                 if plain_chain:
                     message_chain = MessageChain(chain=plain_chain)
                     await self.context.send_message(umo, message_chain)
+                for vid_comp in video_parts:
+                    await self._send_video_or_fallback(umo, vid_comp)
 
             logger.info(f"推文已推送至 {umo}")
         except Exception as e:
@@ -1526,9 +1541,17 @@ class TwitterPlugin(Star):
                     await self._send_video_or_fallback(umo, vid_comp)
             except Exception:
                 # 合并转发失败，回退到普通消息链
-                yield event.chain_result(chain)
+                plain_chain, video_parts = self._split_plain_chain_and_videos(chain)
+                if plain_chain:
+                    yield event.chain_result(plain_chain)
+                for vid_comp in video_parts:
+                    await self._send_video_or_fallback(umo, vid_comp)
         else:
-            yield event.chain_result(chain)
+            plain_chain, video_parts = self._split_plain_chain_and_videos(chain)
+            if plain_chain:
+                yield event.chain_result(plain_chain)
+            for vid_comp in video_parts:
+                await self._send_video_or_fallback(umo, vid_comp)
 
     # ========== 链接识别 ==========
 
@@ -1590,9 +1613,17 @@ class TwitterPlugin(Star):
                     for vid_comp in video_parts:
                         await self._send_video_or_fallback(umo, vid_comp)
                 except Exception:
-                    yield event.chain_result(chain)
+                    plain_chain, video_parts = self._split_plain_chain_and_videos(chain)
+                    if plain_chain:
+                        yield event.chain_result(plain_chain)
+                    for vid_comp in video_parts:
+                        await self._send_video_or_fallback(umo, vid_comp)
             else:
-                yield event.chain_result(chain)
+                plain_chain, video_parts = self._split_plain_chain_and_videos(chain)
+                if plain_chain:
+                    yield event.chain_result(plain_chain)
+                for vid_comp in video_parts:
+                    await self._send_video_or_fallback(umo, vid_comp)
 
         except Exception as e:
             logger.error(f"解析推文链接失败: {e}")
