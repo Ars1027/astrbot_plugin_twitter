@@ -136,7 +136,7 @@
       },
       "twitter_translate_custom_prompt": {
         "description": "自定义翻译提示词",
-        "type": "text",
+        "type": "string",
         "default": "你是一个专业的翻译助手。请将用户提供的文本翻译为{target_lang}。规则：仅输出翻译结果，不要添加任何解释、前缀、注释或原文对照。保持原文的语气和格式（如换行、表情符号等）。",
         "hint": "自定义翻译 system prompt。支持变量：{target_lang} 会替换为翻译目标语言。",
         "editor_mode": "text"
