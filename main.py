@@ -182,6 +182,16 @@ class TwitterPlugin(Star):
         self.translate_provider_id = str(
             self._cfg("translation", "twitter_translate_provider_id", "") or ""
         ).strip()
+        self.translate_custom_prompt_enabled = bool(
+            self._cfg(
+                "translation",
+                "twitter_translate_custom_prompt_enabled",
+                False,
+            )
+        )
+        self.translate_custom_prompt = str(
+            self._cfg("translation", "twitter_translate_custom_prompt", "") or ""
+        ).strip()
         self.custom_nitter_url = str(
             self._cfg("basic", "twitter_nitter_url", "") or ""
         ).strip()
@@ -468,11 +478,16 @@ class TwitterPlugin(Star):
         if not provider_id:
             return text, None
 
-        system_prompt = (
-            f"你是一个专业的翻译助手。请将用户提供的文本翻译为{self.translate_target_lang}。"
-            f"规则：仅输出翻译结果，不要添加任何解释、前缀、注释或原文对照。"
-            f"保持原文的语气和格式（如换行、表情符号等）。"
-        )
+        if self.translate_custom_prompt_enabled and self.translate_custom_prompt:
+            system_prompt = self.translate_custom_prompt.replace(
+                "{target_lang}", self.translate_target_lang
+            )
+        else:
+            system_prompt = (
+                f"你是一个专业的翻译助手。请将用户提供的文本翻译为{self.translate_target_lang}。"
+                f"规则：仅输出翻译结果，不要添加任何解释、前缀、注释或原文对照。"
+                f"保持原文的语气和格式（如换行、表情符号等）。"
+            )
 
         max_retries = 2
         for attempt in range(max_retries):
