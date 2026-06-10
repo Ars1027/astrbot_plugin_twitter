@@ -25,6 +25,7 @@ AstrBot Twitter 推文转发插件
     附带帖子链接 (twitter_include_tweet_link)     - 默认开启
   【内容过滤】
     推送转帖 (twitter_include_retweets)           - 默认开启
+    转帖去重 (twitter_deduplicate_retweets)       - 默认关闭
     链接识别 (twitter_link_recognition_enabled)   - 默认开启
   【翻译设置】
     翻译开关 (twitter_translate_enabled)          - 默认关闭
@@ -58,6 +59,8 @@ TWITTER_LINK_PATTERN = re.compile(
 
 # KV 存储键名
 KV_SUBS_KEY = "twitter_subs"
+KV_RETWEET_DEDUP_KEY = "twitter_retweet_dedup_seen"
+RETWEET_DEDUP_MAX_ITEMS = 500
 
 
 @dataclass
@@ -113,6 +116,9 @@ class TwitterPlugin(Star):
         )
         self.include_retweets = bool(
             self._cfg("content_filter", "twitter_include_retweets", True)
+        )
+        self.deduplicate_retweets = bool(
+            self._cfg("content_filter", "twitter_deduplicate_retweets", False)
         )
         self.include_tweet_link = bool(
             self._cfg(
@@ -269,6 +275,15 @@ class TwitterPlugin(Star):
         """保存全部订阅数据"""
         await self.put_kv_data(KV_SUBS_KEY, data)
 
+    async def _get_retweet_dedup_seen(self) -> dict:
+        """获取转帖去重记录。"""
+        data = await self.get_kv_data(KV_RETWEET_DEDUP_KEY, {})
+        return data if isinstance(data, dict) else {}
+
+    async def _save_retweet_dedup_seen(self, data: dict):
+        """保存转帖去重记录。"""
+        await self.put_kv_data(KV_RETWEET_DEDUP_KEY, data)
+
     # ========== 工具方法 ==========
 
     @staticmethod
@@ -307,6 +322,31 @@ class TwitterPlugin(Star):
                 "retweeter_username": str(item.get("retweeter_username") or ""),
                 "retweeter_screen_name": str(item.get("retweeter_screen_name") or ""),
             }
+
+    @staticmethod
+    def _retweet_seen_by_umo(seen_data: dict, umo: str, tweet_id: str) -> bool:
+        """判断某会话是否已经接收过指定原帖的转帖。"""
+        seen_ids = seen_data.get(umo) or []
+        if not isinstance(seen_ids, list):
+            return False
+        return str(tweet_id) in {str(item) for item in seen_ids}
+
+    @staticmethod
+    def _mark_retweet_seen(seen_data: dict, umo: str, tweet_id: str) -> None:
+        """记录某会话已接收过指定原帖的转帖，并限制缓存长度。"""
+        tweet_id = str(tweet_id or "")
+        if not tweet_id:
+            return
+
+        raw_seen_ids = seen_data.get(umo) or []
+        if not isinstance(raw_seen_ids, list):
+            raw_seen_ids = []
+
+        seen_ids = [str(item) for item in raw_seen_ids if str(item)]
+        if tweet_id in seen_ids:
+            seen_ids.remove(tweet_id)
+        seen_ids.append(tweet_id)
+        seen_data[umo] = seen_ids[-RETWEET_DEDUP_MAX_ITEMS:]
 
     @staticmethod
     def _tweet_has_media(tweet_info: dict) -> bool:
@@ -856,6 +896,17 @@ class TwitterPlugin(Star):
         else:
             nickname = self._build_nickname(username, screen_name)
 
+        should_dedup_retweet = (
+            self.deduplicate_retweets
+            and bool(retweet)
+            and bool(str(tweet_info.get("tweet_id") or ""))
+        )
+        retweet_dedup_seen: dict | None = None
+        retweet_dedup_dirty = False
+        if should_dedup_retweet:
+            retweet_dedup_seen = await self._get_retweet_dedup_seen()
+        retweet_dedup_id = str(tweet_info.get("tweet_id") or "")
+
         # 翻译推文（如果开启），同一推文只翻译一次
         first_umo = next(iter(subscribers), "")
         translated_text, translate_model = await self._maybe_translate(
@@ -884,6 +935,23 @@ class TwitterPlugin(Star):
             if sub_config.get("media", False) and not self._tweet_has_media(tweet_info):
                 continue
 
+            if should_dedup_retweet and retweet_dedup_seen is not None:
+                if self._retweet_seen_by_umo(
+                    retweet_dedup_seen,
+                    umo,
+                    retweet_dedup_id,
+                ):
+                    logger.debug(
+                        f"跳过重复转帖 {umo}: @{username} -> {retweet_dedup_id}"
+                    )
+                    continue
+                self._mark_retweet_seen(
+                    retweet_dedup_seen,
+                    umo,
+                    retweet_dedup_id,
+                )
+                retweet_dedup_dirty = True
+
             # 集体转发模式：缓存推文，轮询结束后统一发送
             if self.collective_forward and self.use_node:
                 if umo not in self._collected_tweets:
@@ -906,6 +974,9 @@ class TwitterPlugin(Star):
                 translated_text=translated_text,
                 translate_model=translate_model,
             )
+
+        if retweet_dedup_dirty and retweet_dedup_seen is not None:
+            await self._save_retweet_dedup_seen(retweet_dedup_seen)
 
     async def _send_tweet_to_subscriber(
         self,

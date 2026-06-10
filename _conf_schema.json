@@ -97,6 +97,12 @@
         "default": true,
         "hint": "开启后会推送转帖，并在消息中标明谁转发了谁；关闭后轮询跳过转帖，/推特测试会寻找最新的非转贴推文"
       },
+      "twitter_deduplicate_retweets": {
+        "description": "轮询推送时对转帖去重",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，同一条原帖被多个订阅推主转发时，每个会话只推送第一次"
+      },
       "twitter_link_recognition_enabled": {
         "description": "推文链接识别全局开关",
         "type": "bool",
