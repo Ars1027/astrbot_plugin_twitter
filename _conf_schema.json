@@ -53,6 +53,12 @@
         "options": ["dark", "light"],
         "hint": "dark=黑色背景 X 风格；light=白色背景 X 风格，仅在截图模式下生效"
       },
+      "twitter_send_media_separately": {
+        "description": "单独发送推文媒体资源",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后会在正文或截图之外继续发送原图和视频；关闭后不再追加原图、视频及视频降级链接，截图中的媒体预览不受影响"
+      },
       "twitter_image_quality": {
         "description": "推文图片质量",
         "type": "string",

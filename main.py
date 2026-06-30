@@ -20,6 +20,7 @@ AstrBot Twitter 推文转发插件
   【消息格式】
     合并转发消息 (twitter_use_node)               - 默认开启
     含媒体时隐藏文字 (twitter_no_text)            - 默认关闭
+    单独发送媒体资源 (twitter_send_media_separately) - 默认开启
     图片质量 (twitter_image_quality)              - orig / large
     集体转发 (twitter_collective_forward)         - 默认关闭
     附带帖子链接 (twitter_include_tweet_link)     - 默认开启
@@ -101,6 +102,13 @@ class TwitterPlugin(Star):
         self.proxy = str(self._cfg("basic", "twitter_proxy", "") or "") or None
         self.use_node = bool(self._cfg("message_format", "twitter_use_node", True))
         self.no_text = bool(self._cfg("message_format", "twitter_no_text", False))
+        self.send_media_separately = bool(
+            self._cfg(
+                "message_format",
+                "twitter_send_media_separately",
+                True,
+            )
+        )
         self.link_recognition_enabled = bool(
             self._cfg(
                 "content_filter",
@@ -389,6 +397,9 @@ class TwitterPlugin(Star):
         self, chain: list, images: list, videos: list, context_label: str = "推文"
     ):
         """把图片和视频追加到消息链，供主贴和引用帖复用。"""
+        if not self.send_media_separately:
+            return
+
         for img_url in images:
             try:
                 img_comp = Comp.Image.fromURL(str(img_url))
