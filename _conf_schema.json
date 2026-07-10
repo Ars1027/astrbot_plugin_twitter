@@ -16,6 +16,12 @@
         "hint": "例如: http://127.0.0.1:7890 或 socks5://127.0.0.1:1080",
         "default": ""
       },
+      "twitter_pre_download_media": {
+        "description": "通过代理预下载图片（需先配置代理地址）",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，图片通过代理预下载到本地再发送，避免下游消息适配器直连外部服务器超时。截图模式下图片转为 base64 内嵌，Chromium 渲染零外部请求。关闭时使用原始 URL 传递。"
+      },
       "twitter_poll_interval": {
         "description": "推文轮询间隔（分钟）",
         "type": "int",

@@ -3,6 +3,7 @@ Twitter API 交互模块
 通过 Nitter 镜像站获取 Twitter/X 推文数据
 """
 
+import base64
 import re
 from typing import Optional
 
@@ -51,6 +52,68 @@ class TwitterAPI:
                 },
             )
         return self._client
+
+    async def download_media(self, url: str) -> bytes:
+        """通过已配置代理的 HTTP 客户端下载媒体文件。
+
+        将远程 URL 转换为本地字节数据，避免下游消费者（消息适配器、
+        HTML 渲染器）直连可能受网络限制的外部服务器。
+
+        参数:
+            url: 远程媒体文件 URL
+
+        返回:
+            媒体文件的原始字节数据
+
+        异常:
+            ValueError: URL 为空
+            httpx.HTTPStatusError: 响应状态码非 2xx
+        """
+        url = str(url or "").strip()
+        if not url:
+            raise ValueError("empty URL")
+
+        client = await self._get_client()
+        resp = await client.get(url, timeout=30.0)
+        resp.raise_for_status()
+        return resp.content
+
+    async def download_media_to_data_uri(self, url: str) -> str:
+        """下载媒体文件并转换为 data URI（base64 内嵌）。
+
+        用于截图模式的 HTML 渲染——将图片转为 data: URI 后内嵌到 HTML，
+        Playwright/Chromium 渲染时无需发起外部网络请求。
+
+        参数:
+            url: 远程媒体文件 URL
+
+        返回:
+            data: URI 字符串，如 data:image/png;base64,...
+
+        异常:
+            ValueError: URL 为空
+            httpx.HTTPStatusError: 响应状态码非 2xx
+        """
+        data = await self.download_media(url)
+        mime = self._guess_mime_from_url(url)
+        b64 = base64.b64encode(data).decode("ascii")
+        return f"data:{mime};base64,{b64}"
+
+    @staticmethod
+    def _guess_mime_from_url(url: str) -> str:
+        """根据 URL 后缀推测 MIME 类型，默认 image/jpeg。"""
+        url_lower = str(url or "").lower()
+        for ext, mime in [
+            (".png", "image/png"),
+            (".gif", "image/gif"),
+            (".webp", "image/webp"),
+            (".svg", "image/svg+xml"),
+            (".bmp", "image/bmp"),
+            (".mp4", "video/mp4"),
+        ]:
+            if ext in url_lower:
+                return mime
+        return "image/jpeg"
 
     async def close(self):
         """关闭 HTTP 客户端"""

@@ -37,7 +37,10 @@ AstrBot Twitter 推文转发插件
 """
 
 import asyncio
+import os
 import re
+import shutil
+import tempfile
 from dataclasses import dataclass, field
 
 from astrbot.api import AstrBotConfig, logger
@@ -212,6 +215,9 @@ class TwitterPlugin(Star):
         self.image_quality = str(
             self._cfg("message_format", "twitter_image_quality", "orig") or "orig"
         ).strip()
+        self.pre_download_media = bool(
+            self._cfg("basic", "twitter_pre_download_media", False)
+        )
 
         # 构建镜像站列表
         self.website_list: list[str] = []
@@ -230,6 +236,10 @@ class TwitterPlugin(Star):
 
         # 集体转发推文缓存：{umo: [CachedTweet, ...]}
         self._collected_tweets: dict[str, list[CachedTweet]] = {}
+
+        # 媒体临时文件管理
+        self._media_temp_dir = tempfile.mkdtemp(prefix="twitter_plugin_media_")
+        self._pending_cleanup: list[str] = []
 
     async def initialize(self):
         """插件初始化"""
@@ -270,6 +280,12 @@ class TwitterPlugin(Star):
         if self._collected_tweets:
             logger.info("正在发送剩余缓存的推文...")
             await self._flush_collected_tweets()
+        # 清理媒体临时文件
+        await self._cleanup_temp_files()
+        try:
+            shutil.rmtree(self._media_temp_dir, ignore_errors=True)
+        except Exception:
+            pass
         await self.twitter_api.close()
         logger.info("Twitter 推文转发插件已停止")
 
@@ -396,13 +412,17 @@ class TwitterPlugin(Star):
     async def _append_media_components(
         self, chain: list, images: list, videos: list, context_label: str = "推文"
     ):
-        """把图片和视频追加到消息链，供主贴和引用帖复用。"""
+        """把图片和视频追加到消息链，供主贴和引用帖复用。
+
+        当插件配置了代理时，图片会通过代理预下载到本地临时文件，
+        避免下游消息适配器直连外部服务器导致超时。
+        """
         if not self.send_media_separately:
             return
 
         for img_url in images:
             try:
-                img_comp = Comp.Image.fromURL(str(img_url))
+                img_comp = await self._build_image_component(str(img_url))
                 if img_comp is not None:
                     chain.append(img_comp)
             except Exception as e:
@@ -427,6 +447,65 @@ class TwitterPlugin(Star):
                     f"添加{context_label}视频失败，回退为链接: {video_url}, {e}"
                 )
                 chain.append(Comp.Plain(str(f"\n视频: {video_url}")))
+
+    async def _build_image_component(self, img_url: str) -> Comp.Image | None:
+        """根据代理配置选择合适的图片组件构建方式。
+
+        有代理时：通过代理下载图片到本地临时文件，使用 fromFileSystem，
+        避免下游消息适配器直连外部服务器。
+        无代理时：使用 fromURL，由 AstrBot 核心/适配器自行下载。
+        """
+        img_url = str(img_url or "").strip()
+        if not img_url:
+            return None
+
+        if not (self.pre_download_media and self.proxy):
+            return Comp.Image.fromURL(img_url)
+
+        # 通过代理下载到本地，使用本地路径
+        try:
+            data = await self.twitter_api.download_media(img_url)
+        except Exception as e:
+            logger.warning(f"通过代理下载图片失败 {img_url}: {e}，回退为远程 URL")
+            return Comp.Image.fromURL(img_url)
+
+        suffix = self._guess_image_suffix(img_url)
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=suffix, delete=False, dir=self._media_temp_dir
+        )
+        try:
+            tmp.write(data)
+            tmp.close()
+            self._pending_cleanup.append(tmp.name)
+            return Comp.Image.fromFileSystem(tmp.name)
+        except Exception:
+            tmp.close()
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _guess_image_suffix(url: str) -> str:
+        """根据 URL 或常见模式推测图片文件后缀。"""
+        url_lower = str(url or "").lower()
+        for ext in (".webp", ".png", ".gif", ".bmp", ".svg"):
+            if ext in url_lower:
+                return ext
+        # Nitter /pic/orig/ 路由默认返回 JPEG
+        return ".jpg"
+
+    async def _cleanup_temp_files(self):
+        """清理当前批次累积的媒体临时文件。"""
+        if not self._pending_cleanup:
+            return
+        for path in self._pending_cleanup:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        self._pending_cleanup.clear()
 
     async def _maybe_translate(
         self, tweet_info: dict, umo: str
@@ -739,7 +818,11 @@ class TwitterPlugin(Star):
         translated_text: str | None = None,
         translate_model: str | None = None,
     ) -> list:
-        """构建正文以 X 风格卡片截图展示的消息链。"""
+        """构建正文以 X 风格卡片截图展示的消息链。
+
+        当开启预下载媒体且配置了代理时，提前将所有图片转为 base64
+        data URI 内嵌到 HTML 模板中，避免 Chromium 直连外部服务器。
+        """
         if sub_config is None:
             sub_config = {"r18": True, "media": False, "status": True}
 
@@ -748,6 +831,10 @@ class TwitterPlugin(Star):
         render_text_card = not (self.no_text and has_media)
 
         if render_text_card:
+            # 预下载模式：将图片转为 data URI 内嵌，HTML 渲染零外部请求
+            if self.pre_download_media and self.proxy:
+                tweet_info = await self._prepare_screenshot_media(tweet_info)
+
             context = build_tweet_card_context(
                 username,
                 tweet_info,
@@ -787,7 +874,78 @@ class TwitterPlugin(Star):
             context_label="推文",
         )
 
+        # 及时清理截图流程中创建的临时文件
+        await self._cleanup_temp_files()
+
         return [c for c in chain if c is not None]
+
+    async def _prepare_screenshot_media(self, tweet_info: dict) -> dict:
+        """预下载推文中的所有图片并转为 data URI，返回深拷贝后的 tweet_info。
+
+        下载使用插件已配置代理的 TwitterAPI 客户端，确保在网络受限环境
+        下也能正常获取图片数据。下载失败时保留原始 URL 作为降级。
+        """
+        import copy
+        result = copy.deepcopy(tweet_info)
+
+        # 主贴头像
+        avatar_url = str(result.get("avatar") or "").strip()
+        if avatar_url:
+            data_uri = await self._download_to_data_uri_safe(avatar_url)
+            if data_uri:
+                result["avatar"] = data_uri
+
+        # 主贴图片
+        result["images"] = [
+            await self._download_to_data_uri_safe(str(u)) or str(u)
+            for u in (result.get("images") or [])
+        ]
+
+        # 视频封面
+        previews = result.get("video_previews") or []
+        for p in previews:
+            if isinstance(p, dict):
+                poster = str(p.get("poster") or "").strip()
+                if poster:
+                    data_uri = await self._download_to_data_uri_safe(poster)
+                    if data_uri:
+                        p["poster"] = data_uri
+
+        # 引用推文
+        quote = result.get("quote") or None
+        if quote:
+            quote_avatar = str(quote.get("avatar") or "").strip()
+            if quote_avatar:
+                data_uri = await self._download_to_data_uri_safe(quote_avatar)
+                if data_uri:
+                    quote["avatar"] = data_uri
+
+            quote["images"] = [
+                await self._download_to_data_uri_safe(str(u)) or str(u)
+                for u in (quote.get("images") or [])
+            ]
+
+            quote_previews = quote.get("video_previews") or []
+            for p in quote_previews:
+                if isinstance(p, dict):
+                    poster = str(p.get("poster") or "").strip()
+                    if poster:
+                        data_uri = await self._download_to_data_uri_safe(poster)
+                        if data_uri:
+                            p["poster"] = data_uri
+
+        return result
+
+    async def _download_to_data_uri_safe(self, url: str) -> str | None:
+        """安全地将远程 URL 下载并转为 data URI，失败返回 None。"""
+        url = str(url or "").strip()
+        if not url:
+            return None
+        try:
+            return await self.twitter_api.download_media_to_data_uri(url)
+        except Exception as e:
+            logger.debug(f"预下载截图媒体失败 {url}: {e}")
+            return None
 
     def _split_chain_for_nodes(
         self, chain: list, nickname: str
@@ -1046,6 +1204,8 @@ class TwitterPlugin(Star):
             logger.info(f"推文已推送至 {umo}")
         except Exception as e:
             logger.error(f"推送推文至 {umo} 失败: {e}")
+        finally:
+            await self._cleanup_temp_files()
 
     async def _flush_collected_tweets(self):
         """将缓存的推文按推主分组打包为合并转发消息发送"""
@@ -1650,6 +1810,8 @@ class TwitterPlugin(Star):
             for vid_comp in video_parts:
                 await self._send_video_or_fallback(umo, vid_comp)
 
+        await self._cleanup_temp_files()
+
     # ========== 链接识别 ==========
 
     @filter.event_message_type(filter.EventMessageType.ALL)
@@ -1724,3 +1886,5 @@ class TwitterPlugin(Star):
 
         except Exception as e:
             logger.error(f"解析推文链接失败: {e}")
+        finally:
+            await self._cleanup_temp_files()
