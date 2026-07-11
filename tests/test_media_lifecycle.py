@@ -1,4 +1,3 @@
-import asyncio
 import importlib.util
 import sys
 import types
@@ -35,6 +34,10 @@ class Image(_Component):
     @staticmethod
     def fromFileSystem(path):
         return Image(file=Path(path).resolve().as_uri(), path=str(Path(path).resolve()))
+
+    @staticmethod
+    def fromBytes(data):
+        return Image(data=data)
 
 
 class Video(_Component):
@@ -163,9 +166,7 @@ async def test_screenshot_uses_prepared_copy_but_sends_original_media(
         assert options
         return str(tmp_path / "card.png")
 
-    async def append_media(
-        _chain, images, _videos, _temp_files, context_label="推文"
-    ):
+    async def append_media(_chain, images, _videos, context_label="推文"):
         captured_media.append((context_label, list(images)))
 
     plugin._prepare_screenshot_media = prepare_screenshot_media
@@ -173,7 +174,7 @@ async def test_screenshot_uses_prepared_copy_but_sends_original_media(
     plugin._append_media_components = append_media
 
     await plugin._build_screenshot_tweet_chain(
-        "tester", tweet_info, [], {"r18": True, "media": False, "status": True}
+        "tester", tweet_info, {"r18": True, "media": False, "status": True}
     )
 
     assert captured_context["tweet"]["media"][0]["url"] == prepared_url
@@ -182,83 +183,41 @@ async def test_screenshot_uses_prepared_copy_but_sends_original_media(
 
 
 @pytest.mark.asyncio
-async def test_concurrent_sends_only_clean_their_own_files(plugin_module, tmp_path):
+async def test_pre_downloaded_image_uses_from_bytes(plugin_module):
     plugin = plugin_module.TwitterPlugin.__new__(plugin_module.TwitterPlugin)
-    plugin.use_node = False
-    first_path = tmp_path / "first.jpg"
-    second_path = tmp_path / "second.jpg"
-    first_path.write_bytes(b"first")
-    second_path.write_bytes(b"second")
-    paths = {"first": first_path, "second": second_path}
+    plugin.pre_download_media = True
+    plugin.proxy = "http://127.0.0.1:7890"
+    image_bytes = b"downloaded-image"
 
-    second_started = asyncio.Event()
-    release_second = asyncio.Event()
+    class TwitterAPI:
+        async def download_media(self, url):
+            assert url == "https://example.com/image.jpg"
+            return image_bytes
 
-    class Context:
-        async def send_message(self, umo, _message_chain):
-            assert paths[umo].exists()
-            if umo == "second":
-                second_started.set()
-                await release_second.wait()
+    plugin.twitter_api = TwitterAPI()
 
-    async def build_message(username, *_args, **_kwargs):
-        path = paths[username]
-        return plugin_module.BuiltTweetMessage(
-            chain=[Image.fromFileSystem(path)],
-            temp_files=[str(path)],
-        )
-
-    plugin.context = Context()
-    plugin._build_tweet_message_chain = build_message
-
-    second_task = asyncio.create_task(
-        plugin._send_tweet_to_subscriber(
-            "second", "second", {}, {}, "second"
-        )
+    component = await plugin._build_image_component(
+        "https://example.com/image.jpg"
     )
-    await second_started.wait()
-    await plugin._send_tweet_to_subscriber("first", "first", {}, {}, "first")
 
-    assert not first_path.exists()
-    assert second_path.exists()
-
-    release_second.set()
-    await second_task
-    assert not second_path.exists()
+    assert isinstance(component, Image)
+    assert component.data == image_bytes
 
 
 @pytest.mark.asyncio
-async def test_collective_batch_cleans_files_after_success(plugin_module, tmp_path):
+async def test_pre_download_failure_falls_back_to_remote_url(plugin_module):
     plugin = plugin_module.TwitterPlugin.__new__(plugin_module.TwitterPlugin)
-    media_path = tmp_path / "collective.jpg"
-    media_path.write_bytes(b"collective")
-    sent = False
+    plugin.pre_download_media = True
+    plugin.proxy = "http://127.0.0.1:7890"
 
-    class Context:
-        async def send_message(self, _umo, _message_chain):
-            nonlocal sent
-            assert media_path.exists()
-            sent = True
+    class TwitterAPI:
+        async def download_media(self, _url):
+            raise RuntimeError("proxy unavailable")
 
-    async def build_message(*_args, **_kwargs):
-        return plugin_module.BuiltTweetMessage(
-            chain=[Image.fromFileSystem(media_path)],
-            temp_files=[str(media_path)],
-        )
+    plugin.twitter_api = TwitterAPI()
+    image_url = "https://example.com/image.jpg"
 
-    plugin.context = Context()
-    plugin._build_tweet_message_chain = build_message
-    plugin._send_video_or_fallback = lambda *_args, **_kwargs: None
-    cached_tweet = plugin_module.CachedTweet(
-        username="tester",
-        tweet_info={},
-        sub_config={},
-        nickname="tester",
-    )
+    component = await plugin._build_image_component(image_url)
 
-    await plugin._send_collected_batch(
-        "umo", ["tester"], {"tester": [cached_tweet]}, 0, 1
-    )
-
-    assert sent
-    assert not media_path.exists()
+    assert isinstance(component, Image)
+    assert component.file == image_url

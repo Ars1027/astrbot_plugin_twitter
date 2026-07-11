@@ -37,11 +37,8 @@ AstrBot Twitter 推文转发插件
 """
 
 import asyncio
-import os
 import re
-import shutil
-import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -77,14 +74,6 @@ class CachedTweet:
     nickname: str
     translated_text: str | None = None
     translate_model: str | None = None
-
-
-@dataclass
-class BuiltTweetMessage:
-    """已构建的消息链及其独占的临时文件。"""
-
-    chain: list
-    temp_files: list[str] = field(default_factory=list)
 
 
 class TwitterPlugin(Star):
@@ -245,9 +234,6 @@ class TwitterPlugin(Star):
         # 集体转发推文缓存：{umo: [CachedTweet, ...]}
         self._collected_tweets: dict[str, list[CachedTweet]] = {}
 
-        # 媒体临时文件管理
-        self._media_temp_dir = tempfile.mkdtemp(prefix="twitter_plugin_media_")
-
     async def initialize(self):
         """插件初始化"""
         logger.info("Twitter 推文转发插件初始化中...")
@@ -287,11 +273,6 @@ class TwitterPlugin(Star):
         if self._collected_tweets:
             logger.info("正在发送剩余缓存的推文...")
             await self._flush_collected_tweets()
-        # 清理异常退出时可能残留的媒体临时文件
-        try:
-            shutil.rmtree(self._media_temp_dir, ignore_errors=True)
-        except Exception:
-            pass
         await self.twitter_api.close()
         logger.info("Twitter 推文转发插件已停止")
 
@@ -420,12 +401,11 @@ class TwitterPlugin(Star):
         chain: list,
         images: list,
         videos: list,
-        temp_files: list[str],
         context_label: str = "推文",
     ):
         """把图片和视频追加到消息链，供主贴和引用帖复用。
 
-        当插件配置了代理时，图片会通过代理预下载到本地临时文件，
+        当插件配置了代理时，图片会通过代理预下载为内存字节，
         避免下游消息适配器直连外部服务器导致超时。
         """
         if not self.send_media_separately:
@@ -433,9 +413,7 @@ class TwitterPlugin(Star):
 
         for img_url in images:
             try:
-                img_comp = await self._build_image_component(
-                    str(img_url), temp_files
-                )
+                img_comp = await self._build_image_component(str(img_url))
                 if img_comp is not None:
                     chain.append(img_comp)
             except Exception as e:
@@ -461,12 +439,10 @@ class TwitterPlugin(Star):
                 )
                 chain.append(Comp.Plain(str(f"\n视频: {video_url}")))
 
-    async def _build_image_component(
-        self, img_url: str, temp_files: list[str]
-    ) -> Comp.Image | None:
+    async def _build_image_component(self, img_url: str) -> Comp.Image | None:
         """根据代理配置选择合适的图片组件构建方式。
 
-        有代理时：通过代理下载图片到本地临时文件，使用 fromFileSystem，
+        有代理时：通过代理下载图片字节，使用 fromBytes，
         避免下游消息适配器直连外部服务器。
         无代理时：使用 fromURL，由 AstrBot 核心/适配器自行下载。
         """
@@ -477,49 +453,14 @@ class TwitterPlugin(Star):
         if not (self.pre_download_media and self.proxy):
             return Comp.Image.fromURL(img_url)
 
-        # 通过代理下载到本地，使用本地路径
+        # 通过代理下载并直接构建图片组件，交由 AstrBot 管理媒体数据。
         try:
             data = await self.twitter_api.download_media(img_url)
         except Exception as e:
             logger.warning(f"通过代理下载图片失败 {img_url}: {e}，回退为远程 URL")
             return Comp.Image.fromURL(img_url)
 
-        suffix = self._guess_image_suffix(img_url)
-        tmp = tempfile.NamedTemporaryFile(
-            suffix=suffix, delete=False, dir=self._media_temp_dir
-        )
-        try:
-            tmp.write(data)
-            tmp.close()
-            temp_files.append(tmp.name)
-            return Comp.Image.fromFileSystem(tmp.name)
-        except Exception:
-            tmp.close()
-            try:
-                os.unlink(tmp.name)
-            except OSError:
-                pass
-            raise
-
-    @staticmethod
-    def _guess_image_suffix(url: str) -> str:
-        """根据 URL 或常见模式推测图片文件后缀。"""
-        url_lower = str(url or "").lower()
-        for ext in (".webp", ".png", ".gif", ".bmp", ".svg"):
-            if ext in url_lower:
-                return ext
-        # Nitter /pic/orig/ 路由默认返回 JPEG
-        return ".jpg"
-
-    @staticmethod
-    def _cleanup_temp_files(temp_files: list[str]) -> None:
-        """只清理当前消息拥有的媒体临时文件。"""
-        for path in temp_files:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
-        temp_files.clear()
+        return Comp.Image.fromBytes(data)
 
     async def _maybe_translate(
         self, tweet_info: dict, umo: str
@@ -669,7 +610,6 @@ class TwitterPlugin(Star):
         self,
         username: str,
         tweet_info: dict,
-        temp_files: list[str],
         sub_config: dict | None = None,
         translated_text: str | None = None,
         translate_model: str | None = None,
@@ -749,7 +689,6 @@ class TwitterPlugin(Star):
                 chain,
                 quote.get("images") or [],
                 quote.get("videos") or [],
-                temp_files,
                 context_label="引用推文",
             )
 
@@ -758,7 +697,6 @@ class TwitterPlugin(Star):
             chain,
             images,
             tweet_info.get("videos") or [],
-            temp_files,
             context_label="推文",
         )
 
@@ -801,50 +739,39 @@ class TwitterPlugin(Star):
         sub_config: dict | None = None,
         translated_text: str | None = None,
         translate_model: str | None = None,
-    ) -> BuiltTweetMessage:
-        """按当前文本渲染模式构建推文消息链及其临时文件。"""
-        temp_files: list[str] = []
-        try:
-            if self.text_render_mode != "screenshot":
-                chain = await self._build_tweet_chain(
-                    username,
-                    tweet_info,
-                    temp_files,
-                    sub_config,
-                    translated_text=translated_text,
-                    translate_model=translate_model,
-                )
-                return BuiltTweetMessage(chain=chain, temp_files=temp_files)
+    ) -> list:
+        """按当前文本渲染模式构建推文消息链。"""
+        if self.text_render_mode != "screenshot":
+            return await self._build_tweet_chain(
+                username,
+                tweet_info,
+                sub_config,
+                translated_text=translated_text,
+                translate_model=translate_model,
+            )
 
-            try:
-                chain = await self._build_screenshot_tweet_chain(
-                    username,
-                    tweet_info,
-                    temp_files,
-                    sub_config,
-                    translated_text=translated_text,
-                    translate_model=translate_model,
-                )
-            except Exception as e:
-                logger.warning(f"推文截图渲染失败，已回退为文本消息: {e}")
-                chain = await self._build_tweet_chain(
-                    username,
-                    tweet_info,
-                    temp_files,
-                    sub_config,
-                    translated_text=translated_text,
-                    translate_model=translate_model,
-                )
-            return BuiltTweetMessage(chain=chain, temp_files=temp_files)
-        except BaseException:
-            self._cleanup_temp_files(temp_files)
-            raise
+        try:
+            return await self._build_screenshot_tweet_chain(
+                username,
+                tweet_info,
+                sub_config,
+                translated_text=translated_text,
+                translate_model=translate_model,
+            )
+        except Exception as e:
+            logger.warning(f"推文截图渲染失败，已回退为文本消息: {e}")
+            return await self._build_tweet_chain(
+                username,
+                tweet_info,
+                sub_config,
+                translated_text=translated_text,
+                translate_model=translate_model,
+            )
 
     async def _build_screenshot_tweet_chain(
         self,
         username: str,
         tweet_info: dict,
-        temp_files: list[str],
         sub_config: dict | None = None,
         translated_text: str | None = None,
         translate_model: str | None = None,
@@ -896,7 +823,6 @@ class TwitterPlugin(Star):
                 chain,
                 quote.get("images") or [],
                 quote.get("videos") or [],
-                temp_files,
                 context_label="引用推文",
             )
 
@@ -904,7 +830,6 @@ class TwitterPlugin(Star):
             chain,
             tweet_info.get("images") or [],
             tweet_info.get("videos") or [],
-            temp_files,
             context_label="推文",
         )
 
@@ -1189,14 +1114,12 @@ class TwitterPlugin(Star):
         translate_model: str | None = None,
     ):
         """向单个订阅者发送推文消息"""
-        built_message = BuiltTweetMessage(chain=[])
         try:
-            built_message = await self._build_tweet_message_chain(
+            chain = await self._build_tweet_message_chain(
                 username, tweet_info, sub_config,
                 translated_text=translated_text,
                 translate_model=translate_model,
             )
-            chain = built_message.chain
             if not chain:
                 return
 
@@ -1237,78 +1160,6 @@ class TwitterPlugin(Star):
             logger.info(f"推文已推送至 {umo}")
         except Exception as e:
             logger.error(f"推送推文至 {umo} 失败: {e}")
-        finally:
-            self._cleanup_temp_files(built_message.temp_files)
-
-    async def _send_collected_batch(
-        self,
-        umo: str,
-        batch_authors: list[str],
-        seen_authors: dict[str, list[CachedTweet]],
-        batch_index: int,
-        batch_count: int,
-    ) -> None:
-        """发送一批集体转发消息，并清理该批次独占的临时文件。"""
-        temp_files: list[str] = []
-        nodes: list[Node] = []
-        video_queue: list[Comp.Video] = []
-
-        try:
-            for author in batch_authors:
-                for cached_tweet in seen_authors[author]:
-                    built_message = await self._build_tweet_message_chain(
-                        cached_tweet.username,
-                        cached_tweet.tweet_info,
-                        cached_tweet.sub_config,
-                        translated_text=cached_tweet.translated_text,
-                        translate_model=cached_tweet.translate_model,
-                    )
-                    temp_files.extend(built_message.temp_files)
-                    if not built_message.chain:
-                        continue
-
-                    tweet_nodes, tweet_videos = self._split_chain_for_nodes(
-                        built_message.chain, cached_tweet.nickname
-                    )
-                    nodes.extend(tweet_nodes)
-                    video_queue.extend(tweet_videos)
-
-            if nodes:
-                batch_label = ""
-                if batch_count > 1:
-                    batch_label = f"（第{batch_index + 1}/{batch_count}批）"
-                try:
-                    message_chain = MessageChain(chain=[Nodes(nodes)])
-                    await self.context.send_message(umo, message_chain)
-                    logger.info(
-                        f"集体转发已推送至 {umo} "
-                        f"{batch_label}共 {len(nodes)} 个节点"
-                    )
-                except Exception as node_err:
-                    logger.warning(
-                        f"集体合并转发失败，回退逐条发送: {node_err}"
-                    )
-                    for cached_tweet in [
-                        cached_tweet
-                        for author in batch_authors
-                        for cached_tweet in seen_authors[author]
-                    ]:
-                        await self._send_tweet_to_subscriber(
-                            umo,
-                            cached_tweet.username,
-                            cached_tweet.tweet_info,
-                            cached_tweet.sub_config,
-                            cached_tweet.nickname,
-                            translated_text=cached_tweet.translated_text,
-                            translate_model=cached_tweet.translate_model,
-                        )
-                    # 回退逐条发送已包含视频，不再重复发送。
-                    video_queue.clear()
-
-            for video_component in video_queue:
-                await self._send_video_or_fallback(umo, video_component)
-        finally:
-            self._cleanup_temp_files(temp_files)
 
     async def _flush_collected_tweets(self):
         """将缓存的推文按推主分组打包为合并转发消息发送"""
@@ -1363,13 +1214,64 @@ class TwitterPlugin(Star):
                     author_batches.append(author_order[i : i + max_authors])
 
                 for batch_idx, batch_authors in enumerate(author_batches):
-                    await self._send_collected_batch(
-                        umo,
-                        batch_authors,
-                        seen_authors,
-                        batch_idx,
-                        len(author_batches),
-                    )
+                    nodes: list[Node] = []
+                    video_queue: list[Comp.Video] = []
+
+                    for author in batch_authors:
+                        for ct in seen_authors[author]:
+                            chain = await self._build_tweet_message_chain(
+                                ct.username, ct.tweet_info, ct.sub_config,
+                                translated_text=ct.translated_text,
+                                translate_model=ct.translate_model,
+                            )
+                            if not chain:
+                                continue
+
+                            ct_nodes, ct_videos = self._split_chain_for_nodes(
+                                chain, ct.nickname
+                            )
+                            nodes.extend(ct_nodes)
+                            video_queue.extend(ct_videos)
+
+                    # 发送合并转发消息
+                    if nodes:
+                        batch_label = ""
+                        if len(author_batches) > 1:
+                            batch_label = (
+                                f"（第{batch_idx + 1}/{len(author_batches)}批）"
+                            )
+                        try:
+                            message_chain = MessageChain(chain=[Nodes(nodes)])
+                            await self.context.send_message(umo, message_chain)
+                            logger.info(
+                                f"集体转发已推送至 {umo} "
+                                f"{batch_label}共 {len(nodes)} 个节点"
+                            )
+                        except Exception as node_err:
+                            logger.warning(
+                                f"集体合并转发失败，回退逐条发送: {node_err}"
+                            )
+                            # 回退：逐条发送
+                            for ct in [
+                                ct
+                                for a in batch_authors
+                                for ct in seen_authors[a]
+                            ]:
+                                await self._send_tweet_to_subscriber(
+                                    umo,
+                                    ct.username,
+                                    ct.tweet_info,
+                                    ct.sub_config,
+                                    ct.nickname,
+                                    translated_text=ct.translated_text,
+                                    translate_model=ct.translate_model,
+                                )
+                            # 回退模式下跳过独立视频发送（已在逐条发送中处理）
+                            video_queue.clear()
+
+                    # 逐条发送视频（独立消息，避免超时）
+                    for vid_comp in video_queue:
+                        await self._send_video_or_fallback(umo, vid_comp)
 
             except Exception as e:
                 logger.error(f"集体转发推送至 {umo} 失败: {e}")
@@ -1825,46 +1727,42 @@ class TwitterPlugin(Star):
         )
 
         # 构建并返回消息
-        built_message = await self._build_tweet_message_chain(
+        chain = await self._build_tweet_message_chain(
             username, tweet_info,
             translated_text=translated_text,
             translate_model=translate_model,
         )
-        try:
-            chain = built_message.chain
-            if not chain:
-                yield event.plain_result(f"未找到 @{username} 的推文内容")
-                return
+        if not chain:
+            yield event.plain_result(f"未找到 @{username} 的推文内容")
+            return
 
-            if self.use_node:
-                # 合并转发模式
-                author_username = str(tweet_info.get("username") or username)
-                screen_name = str(tweet_info.get("screen_name") or author_username)
-                nickname = self._build_author_display(author_username, screen_name)
-                try:
-                    nodes, video_parts = self._split_chain_for_nodes(chain, nickname)
-                    if nodes:
-                        yield event.chain_result([Nodes(nodes)])
-                    else:
-                        yield event.plain_result(f"未找到 @{username} 的推文内容")
-                    # 视频无法通过 yield 发送，作为独立消息发送
-                    for vid_comp in video_parts:
-                        await self._send_video_or_fallback(umo, vid_comp)
-                except Exception:
-                    # 合并转发失败，回退到普通消息链
-                    plain_chain, video_parts = self._split_plain_chain_and_videos(chain)
-                    if plain_chain:
-                        yield event.chain_result(plain_chain)
-                    for vid_comp in video_parts:
-                        await self._send_video_or_fallback(umo, vid_comp)
-            else:
+        if self.use_node:
+            # 合并转发模式
+            author_username = str(tweet_info.get("username") or username)
+            screen_name = str(tweet_info.get("screen_name") or author_username)
+            nickname = self._build_author_display(author_username, screen_name)
+            try:
+                nodes, video_parts = self._split_chain_for_nodes(chain, nickname)
+                if nodes:
+                    yield event.chain_result([Nodes(nodes)])
+                else:
+                    yield event.plain_result(f"未找到 @{username} 的推文内容")
+                # 视频无法通过 yield 发送，作为独立消息发送
+                for vid_comp in video_parts:
+                    await self._send_video_or_fallback(umo, vid_comp)
+            except Exception:
+                # 合并转发失败，回退到普通消息链
                 plain_chain, video_parts = self._split_plain_chain_and_videos(chain)
                 if plain_chain:
                     yield event.chain_result(plain_chain)
                 for vid_comp in video_parts:
                     await self._send_video_or_fallback(umo, vid_comp)
-        finally:
-            self._cleanup_temp_files(built_message.temp_files)
+        else:
+            plain_chain, video_parts = self._split_plain_chain_and_videos(chain)
+            if plain_chain:
+                yield event.chain_result(plain_chain)
+            for vid_comp in video_parts:
+                await self._send_video_or_fallback(umo, vid_comp)
 
     # ========== 链接识别 ==========
 
@@ -1892,7 +1790,6 @@ class TwitterPlugin(Star):
         if not self.twitter_api.nitter_url:
             return
 
-        built_message = BuiltTweetMessage(chain=[])
         try:
             tweet_info = await self.twitter_api.get_tweet(username, tweet_id)
 
@@ -1902,14 +1799,13 @@ class TwitterPlugin(Star):
             )
 
             # 构建推文消息链
-            built_message = await self._build_tweet_message_chain(
+            chain = await self._build_tweet_message_chain(
                 username,
                 tweet_info,
                 {"r18": True, "media": False, "status": True},
                 translated_text=translated_text,
                 translate_model=translate_model,
             )
-            chain = built_message.chain
             if not chain:
                 return
 
@@ -1942,5 +1838,3 @@ class TwitterPlugin(Star):
 
         except Exception as e:
             logger.error(f"解析推文链接失败: {e}")
-        finally:
-            self._cleanup_temp_files(built_message.temp_files)
