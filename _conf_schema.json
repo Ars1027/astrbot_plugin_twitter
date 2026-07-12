@@ -16,6 +16,12 @@
         "hint": "例如: http://127.0.0.1:7890 或 socks5://127.0.0.1:1080",
         "default": ""
       },
+      "twitter_pre_download_media": {
+        "description": "通过代理加载图片（需先配置代理地址）",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，插件会先通过代理下载图片，再交给 AstrBot 发送或 Chromium 生成截图，避免因直连外部服务器导致图片加载超时。关闭后，图片由 AstrBot 或 Chromium 直接从原链接加载，不使用代理。"
+      },
       "twitter_poll_interval": {
         "description": "推文轮询间隔（分钟）",
         "type": "int",

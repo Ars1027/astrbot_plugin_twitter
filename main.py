@@ -38,7 +38,7 @@ AstrBot Twitter 推文转发插件
 
 import asyncio
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -212,6 +212,9 @@ class TwitterPlugin(Star):
         self.image_quality = str(
             self._cfg("message_format", "twitter_image_quality", "orig") or "orig"
         ).strip()
+        self.pre_download_media = bool(
+            self._cfg("basic", "twitter_pre_download_media", False)
+        )
 
         # 构建镜像站列表
         self.website_list: list[str] = []
@@ -394,15 +397,23 @@ class TwitterPlugin(Star):
         return size_bytes > limit_bytes, size_bytes
 
     async def _append_media_components(
-        self, chain: list, images: list, videos: list, context_label: str = "推文"
+        self,
+        chain: list,
+        images: list,
+        videos: list,
+        context_label: str = "推文",
     ):
-        """把图片和视频追加到消息链，供主贴和引用帖复用。"""
+        """把图片和视频追加到消息链，供主贴和引用帖复用。
+
+        当插件配置了代理时，图片会通过代理预下载为内存字节，
+        避免下游消息适配器直连外部服务器导致超时。
+        """
         if not self.send_media_separately:
             return
 
         for img_url in images:
             try:
-                img_comp = Comp.Image.fromURL(str(img_url))
+                img_comp = await self._build_image_component(str(img_url))
                 if img_comp is not None:
                     chain.append(img_comp)
             except Exception as e:
@@ -427,6 +438,29 @@ class TwitterPlugin(Star):
                     f"添加{context_label}视频失败，回退为链接: {video_url}, {e}"
                 )
                 chain.append(Comp.Plain(str(f"\n视频: {video_url}")))
+
+    async def _build_image_component(self, img_url: str) -> Comp.Image | None:
+        """根据代理配置选择合适的图片组件构建方式。
+
+        有代理时：通过代理下载图片字节，使用 fromBytes，
+        避免下游消息适配器直连外部服务器。
+        无代理时：使用 fromURL，由 AstrBot 核心/适配器自行下载。
+        """
+        img_url = str(img_url or "").strip()
+        if not img_url:
+            return None
+
+        if not (self.pre_download_media and self.proxy):
+            return Comp.Image.fromURL(img_url)
+
+        # 通过代理下载并直接构建图片组件，交由 AstrBot 管理媒体数据。
+        try:
+            data = await self.twitter_api.download_media(img_url)
+        except Exception as e:
+            logger.warning(f"通过代理下载图片失败 {img_url}: {e}，回退为远程 URL")
+            return Comp.Image.fromURL(img_url)
+
+        return Comp.Image.fromBytes(data)
 
     async def _maybe_translate(
         self, tweet_info: dict, umo: str
@@ -660,7 +694,10 @@ class TwitterPlugin(Star):
 
         # 主贴媒体
         await self._append_media_components(
-            chain, images, tweet_info.get("videos") or [], context_label="推文"
+            chain,
+            images,
+            tweet_info.get("videos") or [],
+            context_label="推文",
         )
 
         # 过滤 None 值，防止类型验证错误
@@ -739,18 +776,27 @@ class TwitterPlugin(Star):
         translated_text: str | None = None,
         translate_model: str | None = None,
     ) -> list:
-        """构建正文以 X 风格卡片截图展示的消息链。"""
+        """构建正文以 X 风格卡片截图展示的消息链。
+
+        当开启预下载媒体且配置了代理时，提前将所有图片转为 base64
+        data URI 内嵌到 HTML 模板中，避免 Chromium 直连外部服务器。
+        """
         if sub_config is None:
             sub_config = {"r18": True, "media": False, "status": True}
 
         chain: list = []
         has_media = self._tweet_has_media(tweet_info)
         render_text_card = not (self.no_text and has_media)
+        render_tweet_info = tweet_info
 
         if render_text_card:
+            # 预下载模式：将图片转为 data URI 内嵌，HTML 渲染零外部请求
+            if self.pre_download_media and self.proxy:
+                render_tweet_info = await self._prepare_screenshot_media(tweet_info)
+
             context = build_tweet_card_context(
                 username,
-                tweet_info,
+                render_tweet_info,
                 translated_text=translated_text,
                 translate_model=translate_model,
                 theme=self.screenshot_theme,
@@ -788,6 +834,74 @@ class TwitterPlugin(Star):
         )
 
         return [c for c in chain if c is not None]
+
+    async def _prepare_screenshot_media(self, tweet_info: dict) -> dict:
+        """预下载推文中的所有图片并转为 data URI，返回深拷贝后的 tweet_info。
+
+        下载使用插件已配置代理的 TwitterAPI 客户端，确保在网络受限环境
+        下也能正常获取图片数据。下载失败时保留原始 URL 作为降级。
+        """
+        import copy
+        result = copy.deepcopy(tweet_info)
+
+        # 主贴头像
+        avatar_url = str(result.get("avatar") or "").strip()
+        if avatar_url:
+            data_uri = await self._download_to_data_uri_safe(avatar_url)
+            if data_uri:
+                result["avatar"] = data_uri
+
+        # 主贴图片
+        result["images"] = [
+            await self._download_to_data_uri_safe(str(u)) or str(u)
+            for u in (result.get("images") or [])
+        ]
+
+        # 视频封面
+        previews = result.get("video_previews") or []
+        for p in previews:
+            if isinstance(p, dict):
+                poster = str(p.get("poster") or "").strip()
+                if poster:
+                    data_uri = await self._download_to_data_uri_safe(poster)
+                    if data_uri:
+                        p["poster"] = data_uri
+
+        # 引用推文
+        quote = result.get("quote") or None
+        if quote:
+            quote_avatar = str(quote.get("avatar") or "").strip()
+            if quote_avatar:
+                data_uri = await self._download_to_data_uri_safe(quote_avatar)
+                if data_uri:
+                    quote["avatar"] = data_uri
+
+            quote["images"] = [
+                await self._download_to_data_uri_safe(str(u)) or str(u)
+                for u in (quote.get("images") or [])
+            ]
+
+            quote_previews = quote.get("video_previews") or []
+            for p in quote_previews:
+                if isinstance(p, dict):
+                    poster = str(p.get("poster") or "").strip()
+                    if poster:
+                        data_uri = await self._download_to_data_uri_safe(poster)
+                        if data_uri:
+                            p["poster"] = data_uri
+
+        return result
+
+    async def _download_to_data_uri_safe(self, url: str) -> str | None:
+        """安全地将远程 URL 下载并转为 data URI，失败返回 None。"""
+        url = str(url or "").strip()
+        if not url:
+            return None
+        try:
+            return await self.twitter_api.download_media_to_data_uri(url)
+        except Exception as e:
+            logger.debug(f"预下载截图媒体失败 {url}: {e}")
+            return None
 
     def _split_chain_for_nodes(
         self, chain: list, nickname: str
