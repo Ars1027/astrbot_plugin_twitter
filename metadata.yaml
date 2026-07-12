@@ -1,7 +1,7 @@
 name: astrbot_plugin_twitter
 display_name: Twitter 推文转发
 desc: 基于 Nitter 的推特转发插件，支持订阅推主、定时推送、链接识别、合并转发消息
-version: v1.7.0
+version: v1.7.1
 author: Ars1027
 support_platforms: 
   - aiocqhttp
