@@ -1,0 +1,5 @@
+{
+  "code": 429,
+  "message": "Rate limit exceeded",
+  "retry_after": 60
+}

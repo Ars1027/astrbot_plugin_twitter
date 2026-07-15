@@ -1,0 +1,10 @@
+{
+  "type": "status",
+  "id": "1010",
+  "url": "https://x.com/tester/status/1010",
+  "text": "sensitive",
+  "created_at": "Tue Jul 14 15:04:00 +0000 2026",
+  "author": {"name": "Test User", "screen_name": "tester"},
+  "possibly_sensitive": true,
+  "media": {}
+}

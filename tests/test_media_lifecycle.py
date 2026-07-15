@@ -116,6 +116,10 @@ def _load_main_module():
     sys.modules[package_name] = package
 
     twitter_api = types.ModuleType(f"{package_name}.twitter_api")
+    twitter_api.DATA_PROVIDER_NITTER = "nitter"
+    twitter_api.DATA_PROVIDER_FXTWITTER = "fxtwitter"
+    twitter_api.DATA_PROVIDER_OPTIONS = ("nitter", "fxtwitter")
+    twitter_api.DEFAULT_FXTWITTER_API_BASE = "https://api.fxtwitter.com"
     twitter_api.TwitterAPI = object
     twitter_api.WEBSITE_LIST = []
     twitter_api.get_next_website = lambda *_args, **_kwargs: None
@@ -221,3 +225,25 @@ async def test_pre_download_failure_falls_back_to_remote_url(plugin_module):
 
     assert isinstance(component, Image)
     assert component.file == image_url
+
+
+@pytest.mark.asyncio
+async def test_media_send_failure_preserves_text(plugin_module):
+    plugin = plugin_module.TwitterPlugin.__new__(plugin_module.TwitterPlugin)
+
+    class Context:
+        def __init__(self):
+            self.sent = []
+
+        async def send_message(self, _umo, message_chain):
+            self.sent.append(message_chain.chain)
+            if any(isinstance(component, Image) for component in message_chain.chain):
+                raise RuntimeError("media unavailable")
+
+    plugin.context = Context()
+    chain = [Plain("tweet text"), Image.fromURL("https://example.com/image.jpg")]
+
+    await plugin._send_plain_chain_resilient("session", chain)
+
+    assert len(plugin.context.sent) == 3
+    assert plugin.context.sent[1][0].text == "tweet text"

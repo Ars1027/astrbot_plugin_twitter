@@ -1,0 +1,9 @@
+{
+  "code": 200,
+  "results": [
+    {"type": "status", "id": "103", "url": "https://x.com/tester/status/103", "text": "three", "created_at": "Tue Jul 14 15:03:00 +0000 2026", "author": {"name": "Tester", "screen_name": "tester"}, "media": {}},
+    {"type": "status", "id": "102", "url": "https://x.com/tester/status/102", "text": "two", "created_at": "Tue Jul 14 15:02:00 +0000 2026", "author": {"name": "Tester", "screen_name": "tester"}, "media": {}},
+    {"type": "status", "id": "101", "url": "https://x.com/tester/status/101", "text": "cursor boundary", "created_at": "Tue Jul 14 15:01:00 +0000 2026", "author": {"name": "Tester", "screen_name": "tester"}, "media": {}}
+  ],
+  "cursor": {"top": "page-1", "bottom": null}
+}

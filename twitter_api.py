@@ -1,11 +1,15 @@
 """
 Twitter API 交互模块
-通过 Nitter 镜像站获取 Twitter/X 推文数据
+通过 Nitter HTML 或 FxTwitter JSON API 获取 Twitter/X 推文数据
 """
 
+import asyncio
 import base64
 import re
-from typing import Optional
+from collections import OrderedDict
+from datetime import datetime
+from typing import Any, Optional
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import httpx
 from bs4 import BeautifulSoup, Tag
@@ -19,19 +23,54 @@ WEBSITE_LIST = [
 # 有效的图片质量选项
 IMAGE_QUALITY_OPTIONS = ("large", "orig")
 
+DATA_PROVIDER_NITTER = "nitter"
+DATA_PROVIDER_FXTWITTER = "fxtwitter"
+DATA_PROVIDER_OPTIONS = (DATA_PROVIDER_NITTER, DATA_PROVIDER_FXTWITTER)
+DEFAULT_FXTWITTER_API_BASE = "https://api.fxtwitter.com"
+FXTWITTER_MAX_TIMELINE_PAGES = 4
+FXTWITTER_MAX_TIMELINE_ITEMS = 100
+FXTWITTER_STATUS_CACHE_SIZE = 200
+
 # 直播推文链接特征（推文链接中包含此路径即为直播）
 BROADCAST_LINK_PATTERN = re.compile(r'/i/broadcasts/', re.IGNORECASE)
 
 
 class TwitterAPI:
-    """Twitter API 交互类，通过 Nitter 镜像站获取推文"""
+    """Twitter 数据访问层，向上提供兼容的 Nitter/FxTwitter 接口。"""
 
-    def __init__(self, proxy: Optional[str] = None, nitter_url: str = "",
-                 image_quality: str = "orig"):
+    def __init__(
+        self,
+        proxy: Optional[str] = None,
+        nitter_url: str = "",
+        image_quality: str = "orig",
+        provider: str = DATA_PROVIDER_NITTER,
+        fxtwitter_api_base: str = DEFAULT_FXTWITTER_API_BASE,
+        fxtwitter_max_pages: int = FXTWITTER_MAX_TIMELINE_PAGES,
+        fxtwitter_max_items: int = FXTWITTER_MAX_TIMELINE_ITEMS,
+    ):
         self.proxy = proxy
         self.nitter_url = nitter_url
         self.image_quality = image_quality if image_quality in IMAGE_QUALITY_OPTIONS else "orig"
+        provider = str(provider or DATA_PROVIDER_NITTER).strip().lower()
+        self.provider = (
+            provider if provider in DATA_PROVIDER_OPTIONS else DATA_PROVIDER_NITTER
+        )
+        self.fxtwitter_api_base = (
+            str(fxtwitter_api_base or DEFAULT_FXTWITTER_API_BASE).strip().rstrip("/")
+            or DEFAULT_FXTWITTER_API_BASE
+        )
+        self.fxtwitter_max_pages = max(1, min(int(fxtwitter_max_pages), 10))
+        self.fxtwitter_max_items = max(1, min(int(fxtwitter_max_items), 500))
+        self.provider_ready = False
         self._client: Optional[httpx.AsyncClient] = None
+        self._status_cache: OrderedDict[str, dict] = OrderedDict()
+
+    @property
+    def is_ready(self) -> bool:
+        """当前数据源是否已通过初始化检查。"""
+        if self.provider == DATA_PROVIDER_FXTWITTER:
+            return self.provider_ready
+        return bool(self.nitter_url)
 
     async def _get_client(self) -> httpx.AsyncClient:
         """获取或创建异步 HTTP 客户端"""
@@ -40,18 +79,97 @@ class TwitterAPI:
             self._client = httpx.AsyncClient(
                 proxy=proxy,
                 http2=True,
-                timeout=30.0,
+                timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0),
                 follow_redirects=True,
                 headers={
                     "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
+                        "AstrBot-Twitter-Plugin/1.8 "
+                        "(+https://github.com/Ars1027/astrbot_plugin_twitter)"
                     ),
+                    "Accept": "application/json, text/html;q=0.9, */*;q=0.8",
                     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
                 },
             )
         return self._client
+
+    async def _request_fxtwitter_json(
+        self,
+        path: str,
+        params: Optional[dict[str, Any]] = None,
+        retries: int = 2,
+    ) -> Optional[dict]:
+        """请求 FxTwitter JSON，统一处理超时、限流、5xx 与解码错误。"""
+        client = await self._get_client()
+        url = f"{self.fxtwitter_api_base}/{str(path or '').lstrip('/')}"
+        attempts = max(1, int(retries))
+
+        for attempt in range(attempts):
+            try:
+                resp = await client.get(url, params=params)
+            except httpx.TimeoutException as e:
+                logger.warning(f"FxTwitter API 连接或读取超时: {url}, {e}")
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                return None
+            except httpx.RequestError as e:
+                logger.warning(f"FxTwitter API 请求失败: {url}, {e}")
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                return None
+
+            if resp.status_code == 429:
+                retry_after = str(resp.headers.get("Retry-After") or "").strip()
+                suffix = f"，Retry-After={retry_after}" if retry_after else ""
+                logger.warning(f"FxTwitter API 触发限流: {url}{suffix}")
+                return None
+
+            if 500 <= resp.status_code < 600:
+                logger.warning(
+                    f"FxTwitter API 服务端错误: {url}, 状态码: {resp.status_code}, "
+                    f"尝试 {attempt + 1}/{attempts}"
+                )
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                return None
+
+            if resp.status_code < 200 or resp.status_code >= 300:
+                logger.warning(
+                    f"FxTwitter API 请求失败: {url}, 状态码: {resp.status_code}"
+                )
+                return None
+
+            try:
+                payload = resp.json()
+            except ValueError:
+                summary = re.sub(r"\s+", " ", resp.text[:240]).strip()
+                logger.warning(
+                    f"FxTwitter API JSON 解码失败: {url}, 状态码: "
+                    f"{resp.status_code}, 响应摘要: {summary!r}"
+                )
+                return None
+
+            if not isinstance(payload, dict):
+                logger.warning(f"FxTwitter API 返回非对象 JSON: {url}")
+                return None
+
+            api_code = payload.get("code")
+            try:
+                api_ok = int(api_code) == 200
+            except (TypeError, ValueError):
+                api_ok = False
+            if not api_ok:
+                message = str(payload.get("message") or "")[:160]
+                logger.warning(
+                    f"FxTwitter API 内部错误: {url}, code={api_code}, "
+                    f"message={message!r}"
+                )
+                return None
+            return payload
+
+        return None
 
     async def download_media(self, url: str) -> bytes:
         """通过已配置代理的 HTTP 客户端下载媒体文件。
@@ -181,6 +299,9 @@ class TwitterAPI:
 
     async def check_website_available(self, website_list: list[str]) -> Optional[str]:
         """检测可用的镜像站，返回第一个可用的 URL"""
+        if self.provider != DATA_PROVIDER_NITTER:
+            return None
+
         client = await self._get_client()
         for url in website_list:
             try:
@@ -189,13 +310,32 @@ class TwitterAPI:
                 if resp.status_code == 200:
                     logger.info(f"Nitter 镜像站可用: {url}")
                     self.nitter_url = url
+                    self.provider_ready = True
                     return url
                 logger.debug(f"Nitter 镜像站不可用: {url}, 状态码: {resp.status_code}")
             except Exception as e:
                 logger.debug(f"Nitter 镜像站检测异常: {url}, 错误: {e}")
                 continue
         logger.warning("所有 Nitter 镜像站均不可用")
+        self.provider_ready = False
         return None
+
+    async def check_fxtwitter_available(self) -> bool:
+        """轻量检查 FxTwitter 时间线接口及响应契约。"""
+        if self.provider != DATA_PROVIDER_FXTWITTER:
+            return False
+
+        payload = await self._request_fxtwitter_json(
+            "2/profile/elonmusk/statuses",
+            params={"count": 1},
+        )
+        available = bool(payload and isinstance(payload.get("results"), list))
+        self.provider_ready = available
+        if available:
+            logger.info(f"FxTwitter API 可用: {self.fxtwitter_api_base}")
+        else:
+            logger.warning(f"FxTwitter API 不可用: {self.fxtwitter_api_base}")
+        return available
 
     async def get_user_info(self, username: str) -> dict:
         """获取 Twitter 用户信息
@@ -203,6 +343,9 @@ class TwitterAPI:
         返回:
             {"status": bool, "screen_name": str, "bio": str, "user_name": str}
         """
+        if self.provider == DATA_PROVIDER_FXTWITTER:
+            return await self._get_fxtwitter_user_info(username)
+
         if not self.nitter_url:
             return {"status": False, "screen_name": "", "bio": "", "user_name": username}
 
@@ -230,6 +373,34 @@ class TwitterAPI:
         except Exception as e:
             logger.error(f"获取用户信息失败 {username}: {e}")
             return {"status": False, "screen_name": "", "bio": "", "user_name": username}
+
+    async def _get_fxtwitter_user_info(self, username: str) -> dict:
+        """将 FxTwitter 用户资料转换成插件既有结构。"""
+        username = str(username or "").strip().lstrip("@")
+        failure = {
+            "status": False,
+            "screen_name": "",
+            "bio": "",
+            "user_name": username,
+        }
+        if not username:
+            return failure
+
+        payload = await self._request_fxtwitter_json(
+            f"2/profile/{quote(username, safe='')}"
+        )
+        user = payload.get("user") if payload else None
+        if not isinstance(user, dict):
+            return failure
+
+        user_name = str(user.get("screen_name") or username).strip().lstrip("@")
+        screen_name = str(user.get("name") or user_name).strip()
+        return {
+            "status": bool(user_name),
+            "screen_name": screen_name,
+            "bio": str(user.get("description") or ""),
+            "user_name": user_name or username,
+        }
 
     async def get_user_newtimeline(self, username: str, since_id: str = "") -> list[str]:
         """获取用户比 since_id 更新的推文 ID 列表
@@ -319,10 +490,178 @@ class TwitterAPI:
             parsed_items.reverse()
         return parsed_items
 
+    @staticmethod
+    def _flatten_fxtwitter_results(results: list) -> list[dict]:
+        """兼容普通状态列表和可选的 thread 分组响应。"""
+        flattened: list[dict] = []
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "thread":
+                statuses = item.get("statuses") or []
+                if isinstance(statuses, list):
+                    flattened.extend(
+                        status
+                        for status in statuses
+                        if isinstance(status, dict) and status.get("type") == "status"
+                    )
+            elif item.get("type") == "status":
+                flattened.append(item)
+        return flattened
+
+    def _cache_fxtwitter_status(self, status: dict) -> None:
+        tweet_id = str(status.get("id") or "")
+        if not tweet_id:
+            return
+        self._status_cache[tweet_id] = status
+        self._status_cache.move_to_end(tweet_id)
+        while len(self._status_cache) > FXTWITTER_STATUS_CACHE_SIZE:
+            self._status_cache.popitem(last=False)
+
+    @staticmethod
+    def _fxtwitter_timeline_item(status: dict, requested_username: str) -> dict:
+        author = status.get("author") or {}
+        reposted_by = status.get("reposted_by") or {}
+        is_retweet = isinstance(reposted_by, dict) and bool(
+            reposted_by.get("screen_name") or reposted_by.get("name")
+        )
+        return {
+            "tweet_id": str(status.get("id") or ""),
+            "username": str(author.get("screen_name") or requested_username)
+            .strip()
+            .lstrip("@"),
+            "is_retweet": is_retweet,
+            "retweeter_username": str(
+                reposted_by.get("screen_name") or requested_username
+            )
+            .strip()
+            .lstrip("@"),
+            "retweeter_screen_name": str(
+                reposted_by.get("name")
+                or reposted_by.get("screen_name")
+                or requested_username
+            ).strip(),
+        }
+
+    async def _get_fxtwitter_timeline_items(
+        self, username: str, since_id: str = "", limit: int = 0
+    ) -> list[dict]:
+        """获取 FxTwitter 时间线，有限分页、去重并保持既有排序语义。"""
+        username = str(username or "").strip().lstrip("@")
+        since_id = str(since_id or "").strip()
+        if not username:
+            return []
+
+        try:
+            since_int = int(since_id) if since_id else None
+        except ValueError:
+            logger.warning(
+                f"检测到无效 since_id @{username}: {since_id!r}，"
+                "为避免回放历史，本轮不获取时间线"
+            )
+            return []
+
+        items: list[dict] = []
+        seen_ids: set[str] = set()
+        cursor = ""
+        previous_cursor = ""
+        boundary_found = False
+
+        for page_index in range(self.fxtwitter_max_pages):
+            params: dict[str, Any] = {"count": 20}
+            if cursor:
+                params["cursor"] = cursor
+
+            payload = await self._request_fxtwitter_json(
+                f"2/profile/{quote(username, safe='')}/statuses",
+                params=params,
+            )
+            if payload is None:
+                if page_index > 0:
+                    logger.warning(
+                        f"FxTwitter 时间线分页中断 @{username}: 已完成 {page_index} 页"
+                    )
+                return [] if page_index == 0 else self._finalize_fxtwitter_items(
+                    items, since_int, limit
+                )
+
+            raw_results = payload.get("results")
+            if not isinstance(raw_results, list):
+                logger.warning(f"FxTwitter 时间线 results 不是列表 @{username}")
+                return [] if page_index == 0 else self._finalize_fxtwitter_items(
+                    items, since_int, limit
+                )
+
+            statuses = self._flatten_fxtwitter_results(raw_results)
+            for status in statuses:
+                tweet_id = str(status.get("id") or "")
+                if not tweet_id or tweet_id in seen_ids or status.get("is_pinned") is True:
+                    continue
+                seen_ids.add(tweet_id)
+
+                item = self._fxtwitter_timeline_item(status, username)
+                try:
+                    tweet_int = int(tweet_id)
+                except ValueError:
+                    continue
+
+                if since_int is not None and tweet_int <= since_int:
+                    if tweet_int == since_int or not item.get("is_retweet"):
+                        boundary_found = True
+                    continue
+
+                self._cache_fxtwitter_status(status)
+                items.append(item)
+
+                if since_int is None and limit > 0 and len(items) >= limit:
+                    return items[:limit]
+                if len(seen_ids) >= self.fxtwitter_max_items:
+                    logger.debug(
+                        f"FxTwitter 时间线达到本地抓取上限 @{username}: "
+                        f"{self.fxtwitter_max_items}"
+                    )
+                    boundary_found = True
+                    break
+
+            if boundary_found:
+                break
+
+            cursor_info = payload.get("cursor") or {}
+            next_cursor = (
+                str(cursor_info.get("bottom") or "")
+                if isinstance(cursor_info, dict)
+                else ""
+            )
+            if not next_cursor or next_cursor == cursor or next_cursor == previous_cursor:
+                break
+            previous_cursor, cursor = cursor, next_cursor
+
+        if since_int is not None and not boundary_found and cursor:
+            logger.debug(
+                f"FxTwitter 时间线在 {self.fxtwitter_max_pages} 页内未找到 "
+                f"since_id @{username}: {since_id}"
+            )
+        return self._finalize_fxtwitter_items(items, since_int, limit)
+
+    @staticmethod
+    def _finalize_fxtwitter_items(
+        items: list[dict], since_int: Optional[int], limit: int
+    ) -> list[dict]:
+        if since_int is not None:
+            items.sort(key=lambda item: int(str(item.get("tweet_id") or "0")))
+        if limit > 0:
+            return items[:limit]
+        return items
+
     async def get_user_timeline_items(
         self, username: str, since_id: str = "", limit: int = 0
     ) -> list[dict]:
         """获取用户时间线条目，包含转帖元数据。"""
+        if self.provider == DATA_PROVIDER_FXTWITTER:
+            return await self._get_fxtwitter_timeline_items(
+                username, since_id=since_id, limit=limit
+            )
+
         if not self.nitter_url:
             return []
 
@@ -509,14 +848,12 @@ class TwitterAPI:
                 return True
         return False
 
-    async def get_tweet(self, username: str, tweet_id: str) -> dict:
-        """获取推文详细信息
-
-        返回:
-            推文信息字典，包含 text, images, videos, quote, is_r18,
-            screen_name, retweet 等
-        """
-        result = {
+    @staticmethod
+    def _empty_tweet_result(username: str, tweet_id: str) -> dict:
+        username = str(username or "").strip().lstrip("@")
+        tweet_id = str(tweet_id or "").strip()
+        return {
+            "status": False,
             "tweet_id": tweet_id,
             "username": username,
             "screen_name": username,
@@ -531,7 +868,295 @@ class TwitterAPI:
             "quote": None,
             "retweet": None,
             "is_r18": False,
+            "url": (
+                f"https://x.com/{username}/status/{tweet_id}"
+                if username and tweet_id
+                else ""
+            ),
+            "replying_to": None,
         }
+
+    @staticmethod
+    def _format_fxtwitter_date(value: Any) -> str:
+        """解析 FxTwitter 的 Twitter 时间并转为运行主机本地时区。"""
+        value = str(value or "").strip()
+        if not value:
+            return ""
+        try:
+            parsed = datetime.strptime(value, "%a %b %d %H:%M:%S %z %Y")
+            return parsed.astimezone().isoformat(sep=" ", timespec="seconds")
+        except ValueError:
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                return parsed.astimezone().isoformat(sep=" ", timespec="seconds")
+            except ValueError:
+                return value
+
+    @staticmethod
+    def _fxtwitter_verified(author: dict) -> bool:
+        verification = author.get("verification") or {}
+        if isinstance(verification, dict):
+            return bool(verification.get("verified"))
+        return bool(author.get("verified"))
+
+    @staticmethod
+    def _format_duration(value: Any) -> str:
+        try:
+            seconds = max(0, int(round(float(value))))
+        except (TypeError, ValueError):
+            return ""
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def _apply_fxtwitter_image_quality(self, url: str) -> str:
+        """将 FxTwitter 图片 URL 调整为配置的 orig/large 质量。"""
+        url = str(url or "").strip()
+        if not url or self.image_quality == "orig":
+            return url
+        try:
+            parts = urlsplit(url)
+            if not parts.netloc.lower().endswith("twimg.com"):
+                return url
+            query_items = parse_qsl(parts.query, keep_blank_values=True)
+            updated = False
+            new_query: list[tuple[str, str]] = []
+            for key, value in query_items:
+                if key == "name":
+                    value = "large"
+                    updated = True
+                new_query.append((key, value))
+            if not updated:
+                new_query.append(("name", "large"))
+            return urlunsplit(
+                (parts.scheme, parts.netloc, parts.path, urlencode(new_query), parts.fragment)
+            )
+        except Exception:
+            return url
+
+    @staticmethod
+    def _deduplicate_media_entries(entries: list) -> list[dict]:
+        result: list[dict] = []
+        seen: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            key = str(entry.get("id") or entry.get("url") or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            result.append(entry)
+        return result
+
+    @staticmethod
+    def _select_fxtwitter_video_url(video: dict) -> str:
+        """优先选择最高码率 MP4，再回退到媒体 URL、转码或流媒体。"""
+        formats = video.get("formats") or []
+        mp4_formats = [
+            item
+            for item in formats
+            if isinstance(item, dict)
+            and str(item.get("url") or "").startswith(("http://", "https://"))
+            and (
+                str(item.get("container") or "").lower() == "mp4"
+                or ".mp4" in str(item.get("url") or "").lower()
+            )
+        ]
+        if mp4_formats:
+            best = max(
+                mp4_formats,
+                key=lambda item: (
+                    int(item.get("bitrate") or 0),
+                    int(item.get("width") or 0) * int(item.get("height") or 0),
+                ),
+            )
+            return str(best.get("url") or "")
+
+        for key in ("url", "transcode_url"):
+            candidate = str(video.get(key) or "").strip()
+            if candidate.startswith(("http://", "https://")):
+                return candidate
+
+        for item in formats:
+            if not isinstance(item, dict):
+                continue
+            candidate = str(item.get("url") or "").strip()
+            if candidate.startswith(("http://", "https://")):
+                return candidate
+        return ""
+
+    def _extract_fxtwitter_media(
+        self, status: dict
+    ) -> tuple[list[str], list[str], list[dict]]:
+        media = status.get("media") or {}
+        if not isinstance(media, dict):
+            return [], [], []
+
+        all_entries = media.get("all") or []
+        photos = media.get("photos") or []
+        videos = media.get("videos") or []
+        if not isinstance(photos, list) or not photos:
+            photos = [
+                item
+                for item in all_entries
+                if isinstance(item, dict) and item.get("type") == "photo"
+            ]
+        if not isinstance(videos, list) or not videos:
+            videos = [
+                item
+                for item in all_entries
+                if isinstance(item, dict) and item.get("type") in ("video", "gif")
+            ]
+
+        image_urls: list[str] = []
+        for photo in self._deduplicate_media_entries(photos):
+            image_url = self._apply_fxtwitter_image_quality(
+                str(photo.get("url") or "")
+            )
+            if image_url and image_url not in image_urls:
+                image_urls.append(image_url)
+
+        video_urls: list[str] = []
+        video_previews: list[dict] = []
+        for video in self._deduplicate_media_entries(videos):
+            video_url = self._select_fxtwitter_video_url(video)
+            if video_url and video_url not in video_urls:
+                video_urls.append(video_url)
+            poster = str(video.get("thumbnail_url") or "").strip()
+            if poster and not any(item.get("poster") == poster for item in video_previews):
+                video_previews.append(
+                    {
+                        "poster": poster,
+                        "duration": self._format_duration(video.get("duration")),
+                    }
+                )
+
+        external = media.get("external") or {}
+        if isinstance(external, dict):
+            poster = str(external.get("thumbnail_url") or "").strip()
+            if poster and not any(item.get("poster") == poster for item in video_previews):
+                video_previews.append({"poster": poster, "duration": ""})
+
+        if media.get("broadcast"):
+            logger.info(
+                f"检测到 FxTwitter 直播/广播 @{(status.get('author') or {}).get('screen_name', '')}/"
+                f"{status.get('id', '')}，过滤媒体内容"
+            )
+            return [], [], []
+
+        return image_urls, video_urls, video_previews
+
+    def _adapt_fxtwitter_quote(self, status: Any) -> Optional[dict]:
+        if not isinstance(status, dict) or status.get("type") != "status":
+            return None
+        author = status.get("author") or {}
+        if not isinstance(author, dict):
+            author = {}
+        images, videos, previews = self._extract_fxtwitter_media(status)
+        return {
+            "author": str(author.get("name") or author.get("screen_name") or ""),
+            "username": str(author.get("screen_name") or "").lstrip("@"),
+            "avatar": str(author.get("avatar_url") or ""),
+            "verified": self._fxtwitter_verified(author),
+            "date": self._format_fxtwitter_date(status.get("created_at")),
+            "tweet_id": str(status.get("id") or ""),
+            "text": str(status.get("text") or ""),
+            "images": images,
+            "videos": videos,
+            "video_previews": previews,
+        }
+
+    def _adapt_fxtwitter_status(
+        self, status: dict, fallback_username: str = "", fallback_id: str = ""
+    ) -> dict:
+        author = status.get("author") or {}
+        if not isinstance(author, dict):
+            author = {}
+        username = str(author.get("screen_name") or fallback_username).lstrip("@")
+        tweet_id = str(status.get("id") or fallback_id)
+        result = self._empty_tweet_result(username, tweet_id)
+        images, videos, previews = self._extract_fxtwitter_media(status)
+        reposted_by = status.get("reposted_by") or {}
+        retweet = None
+        if isinstance(reposted_by, dict) and (
+            reposted_by.get("screen_name") or reposted_by.get("name")
+        ):
+            retweet = {
+                "retweeter_username": str(
+                    reposted_by.get("screen_name") or ""
+                ).lstrip("@"),
+                "retweeter_screen_name": str(
+                    reposted_by.get("name")
+                    or reposted_by.get("screen_name")
+                    or ""
+                ),
+            }
+
+        def stat_value(key: str) -> str:
+            value = status.get(key)
+            return "" if value is None else str(value)
+
+        result.update(
+            {
+                "status": status.get("type") == "status" and bool(tweet_id),
+                "username": username,
+                "screen_name": str(author.get("name") or username),
+                "avatar": str(author.get("avatar_url") or ""),
+                "verified": self._fxtwitter_verified(author),
+                "date": self._format_fxtwitter_date(status.get("created_at")),
+                "stats": {
+                    "comments": stat_value("replies"),
+                    "retweets": stat_value("reposts"),
+                    "likes": stat_value("likes"),
+                    "views": stat_value("views"),
+                },
+                "text": str(status.get("text") or ""),
+                "images": images,
+                "videos": videos,
+                "video_previews": previews,
+                "quote": self._adapt_fxtwitter_quote(status.get("quote")),
+                "retweet": retweet,
+                "is_r18": bool(status.get("possibly_sensitive")),
+                "url": str(status.get("url") or result["url"]),
+                "replying_to": (
+                    status.get("replying_to")
+                    if isinstance(status.get("replying_to"), dict)
+                    else None
+                ),
+            }
+        )
+        return result
+
+    async def _get_fxtwitter_tweet(self, username: str, tweet_id: str) -> dict:
+        tweet_id = str(tweet_id or "").strip()
+        username = str(username or "").strip().lstrip("@")
+        result = self._empty_tweet_result(username, tweet_id)
+        if not tweet_id.isdigit():
+            return result
+
+        status = self._status_cache.get(tweet_id)
+        if status is None:
+            payload = await self._request_fxtwitter_json(f"2/status/{tweet_id}")
+            status = payload.get("status") if payload else None
+        if not isinstance(status, dict) or status.get("type") != "status":
+            return result
+
+        self._cache_fxtwitter_status(status)
+        return self._adapt_fxtwitter_status(status, username, tweet_id)
+
+    async def get_tweet(self, username: str, tweet_id: str) -> dict:
+        """获取推文详细信息
+
+        返回:
+            推文信息字典，包含 text, images, videos, quote, is_r18,
+            screen_name, retweet 等
+        """
+        if self.provider == DATA_PROVIDER_FXTWITTER:
+            return await self._get_fxtwitter_tweet(username, tweet_id)
+
+        result = self._empty_tweet_result(username, tweet_id)
 
         if not self.nitter_url:
             return result
@@ -553,6 +1178,8 @@ class TwitterAPI:
             if not main_tweet:
                 logger.warning(f"未找到 div.main-tweet 容器: {nitter_url}")
                 return result
+
+            result["status"] = True
 
             # 获取显示名称
             fullname_elem = main_tweet.select_one("a.fullname")

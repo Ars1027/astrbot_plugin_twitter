@@ -1,0 +1,22 @@
+{
+  "type": "status",
+  "id": "1005",
+  "url": "https://x.com/tester/status/1005",
+  "text": "plain text",
+  "created_at": "Tue Jul 14 14:56:19 +0000 2026",
+  "author": {
+    "type": "profile",
+    "id": "42",
+    "name": "Test User",
+    "screen_name": "tester",
+    "avatar_url": "https://pbs.twimg.com/profile_images/42/avatar.jpg",
+    "verification": {"verified": true, "type": "individual"}
+  },
+  "replies": 1,
+  "reposts": 2,
+  "likes": 3,
+  "views": 4,
+  "possibly_sensitive": false,
+  "replying_to": null,
+  "media": {}
+}

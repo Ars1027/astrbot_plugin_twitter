@@ -1,0 +1,11 @@
+{
+  "type": "status",
+  "id": "1008",
+  "url": "https://x.com/original/status/1008",
+  "text": "original post",
+  "created_at": "Tue Jul 14 15:02:00 +0000 2026",
+  "author": {"name": "Original", "screen_name": "original", "avatar_url": "https://pbs.twimg.com/original.jpg"},
+  "reposted_by": {"id": "99", "name": "Retweeter", "screen_name": "retweeter", "avatar_url": "https://pbs.twimg.com/retweeter.jpg"},
+  "possibly_sensitive": false,
+  "media": {}
+}

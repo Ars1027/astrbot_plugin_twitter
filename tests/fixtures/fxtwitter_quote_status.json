@@ -1,0 +1,19 @@
+{
+  "type": "status",
+  "id": "1009",
+  "url": "https://x.com/tester/status/1009",
+  "text": "comment on quote",
+  "created_at": "Tue Jul 14 15:03:00 +0000 2026",
+  "author": {"name": "Test User", "screen_name": "tester", "avatar_url": ""},
+  "possibly_sensitive": false,
+  "media": {},
+  "quote": {
+    "type": "status",
+    "id": "900",
+    "url": "https://x.com/quoted/status/900",
+    "text": "quoted text",
+    "created_at": "Tue Jul 14 12:00:00 +0000 2026",
+    "author": {"name": "Quoted User", "screen_name": "quoted", "avatar_url": "https://pbs.twimg.com/quoted.jpg", "verification": {"verified": false}},
+    "media": {"photos": [{"type": "photo", "id": "qp1", "url": "https://pbs.twimg.com/media/quoted.jpg?name=orig"}]}
+  }
+}

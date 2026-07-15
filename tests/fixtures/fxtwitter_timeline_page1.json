@@ -1,0 +1,10 @@
+{
+  "code": 200,
+  "results": [
+    {"type": "status", "id": "105", "url": "https://x.com/tester/status/105", "text": "five", "created_at": "Tue Jul 14 15:05:00 +0000 2026", "author": {"name": "Tester", "screen_name": "tester"}, "media": {}},
+    {"type": "status", "id": "105", "url": "https://x.com/tester/status/105", "text": "duplicate five", "created_at": "Tue Jul 14 15:05:00 +0000 2026", "author": {"name": "Tester", "screen_name": "tester"}, "media": {}},
+    {"type": "status", "id": "104", "url": "https://x.com/original/status/104", "text": "retweet", "created_at": "Tue Jul 14 15:04:00 +0000 2026", "author": {"name": "Original", "screen_name": "original"}, "reposted_by": {"name": "Tester", "screen_name": "tester"}, "media": {}},
+    {"type": "status", "id": "999", "url": "https://x.com/tester/status/999", "text": "pinned", "created_at": "Tue Jul 14 10:00:00 +0000 2026", "author": {"name": "Tester", "screen_name": "tester"}, "is_pinned": true, "media": {}}
+  ],
+  "cursor": {"top": "top-1", "bottom": "page-2"}
+}
