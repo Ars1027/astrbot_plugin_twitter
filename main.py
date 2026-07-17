@@ -1,6 +1,6 @@
 """
 AstrBot Twitter 推文转发插件
-基于 Nitter 镜像站，支持订阅推主、定时推送、链接识别、合并转发消息、推文翻译
+支持 Nitter 与 FxTwitter API 数据源，以及订阅、定时推送、链接识别、合并转发消息、推文翻译
 
 指令列表:
   /推特关注 <推主id> [r18] [媒体]          - 订阅推主
@@ -14,6 +14,8 @@ AstrBot Twitter 推文转发插件
 
 配置项:
   【基础设置】
+    Twitter 数据源 (twitter_data_provider)          - nitter / fxtwitter
+    FxTwitter API (twitter_fxtwitter_api_base)      - 默认 https://api.fxtwitter.com
     Nitter 镜像站地址 (twitter_nitter_url)        - 留空则自动选择
     代理地址 (twitter_proxy)                      - 如 http://127.0.0.1:7890
     轮询间隔 (twitter_poll_interval)              - 默认 5 分钟
@@ -46,7 +48,15 @@ from astrbot.api.message_components import Node, Nodes
 from astrbot.api.star import Context, Star
 import astrbot.api.message_components as Comp
 
-from .twitter_api import TwitterAPI, WEBSITE_LIST, get_next_website
+from .twitter_api import (
+    DATA_PROVIDER_FXTWITTER,
+    DATA_PROVIDER_NITTER,
+    DATA_PROVIDER_OPTIONS,
+    DEFAULT_FXTWITTER_API_BASE,
+    TwitterAPI,
+    WEBSITE_LIST,
+    get_next_website,
+)
 from .twitter_renderer import (
     build_tweet_card_context,
     load_tweet_card_template,
@@ -100,6 +110,23 @@ class TwitterPlugin(Star):
 
         # 读取配置
         self.proxy = str(self._cfg("basic", "twitter_proxy", "") or "") or None
+        self.data_provider = str(
+            self._cfg("basic", "twitter_data_provider", DATA_PROVIDER_NITTER)
+            or DATA_PROVIDER_NITTER
+        ).strip().lower()
+        if self.data_provider not in DATA_PROVIDER_OPTIONS:
+            logger.warning(
+                f"未知 Twitter 数据源: {self.data_provider}，已回退为 nitter"
+            )
+            self.data_provider = DATA_PROVIDER_NITTER
+        self.fxtwitter_api_base = str(
+            self._cfg(
+                "basic",
+                "twitter_fxtwitter_api_base",
+                DEFAULT_FXTWITTER_API_BASE,
+            )
+            or DEFAULT_FXTWITTER_API_BASE
+        ).strip().rstrip("/") or DEFAULT_FXTWITTER_API_BASE
         self.use_node = bool(self._cfg("message_format", "twitter_use_node", True))
         self.no_text = bool(self._cfg("message_format", "twitter_no_text", False))
         self.send_media_separately = bool(
@@ -216,16 +243,22 @@ class TwitterPlugin(Star):
             self._cfg("basic", "twitter_pre_download_media", False)
         )
 
-        # 构建镜像站列表
+        # 构建镜像站列表（FxTwitter 模式不会使用或检测这些地址）
         self.website_list: list[str] = []
-        if self.custom_nitter_url:
-            self.website_list.append(self.custom_nitter_url)
-        self.website_list.extend(WEBSITE_LIST)
+        if self.data_provider == DATA_PROVIDER_NITTER:
+            if self.custom_nitter_url:
+                self.website_list.append(self.custom_nitter_url)
+            self.website_list.extend(WEBSITE_LIST)
 
         # 初始化 Twitter API
         self.twitter_api = TwitterAPI(
-            proxy=self.proxy, nitter_url="", image_quality=self.image_quality
+            proxy=self.proxy,
+            nitter_url="",
+            image_quality=self.image_quality,
+            provider=self.data_provider,
+            fxtwitter_api_base=self.fxtwitter_api_base,
         )
+        self._provider_ready = False
 
         # 定时任务句柄
         self._poll_task: asyncio.Task | None = None
@@ -245,15 +278,24 @@ class TwitterPlugin(Star):
                 "请同时开启「使用合并转发消息」配置项。"
             )
 
-        # 检测可用镜像站
-        available = await self.twitter_api.check_website_available(self.website_list)
-        if available:
-            logger.info(f"当前使用 Nitter 镜像站: {available}")
+        if self.data_provider == DATA_PROVIDER_FXTWITTER:
+            logger.info("当前使用 Twitter 数据源: FxTwitter API")
+            self._provider_ready = await self.twitter_api.check_fxtwitter_available()
+            if not self._provider_ready:
+                logger.warning("FxTwitter API 健康检查失败，推文轮询功能暂不可用")
         else:
-            logger.warning("未找到可用 Nitter 镜像站，推文轮询功能暂不可用")
+            logger.info("当前使用 Twitter 数据源: Nitter")
+            available = await self.twitter_api.check_website_available(
+                self.website_list
+            )
+            self._provider_ready = bool(available)
+            if available:
+                logger.info(f"当前使用 Nitter 镜像站: {available}")
+            else:
+                logger.warning("未找到可用 Nitter 镜像站，推文轮询功能暂不可用")
 
         # 启动定时轮询任务
-        if self.twitter_api.nitter_url:
+        if self._provider_ready:
             self._running = True
             self._poll_task = asyncio.create_task(self._poll_tweets())
             logger.info(f"推文轮询已启动，间隔 {self.poll_interval} 分钟")
@@ -312,6 +354,11 @@ class TwitterPlugin(Star):
         if screen_name and screen_name != username:
             nickname += f" ({screen_name})"
         return nickname
+
+    def _provider_unavailable_message(self) -> str:
+        if self.data_provider == DATA_PROVIDER_FXTWITTER:
+            return "FxTwitter API 不可用，请检查配置或网络"
+        return "Nitter 镜像站不可用，请检查配置或网络"
 
     @staticmethod
     def _build_author_display(username: str, screen_name: str) -> str:
@@ -970,6 +1017,38 @@ class TwitterPlugin(Star):
                 plain_chain.append(comp)
         return plain_chain, video_parts
 
+    async def _send_plain_chain_resilient(self, umo: str, chain: list) -> None:
+        """发送普通消息；媒体导致整链失败时，优先补发文字再逐图尝试。"""
+        if not chain:
+            return
+        try:
+            await self.context.send_message(umo, MessageChain(chain=chain))
+            return
+        except Exception as error:
+            logger.warning(f"包含媒体的消息发送失败，尝试保留文字内容: {error}")
+
+        text_parts = [comp for comp in chain if not isinstance(comp, Comp.Image)]
+        image_parts = [comp for comp in chain if isinstance(comp, Comp.Image)]
+
+        if text_parts:
+            try:
+                await self.context.send_message(
+                    umo, MessageChain(chain=text_parts)
+                )
+            except Exception as error:
+                logger.error(f"媒体降级后的文字消息仍发送失败: {error}")
+
+        for image_part in image_parts:
+            try:
+                await self.context.send_message(
+                    umo, MessageChain(chain=[image_part])
+                )
+            except Exception as error:
+                image_url = getattr(image_part, "file", "") or getattr(
+                    image_part, "url", ""
+                )
+                logger.warning(f"图片发送失败，已保留文字内容: {image_url}, {error}")
+
     async def _send_video_or_fallback(self, umo: str, vid_comp: Comp.Video):
         """发送视频组件，失败时回退为链接
 
@@ -1146,14 +1225,14 @@ class TwitterPlugin(Star):
                     )
                     fallback_chain = self._build_plain_chain(chain)
                     if fallback_chain:
-                        message_chain = MessageChain(chain=fallback_chain)
-                        await self.context.send_message(umo, message_chain)
+                        await self._send_plain_chain_resilient(
+                            umo, fallback_chain
+                        )
             else:
                 # 普通消息模式：正文和图片先发，视频独立发送，避免混入普通链导致文本异常
                 plain_chain, video_parts = self._split_plain_chain_and_videos(chain)
                 if plain_chain:
-                    message_chain = MessageChain(chain=plain_chain)
-                    await self.context.send_message(umo, message_chain)
+                    await self._send_plain_chain_resilient(umo, plain_chain)
                 for vid_comp in video_parts:
                     await self._send_video_or_fallback(umo, vid_comp)
 
@@ -1322,7 +1401,11 @@ class TwitterPlugin(Star):
             await self._flush_collected_tweets()
 
         # 自动切换镜像站
-        if not self.custom_nitter_url and results:
+        if (
+            self.data_provider == DATA_PROVIDER_NITTER
+            and not self.custom_nitter_url
+            and results
+        ):
             success_count = sum(1 for r in results if r)
             if success_count < len(results) / 2 and self.website_list:
                 new_url = get_next_website(
@@ -1351,33 +1434,43 @@ class TwitterPlugin(Star):
 
             # 按时间正序（最旧在前）逐条处理
             # （集体转发模式下缓存，即时模式下直接推送）
+            last_processed_id = str(since_id or "")
+            detail_failed = False
             for item in new_tweet_items:
-                if item.get("is_retweet") and not self.include_retweets:
-                    logger.debug(
-                        f"跳过 @{username} 转帖: {item.get('tweet_id')}"
-                    )
-                    continue
-
                 tweet_id = str(item.get("tweet_id") or "")
                 tweet_username = str(item.get("username") or username)
                 if not tweet_id:
                     continue
 
+                if item.get("is_retweet") and not self.include_retweets:
+                    logger.debug(
+                        f"跳过 @{username} 转帖: {tweet_id}"
+                    )
+                    last_processed_id = tweet_id
+                    continue
+
                 tweet_info = await self.twitter_api.get_tweet(
                     tweet_username, tweet_id
                 )
+                if not tweet_info.get("status", True):
+                    logger.warning(
+                        f"获取 @{username} 推文详情失败，保留游标等待下次重试: "
+                        f"{tweet_id}"
+                    )
+                    detail_failed = True
+                    break
                 self._attach_timeline_item_metadata(tweet_info, item)
                 await self._push_tweet_to_subscribers(username, tweet_info, info)
+                last_processed_id = tweet_id
 
-            # 更新 since_id 为最新一条
+            # 仅推进到已经成功处理（或按配置明确跳过）的最后一条，
+            # 避免详情 API 临时失败时越过未发送的推文。
             subs = await self._get_subs()
-            if username in subs:
-                subs[username]["since_id"] = str(
-                    new_tweet_items[-1].get("tweet_id") or since_id
-                )
+            if username in subs and last_processed_id != str(since_id or ""):
+                subs[username]["since_id"] = last_processed_id
                 await self._save_subs(subs)
 
-            return True
+            return not detail_failed
         except Exception as e:
             logger.error(f"获取 {username} 推文异常: {e}")
             return False
@@ -1387,8 +1480,8 @@ class TwitterPlugin(Star):
     @filter.command("推特关注", alias={"twitter_follow"})
     async def follow_twitter(self, event: AstrMessageEvent, username: str = ""):
         """订阅推主，格式: /推特关注 <推主id> [r18] [媒体]"""
-        if not self.twitter_api.nitter_url:
-            yield event.plain_result("镜像站不可用，请检查配置或网络")
+        if not self._provider_ready:
+            yield event.plain_result(self._provider_unavailable_message())
             return
 
         if not username:
@@ -1452,8 +1545,8 @@ class TwitterPlugin(Star):
     @filter.command("推特批量关注", alias={"twitter_batch_follow"})
     async def batch_follow_twitter(self, event: AstrMessageEvent):
         """批量订阅推主，格式: /推特批量关注 <推主id1> <推主id2> ... [r18] [媒体]"""
-        if not self.twitter_api.nitter_url:
-            yield event.plain_result("镜像站不可用，请检查配置或网络")
+        if not self._provider_ready:
+            yield event.plain_result(self._provider_unavailable_message())
             return
 
         # 解析消息：提取用户名和选项
@@ -1683,8 +1776,8 @@ class TwitterPlugin(Star):
     @filter.command("推特测试", alias={"twitter_test"})
     async def test_tweet(self, event: AstrMessageEvent, username: str = ""):
         """立即获取并推送指定推主的最新一条推文，格式: /推特测试 <推主id>"""
-        if not self.twitter_api.nitter_url:
-            yield event.plain_result("镜像站不可用，请检查配置或网络")
+        if not self._provider_ready:
+            yield event.plain_result(self._provider_unavailable_message())
             return
 
         if not username:
@@ -1719,6 +1812,11 @@ class TwitterPlugin(Star):
 
         # 获取推文详情
         tweet_info = await self.twitter_api.get_tweet(tweet_username, tweet_id)
+        if not tweet_info.get("status", True):
+            yield event.plain_result(
+                f"无法获取 @{username} 的推文，帖子可能已删除、受限或暂时不可用"
+            )
+            return
         self._attach_timeline_item_metadata(tweet_info, selected_item)
 
         # 翻译推文
@@ -1787,11 +1885,16 @@ class TwitterPlugin(Star):
 
         logger.info(f"检测到推文链接: {link}")
 
-        if not self.twitter_api.nitter_url:
+        if not self._provider_ready:
             return
 
         try:
             tweet_info = await self.twitter_api.get_tweet(username, tweet_id)
+            if not tweet_info.get("status", True):
+                yield event.plain_result(
+                    "无法获取该推文，帖子可能已删除、受限或暂时不可用"
+                )
+                return
 
             # 翻译推文
             translated_text, translate_model = await self._maybe_translate(

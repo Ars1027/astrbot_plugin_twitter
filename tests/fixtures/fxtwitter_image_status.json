@@ -1,0 +1,17 @@
+{
+  "type": "status",
+  "id": "1006",
+  "url": "https://x.com/tester/status/1006",
+  "text": "photo",
+  "created_at": "Tue Jul 14 15:00:00 +0000 2026",
+  "author": {"name": "Test User", "screen_name": "tester", "avatar_url": null},
+  "possibly_sensitive": false,
+  "media": {
+    "all": [
+      {"type": "photo", "id": "p1", "url": "https://pbs.twimg.com/media/photo.jpg?name=orig", "width": 1200, "height": 800}
+    ],
+    "photos": [
+      {"type": "photo", "id": "p1", "url": "https://pbs.twimg.com/media/photo.jpg?name=orig", "width": 1200, "height": 800}
+    ]
+  }
+}

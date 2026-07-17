@@ -1,0 +1,9 @@
+{
+  "code": 200,
+  "results": [
+    {"type": "status", "id": "202", "author": {"screen_name": "tester"}, "media": {}},
+    {"type": "status", "id": "202", "author": {"screen_name": "tester"}, "media": {}},
+    {"type": "status", "id": "201", "author": {"screen_name": "tester"}, "media": {}}
+  ],
+  "cursor": {"top": null, "bottom": null}
+}

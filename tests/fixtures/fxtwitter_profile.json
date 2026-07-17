@@ -1,0 +1,12 @@
+{
+  "code": 200,
+  "message": "OK",
+  "user": {
+    "type": "profile",
+    "id": "42",
+    "name": "Test User",
+    "screen_name": "tester",
+    "avatar_url": "https://pbs.twimg.com/profile_images/42/avatar.jpg",
+    "description": "profile bio"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "type": "status",
+  "id": "1007",
+  "url": "https://x.com/tester/status/1007",
+  "text": "video",
+  "created_at": "Tue Jul 14 15:01:00 +0000 2026",
+  "author": {"name": "Test User", "screen_name": "tester", "avatar_url": ""},
+  "possibly_sensitive": false,
+  "media": {
+    "videos": [
+      {
+        "type": "video",
+        "id": "v1",
+        "url": "https://video.twimg.com/video/high.mp4",
+        "thumbnail_url": "https://pbs.twimg.com/video_thumb/v1.jpg",
+        "duration": 65.4,
+        "formats": [
+          {"container": "m3u8", "url": "https://video.twimg.com/video/master.m3u8"},
+          {"container": "mp4", "codec": "h264", "bitrate": 256000, "url": "https://video.twimg.com/video/low.mp4"},
+          {"container": "mp4", "codec": "h264", "bitrate": 2176000, "url": "https://video.twimg.com/video/high.mp4"}
+        ]
+      }
+    ]
+  }
+}

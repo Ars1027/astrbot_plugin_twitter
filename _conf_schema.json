@@ -2,8 +2,21 @@
   "basic": {
     "description": "基础设置",
     "type": "object",
-    "hint": "Nitter 镜像站、代理与轮询等基础配置。",
+    "hint": "Twitter 数据源、Nitter 镜像站、代理与轮询等基础配置。",
     "items": {
+      "twitter_data_provider": {
+        "description": "Twitter 数据源",
+        "type": "string",
+        "default": "nitter",
+        "options": ["nitter", "fxtwitter"],
+        "hint": "nitter=保持原有 Nitter HTML 抓取；fxtwitter=通过 FxTwitter JSON API 获取用户和推文。切换到 fxtwitter 后不会检测或访问 Nitter 镜像。"
+      },
+      "twitter_fxtwitter_api_base": {
+        "description": "FxTwitter API 基础地址",
+        "type": "string",
+        "default": "https://api.fxtwitter.com",
+        "hint": "FxTwitter JSON API 地址，末尾斜杠会自动清理。默认：https://api.fxtwitter.com"
+      },
       "twitter_nitter_url": {
         "description": "Nitter 镜像站地址（留空则使用内置列表自动选择）",
         "type": "string",
