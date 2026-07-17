@@ -53,6 +53,7 @@ from .twitter_api import (
     DATA_PROVIDER_NITTER,
     DATA_PROVIDER_OPTIONS,
     DEFAULT_FXTWITTER_API_BASE,
+    FxTwitterTimelineError,
     TwitterAPI,
     WEBSITE_LIST,
     get_next_website,
@@ -380,6 +381,8 @@ class TwitterPlugin(Star):
                 "retweeter_username": str(item.get("retweeter_username") or ""),
                 "retweeter_screen_name": str(item.get("retweeter_screen_name") or ""),
             }
+        else:
+            tweet_info["retweet"] = None
 
     @staticmethod
     def _retweet_seen_by_umo(seen_data: dict, umo: str, tweet_id: str) -> bool:
@@ -1471,6 +1474,9 @@ class TwitterPlugin(Star):
                 await self._save_subs(subs)
 
             return not detail_failed
+        except FxTwitterTimelineError as e:
+            logger.warning(f"获取 @{username} 时间线失败，保留当前游标: {e}")
+            return False
         except Exception as e:
             logger.error(f"获取 {username} 推文异常: {e}")
             return False
@@ -1503,7 +1509,12 @@ class TwitterPlugin(Star):
             return
 
         # 获取最新推文 ID 作为 since_id
-        latest_ids = await self.twitter_api.get_user_newtimeline(username)
+        try:
+            latest_ids = await self.twitter_api.get_user_newtimeline(username)
+        except FxTwitterTimelineError as e:
+            logger.warning(f"订阅 @{username} 时获取时间线失败: {e}")
+            yield event.plain_result(f"获取 @{username} 时间线失败，请稍后重试")
+            return
         since_id = latest_ids[-1] if latest_ids else ""
 
         umo = event.unified_msg_origin
@@ -1791,7 +1802,12 @@ class TwitterPlugin(Star):
         yield event.plain_result(f"正在获取 @{username} 的最新推文，请稍候...")
 
         # 获取时间线并按配置选择最新推文
-        timeline_items = await self.twitter_api.get_user_timeline_items(username)
+        try:
+            timeline_items = await self.twitter_api.get_user_timeline_items(username)
+        except FxTwitterTimelineError as e:
+            logger.warning(f"测试 @{username} 时获取时间线失败: {e}")
+            yield event.plain_result(f"获取 @{username} 时间线失败，请稍后重试")
+            return
         if not timeline_items:
             yield event.plain_result(f"未找到 @{username} 的推文")
             return

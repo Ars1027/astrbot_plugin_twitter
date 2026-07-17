@@ -31,8 +31,33 @@ FXTWITTER_MAX_TIMELINE_PAGES = 4
 FXTWITTER_MAX_TIMELINE_ITEMS = 100
 FXTWITTER_STATUS_CACHE_SIZE = 200
 
+NITTER_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
+FXTWITTER_REQUEST_HEADERS = {
+    "User-Agent": (
+        "AstrBot-Twitter-Plugin/1.8 "
+        "(+https://github.com/Ars1027/astrbot_plugin_twitter)"
+    ),
+    "Accept": "application/json",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+}
+
 # 直播推文链接特征（推文链接中包含此路径即为直播）
 BROADCAST_LINK_PATTERN = re.compile(r'/i/broadcasts/', re.IGNORECASE)
+
+
+class FxTwitterTimelineError(RuntimeError):
+    """FxTwitter 时间线请求失败或分页结果不完整。"""
 
 
 class TwitterAPI:
@@ -76,19 +101,17 @@ class TwitterAPI:
         """获取或创建异步 HTTP 客户端"""
         if self._client is None or self._client.is_closed:
             proxy = self.proxy if self.proxy else None
+            headers = (
+                FXTWITTER_REQUEST_HEADERS
+                if self.provider == DATA_PROVIDER_FXTWITTER
+                else NITTER_REQUEST_HEADERS
+            )
             self._client = httpx.AsyncClient(
                 proxy=proxy,
                 http2=True,
                 timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0),
                 follow_redirects=True,
-                headers={
-                    "User-Agent": (
-                        "AstrBot-Twitter-Plugin/1.8 "
-                        "(+https://github.com/Ars1027/astrbot_plugin_twitter)"
-                    ),
-                    "Accept": "application/json, text/html;q=0.9, */*;q=0.8",
-                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                },
+                headers=dict(headers),
             )
         return self._client
 
@@ -513,7 +536,9 @@ class TwitterAPI:
         tweet_id = str(status.get("id") or "")
         if not tweet_id:
             return
-        self._status_cache[tweet_id] = status
+        cached_status = dict(status)
+        cached_status.pop("reposted_by", None)
+        self._status_cache[tweet_id] = cached_status
         self._status_cache.move_to_end(tweet_id)
         while len(self._status_cache) > FXTWITTER_STATUS_CACHE_SIZE:
             self._status_cache.popitem(last=False)
@@ -546,7 +571,7 @@ class TwitterAPI:
     async def _get_fxtwitter_timeline_items(
         self, username: str, since_id: str = "", limit: int = 0
     ) -> list[dict]:
-        """获取 FxTwitter 时间线，有限分页、去重并保持既有排序语义。"""
+        """获取完整的 FxTwitter 时间线增量，并保持既有排序语义。"""
         username = str(username or "").strip().lstrip("@")
         since_id = str(since_id or "").strip()
         if not username:
@@ -562,10 +587,14 @@ class TwitterAPI:
             return []
 
         items: list[dict] = []
+        statuses_to_cache: list[dict] = []
         seen_ids: set[str] = set()
         cursor = ""
         previous_cursor = ""
         boundary_found = False
+        timeline_exhausted = False
+        requested_limit_reached = False
+        local_item_limit_reached = False
 
         for page_index in range(self.fxtwitter_max_pages):
             params: dict[str, Any] = {"count": 20}
@@ -577,19 +606,16 @@ class TwitterAPI:
                 params=params,
             )
             if payload is None:
-                if page_index > 0:
-                    logger.warning(
-                        f"FxTwitter 时间线分页中断 @{username}: 已完成 {page_index} 页"
-                    )
-                return [] if page_index == 0 else self._finalize_fxtwitter_items(
-                    items, since_int, limit
+                page_label = "首页" if page_index == 0 else f"第 {page_index + 1} 页"
+                raise FxTwitterTimelineError(
+                    f"获取 @{username} 的 FxTwitter 时间线失败：{page_label}请求失败"
                 )
 
             raw_results = payload.get("results")
             if not isinstance(raw_results, list):
-                logger.warning(f"FxTwitter 时间线 results 不是列表 @{username}")
-                return [] if page_index == 0 else self._finalize_fxtwitter_items(
-                    items, since_int, limit
+                raise FxTwitterTimelineError(
+                    f"获取 @{username} 的 FxTwitter 时间线失败："
+                    f"第 {page_index + 1} 页响应结构异常"
                 )
 
             statuses = self._flatten_fxtwitter_results(raw_results)
@@ -610,37 +636,54 @@ class TwitterAPI:
                         boundary_found = True
                     continue
 
-                self._cache_fxtwitter_status(status)
+                statuses_to_cache.append(status)
                 items.append(item)
 
                 if since_int is None and limit > 0 and len(items) >= limit:
-                    return items[:limit]
+                    requested_limit_reached = True
+                    break
                 if len(seen_ids) >= self.fxtwitter_max_items:
-                    logger.debug(
-                        f"FxTwitter 时间线达到本地抓取上限 @{username}: "
-                        f"{self.fxtwitter_max_items}"
-                    )
-                    boundary_found = True
+                    local_item_limit_reached = True
                     break
 
-            if boundary_found:
+            if boundary_found or requested_limit_reached:
+                break
+            if local_item_limit_reached:
+                if since_int is not None:
+                    raise FxTwitterTimelineError(
+                        f"获取 @{username} 的 FxTwitter 时间线失败：达到本地抓取上限，"
+                        "尚未找到上次游标"
+                    )
                 break
 
-            cursor_info = payload.get("cursor") or {}
+            cursor_info = payload.get("cursor")
+            if cursor_info is not None and not isinstance(cursor_info, dict):
+                raise FxTwitterTimelineError(
+                    f"获取 @{username} 的 FxTwitter 时间线失败："
+                    f"第 {page_index + 1} 页分页游标结构异常"
+                )
             next_cursor = (
                 str(cursor_info.get("bottom") or "")
                 if isinstance(cursor_info, dict)
                 else ""
             )
-            if not next_cursor or next_cursor == cursor or next_cursor == previous_cursor:
+            if not next_cursor:
+                timeline_exhausted = True
                 break
+            if next_cursor == cursor or next_cursor == previous_cursor:
+                raise FxTwitterTimelineError(
+                    f"获取 @{username} 的 FxTwitter 时间线失败：分页游标重复"
+                )
             previous_cursor, cursor = cursor, next_cursor
 
-        if since_int is not None and not boundary_found and cursor:
-            logger.debug(
-                f"FxTwitter 时间线在 {self.fxtwitter_max_pages} 页内未找到 "
-                f"since_id @{username}: {since_id}"
+        if since_int is not None and not boundary_found and not timeline_exhausted:
+            raise FxTwitterTimelineError(
+                f"获取 @{username} 的 FxTwitter 时间线失败："
+                f"在 {self.fxtwitter_max_pages} 页内尚未找到上次游标"
             )
+
+        for status in statuses_to_cache:
+            self._cache_fxtwitter_status(status)
         return self._finalize_fxtwitter_items(items, since_int, limit)
 
     @staticmethod

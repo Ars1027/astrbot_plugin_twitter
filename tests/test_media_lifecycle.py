@@ -120,6 +120,7 @@ def _load_main_module():
     twitter_api.DATA_PROVIDER_FXTWITTER = "fxtwitter"
     twitter_api.DATA_PROVIDER_OPTIONS = ("nitter", "fxtwitter")
     twitter_api.DEFAULT_FXTWITTER_API_BASE = "https://api.fxtwitter.com"
+    twitter_api.FxTwitterTimelineError = RuntimeError
     twitter_api.TwitterAPI = object
     twitter_api.WEBSITE_LIST = []
     twitter_api.get_next_website = lambda *_args, **_kwargs: None

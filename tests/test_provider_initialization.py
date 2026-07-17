@@ -87,6 +87,10 @@ class FakeTwitterAPI:
         self.closed = True
 
 
+class FakeFxTwitterTimelineError(RuntimeError):
+    pass
+
+
 def _load_main_module():
     package_name = "twitter_provider_test_package"
     for module_name in list(sys.modules):
@@ -141,6 +145,7 @@ def _load_main_module():
     twitter_api.DATA_PROVIDER_FXTWITTER = "fxtwitter"
     twitter_api.DATA_PROVIDER_OPTIONS = ("nitter", "fxtwitter")
     twitter_api.DEFAULT_FXTWITTER_API_BASE = "https://api.fxtwitter.com"
+    twitter_api.FxTwitterTimelineError = FakeFxTwitterTimelineError
     twitter_api.TwitterAPI = FakeTwitterAPI
     twitter_api.WEBSITE_LIST = ["https://nitter.test"]
     twitter_api.get_next_website = lambda *_args, **_kwargs: None
@@ -281,3 +286,107 @@ async def test_detail_failure_only_advances_cursor_to_last_success(plugin_module
 
     assert result is False
     assert store["tester"]["since_id"] == "101"
+
+
+@pytest.mark.asyncio
+async def test_timeline_failure_does_not_advance_polling_cursor(plugin_module):
+    plugin = plugin_module.TwitterPlugin.__new__(plugin_module.TwitterPlugin)
+    store = {
+        "tester": {
+            "screen_name": "Tester",
+            "since_id": "100",
+            "subscribers": {"session": {"status": True}},
+        }
+    }
+    save_calls = 0
+
+    class API:
+        async def get_user_timeline_items(self, _username, _since_id):
+            raise plugin_module.FxTwitterTimelineError("第二页请求失败")
+
+    async def get_subs():
+        return store
+
+    async def save_subs(_data):
+        nonlocal save_calls
+        save_calls += 1
+
+    plugin.twitter_api = API()
+    plugin._get_subs = get_subs
+    plugin._save_subs = save_subs
+
+    result = await plugin._check_user_tweets("tester", store["tester"])
+
+    assert result is False
+    assert store["tester"]["since_id"] == "100"
+    assert save_calls == 0
+
+
+def test_timeline_metadata_is_the_only_source_of_retweet_context(plugin_module):
+    tweet_info = {
+        "username": "original",
+        "retweet": {
+            "retweeter_username": "stale",
+            "retweeter_screen_name": "Stale",
+        },
+    }
+
+    plugin_module.TwitterPlugin._attach_timeline_item_metadata(
+        tweet_info,
+        {"username": "original", "is_retweet": False},
+    )
+    assert tweet_info["retweet"] is None
+
+    plugin_module.TwitterPlugin._attach_timeline_item_metadata(
+        tweet_info,
+        {
+            "username": "original",
+            "is_retweet": True,
+            "retweeter_username": "tester",
+            "retweeter_screen_name": "Tester",
+        },
+    )
+    assert tweet_info["retweet"] == {
+        "retweeter_username": "tester",
+        "retweeter_screen_name": "Tester",
+    }
+
+
+@pytest.mark.asyncio
+async def test_commands_report_timeline_failures_clearly(plugin_module):
+    plugin = plugin_module.TwitterPlugin.__new__(plugin_module.TwitterPlugin)
+    plugin._provider_ready = True
+
+    class API:
+        async def get_user_info(self, _username):
+            return {
+                "status": True,
+                "screen_name": "Tester",
+                "bio": "",
+                "user_name": "tester",
+            }
+
+        async def get_user_newtimeline(self, _username):
+            raise plugin_module.FxTwitterTimelineError("首页请求失败")
+
+        async def get_user_timeline_items(self, _username):
+            raise plugin_module.FxTwitterTimelineError("首页请求失败")
+
+    class Event:
+        message_str = "/推特关注 tester"
+        unified_msg_origin = "session"
+
+        @staticmethod
+        def plain_result(text):
+            return text
+
+    plugin.twitter_api = API()
+    event = Event()
+
+    follow_results = [
+        result async for result in plugin.follow_twitter(event, "tester")
+    ]
+    test_results = [result async for result in plugin.test_tweet(event, "tester")]
+
+    assert follow_results == ["获取 @tester 时间线失败，请稍后重试"]
+    assert test_results[-1] == "获取 @tester 时间线失败，请稍后重试"
