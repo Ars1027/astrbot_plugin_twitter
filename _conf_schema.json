@@ -40,6 +40,12 @@
         "type": "int",
         "default": 5,
         "hint": "建议不低于 3 分钟，避免频繁请求"
+      },
+      "twitter_poll_max_tweets_per_user": {
+        "description": "每个推主每轮最多推送推文数",
+        "type": "int",
+        "default": 5,
+        "hint": "数据源恢复或积压较多时，每个推主每轮最多按时间顺序推送此数量，剩余推文将在后续轮询继续推送；最小值为 1"
       }
     }
   },

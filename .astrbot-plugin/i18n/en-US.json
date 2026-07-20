@@ -1,0 +1,8 @@
+{
+  "pages": {
+    "subscriptions": {
+      "title": "Twitter Subscriptions",
+      "description": "Manage chat subscriptions and polling interval"
+    }
+  }
+}

@@ -140,17 +140,47 @@ def plugin_module():
     return _load_main_module()
 
 
+def _delivery_contract(plugin_module):
+    return sys.modules[
+        f"{plugin_module.__package__}.services.tweet_delivery_service"
+    ]
+
+
+def _message_settings(plugin_module, **overrides):
+    values = {
+        "no_text": False,
+        "send_media_separately": True,
+        "include_tweet_link": False,
+        "text_render_mode": "screenshot",
+        "screenshot_theme": "dark",
+        "video_max_size_mb": 256,
+        "translate_enabled": False,
+        "translate_target_lang": "简体中文",
+        "translate_provider_id": "",
+        "translate_custom_prompt_enabled": False,
+        "translate_custom_prompt": "",
+        "pre_download_media": True,
+        "proxy": "http://127.0.0.1:7890",
+    }
+    values.update(overrides)
+    return plugin_module.TweetMessageSettings(**values)
+
+
+def _delivery_settings(plugin_module, **overrides):
+    values = {
+        "use_node": False,
+        "collective_forward": False,
+        "collective_max_authors": 5,
+        "deduplicate_retweets": False,
+    }
+    values.update(overrides)
+    return plugin_module.TweetDeliverySettings(**values)
+
+
 @pytest.mark.asyncio
 async def test_screenshot_uses_prepared_copy_but_sends_original_media(
     plugin_module, tmp_path
 ):
-    plugin = plugin_module.TwitterPlugin.__new__(plugin_module.TwitterPlugin)
-    plugin.no_text = False
-    plugin.pre_download_media = True
-    plugin.proxy = "http://127.0.0.1:7890"
-    plugin.screenshot_theme = "dark"
-    plugin.include_tweet_link = False
-
     original_url = "https://example.com/original.jpg"
     prepared_url = "data:image/jpeg;base64,cHJlcGFyZWQ="
     tweet_info = {
@@ -174,11 +204,16 @@ async def test_screenshot_uses_prepared_copy_but_sends_original_media(
     async def append_media(_chain, images, _videos, context_label="推文"):
         captured_media.append((context_label, list(images)))
 
-    plugin._prepare_screenshot_media = prepare_screenshot_media
-    plugin.html_render = html_render
-    plugin._append_media_components = append_media
+    service = plugin_module.TweetMessageService(
+        object(),
+        object(),
+        html_render,
+        _message_settings(plugin_module),
+    )
+    service.prepare_screenshot_media = prepare_screenshot_media
+    service.append_media_components = append_media
 
-    await plugin._build_screenshot_tweet_chain(
+    await service.build_screenshot_tweet_chain(
         "tester", tweet_info, {"r18": True, "media": False, "status": True}
     )
 
@@ -189,9 +224,6 @@ async def test_screenshot_uses_prepared_copy_but_sends_original_media(
 
 @pytest.mark.asyncio
 async def test_pre_downloaded_image_uses_from_bytes(plugin_module):
-    plugin = plugin_module.TwitterPlugin.__new__(plugin_module.TwitterPlugin)
-    plugin.pre_download_media = True
-    plugin.proxy = "http://127.0.0.1:7890"
     image_bytes = b"downloaded-image"
 
     class TwitterAPI:
@@ -199,9 +231,13 @@ async def test_pre_downloaded_image_uses_from_bytes(plugin_module):
             assert url == "https://example.com/image.jpg"
             return image_bytes
 
-    plugin.twitter_api = TwitterAPI()
-
-    component = await plugin._build_image_component(
+    service = plugin_module.TweetMessageService(
+        object(),
+        TwitterAPI(),
+        None,
+        _message_settings(plugin_module),
+    )
+    component = await service.build_image_component(
         "https://example.com/image.jpg"
     )
 
@@ -211,18 +247,19 @@ async def test_pre_downloaded_image_uses_from_bytes(plugin_module):
 
 @pytest.mark.asyncio
 async def test_pre_download_failure_falls_back_to_remote_url(plugin_module):
-    plugin = plugin_module.TwitterPlugin.__new__(plugin_module.TwitterPlugin)
-    plugin.pre_download_media = True
-    plugin.proxy = "http://127.0.0.1:7890"
-
     class TwitterAPI:
         async def download_media(self, _url):
             raise RuntimeError("proxy unavailable")
 
-    plugin.twitter_api = TwitterAPI()
+    service = plugin_module.TweetMessageService(
+        object(),
+        TwitterAPI(),
+        None,
+        _message_settings(plugin_module),
+    )
     image_url = "https://example.com/image.jpg"
 
-    component = await plugin._build_image_component(image_url)
+    component = await service.build_image_component(image_url)
 
     assert isinstance(component, Image)
     assert component.file == image_url
@@ -230,8 +267,6 @@ async def test_pre_download_failure_falls_back_to_remote_url(plugin_module):
 
 @pytest.mark.asyncio
 async def test_media_send_failure_preserves_text(plugin_module):
-    plugin = plugin_module.TwitterPlugin.__new__(plugin_module.TwitterPlugin)
-
     class Context:
         def __init__(self):
             self.sent = []
@@ -241,10 +276,451 @@ async def test_media_send_failure_preserves_text(plugin_module):
             if any(isinstance(component, Image) for component in message_chain.chain):
                 raise RuntimeError("media unavailable")
 
-    plugin.context = Context()
+    context = Context()
+    delivery = plugin_module.TweetDeliveryService(
+        context,
+        object(),
+        object(),
+        _delivery_settings(plugin_module),
+    )
     chain = [Plain("tweet text"), Image.fromURL("https://example.com/image.jpg")]
 
-    await plugin._send_plain_chain_resilient("session", chain)
+    sent = await delivery.send_plain_chain_resilient("session", chain)
 
-    assert len(plugin.context.sent) == 3
-    assert plugin.context.sent[1][0].text == "tweet text"
+    assert sent is True
+    assert len(context.sent) == 3
+    assert context.sent[1][0].text == "tweet text"
+
+
+@pytest.mark.asyncio
+async def test_primary_and_video_fallback_results_are_reported(plugin_module):
+    class FailedContext:
+        async def send_message(self, _umo, _message_chain):
+            raise RuntimeError("adapter unavailable")
+
+    failed_delivery = plugin_module.TweetDeliveryService(
+        FailedContext(),
+        object(),
+        object(),
+        _delivery_settings(plugin_module),
+    )
+    assert not await failed_delivery.send_plain_chain_resilient(
+        "session", [Plain("tweet")]
+    )
+
+    class VideoFallbackContext:
+        def __init__(self):
+            self.sent = []
+
+        async def send_message(self, _umo, message_chain):
+            self.sent.append(message_chain.chain)
+            if isinstance(message_chain.chain[0], Video):
+                raise RuntimeError("video unavailable")
+
+    context = VideoFallbackContext()
+    delivery = plugin_module.TweetDeliveryService(
+        context,
+        object(),
+        object(),
+        _delivery_settings(plugin_module),
+    )
+    sent = await delivery.send_video_or_fallback(
+        "session", Video.fromURL("https://example.com/video.mp4")
+    )
+
+    assert sent is True
+    assert len(context.sent) == 2
+    assert context.sent[1][0].text.startswith("视频: ")
+
+
+@pytest.mark.asyncio
+async def test_partial_subscriber_failure_is_reported(plugin_module):
+    subscriptions_data = {
+        "tester": {
+            "screen_name": "Tester",
+            "subscribers": {
+                "good": {"status": True, "r18": True, "media": False},
+                "bad": {"status": True, "r18": True, "media": False},
+            },
+        }
+    }
+
+    class Subscriptions:
+        async def get_all(self):
+            return subscriptions_data
+
+        async def get_retweet_seen(self):
+            return {}
+
+        async def save_retweet_seen(self, _data):
+            return None
+
+    class Messages:
+        @staticmethod
+        def build_nickname(username, screen_name):
+            return f"@{username} ({screen_name})"
+
+        build_author_display = build_nickname
+
+        @staticmethod
+        def tweet_has_media(_tweet_info):
+            return False
+
+        async def maybe_translate(self, _tweet_info, _umo):
+            return None, None
+
+        async def build_message_chain(self, *_args, **_kwargs):
+            return [Plain("tweet")]
+
+    class Context:
+        async def send_message(self, umo, _message_chain):
+            if umo == "bad":
+                raise RuntimeError("send failed")
+
+    delivery = plugin_module.TweetDeliveryService(
+        Context(),
+        Subscriptions(),
+        Messages(),
+        _delivery_settings(plugin_module),
+    )
+    result = await delivery.push_to_subscribers(
+        "tester",
+        {
+            "tweet_id": "1",
+            "username": "tester",
+            "screen_name": "Tester",
+            "text": "tweet",
+        },
+    )
+
+    contract = _delivery_contract(plugin_module)
+    assert result.state is contract.DeliveryState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_text_layout_keeps_retweet_quote_and_translation_paragraphs(
+    plugin_module,
+):
+    service = plugin_module.TweetMessageService(
+        object(),
+        object(),
+        None,
+        _message_settings(
+            plugin_module,
+            text_render_mode="text",
+            include_tweet_link=True,
+            pre_download_media=False,
+            proxy=None,
+        ),
+    )
+    tweet_info = {
+        "username": "author",
+        "screen_name": "Author",
+        "tweet_id": "123",
+        "text": "original",
+        "retweet": {
+            "retweeter_username": "retweeter",
+            "retweeter_screen_name": "Retweeter",
+        },
+        "quote": {
+            "username": "quoted",
+            "author": "Quoted",
+            "text": "quoted original",
+            "translated_text": "引用译文",
+        },
+    }
+
+    chain = await service.build_message_chain(
+        "retweeter",
+        tweet_info,
+        translated_text="正文译文",
+        translate_model="model",
+    )
+
+    assert len(chain) == 1
+    assert chain[0].text == (
+        "@retweeter (Retweeter) 转发了 @author (Author) 的帖子\n\n"
+        "正文译文\n\n"
+        "@author (Author) 引用了 @quoted (Quoted) 的帖子\n\n"
+        "引用译文\n\n"
+        "https://x.com/author/status/123\n\n"
+        "（由 model 翻译自原文）"
+    )
+
+
+@pytest.mark.asyncio
+async def test_screenshot_failure_falls_back_to_text(plugin_module):
+    async def html_render(*_args, **_kwargs):
+        raise RuntimeError("render unavailable")
+
+    service = plugin_module.TweetMessageService(
+        object(),
+        object(),
+        html_render,
+        _message_settings(
+            plugin_module,
+            text_render_mode="screenshot",
+            pre_download_media=False,
+            proxy=None,
+        ),
+    )
+
+    chain = await service.build_message_chain(
+        "tester",
+        {
+            "username": "tester",
+            "screen_name": "Tester",
+            "tweet_id": "1",
+            "text": "fallback text",
+        },
+    )
+
+    assert len(chain) == 1
+    assert isinstance(chain[0], Plain)
+    assert "fallback text" in chain[0].text
+
+
+@pytest.mark.asyncio
+async def test_disabling_separate_media_skips_all_media_work(plugin_module):
+    class TwitterAPI:
+        async def get_remote_file_size(self, _url):
+            raise AssertionError("关闭媒体发送后不应探测视频大小")
+
+        async def download_media(self, _url):
+            raise AssertionError("关闭媒体发送后不应下载图片")
+
+    service = plugin_module.TweetMessageService(
+        object(),
+        TwitterAPI(),
+        None,
+        _message_settings(
+            plugin_module,
+            text_render_mode="text",
+            send_media_separately=False,
+        ),
+    )
+
+    chain = await service.build_message_chain(
+        "tester",
+        {
+            "username": "tester",
+            "tweet_id": "1",
+            "text": "text",
+            "images": ["https://example.com/image.jpg"],
+            "videos": ["https://example.com/video.mp4"],
+            "quote": {
+                "username": "quoted",
+                "text": "quote",
+                "images": ["https://example.com/quote.jpg"],
+                "videos": ["https://example.com/quote.mp4"],
+            },
+        },
+    )
+
+    assert len(chain) == 1
+    assert isinstance(chain[0], Plain)
+
+
+def test_prepared_delivery_is_shared_by_plain_and_node_modes(plugin_module):
+    chain = [
+        Plain("tweet text"),
+        Image.fromURL("https://example.com/image.jpg"),
+        Video.fromURL("https://example.com/video.mp4"),
+    ]
+
+    plain_delivery = plugin_module.TweetDeliveryService(
+        object(),
+        object(),
+        object(),
+        _delivery_settings(plugin_module),
+    )
+    plain = plain_delivery.prepare_event_delivery(chain, "Tester")
+
+    node_delivery = plugin_module.TweetDeliveryService(
+        object(),
+        object(),
+        object(),
+        _delivery_settings(plugin_module, use_node=True),
+    )
+    node = node_delivery.prepare_event_delivery(chain, "Tester")
+
+    assert [type(component) for component in plain.primary_chain] == [Plain, Image]
+    assert len(plain.videos) == 1
+    assert len(node.primary_chain) == 1
+    assert isinstance(node.primary_chain[0], Nodes)
+    assert len(node.primary_chain[0].nodes) == 2
+    assert len(node.videos) == 1
+
+
+@pytest.mark.asyncio
+async def test_collective_delivery_flushes_and_clears_cache(plugin_module):
+    subscriptions_data = {
+        "tester": {
+            "screen_name": "Tester",
+            "subscribers": {
+                "session": {"status": True, "r18": True, "media": False}
+            },
+        }
+    }
+
+    class Subscriptions:
+        async def get_all(self):
+            return subscriptions_data
+
+        async def get_retweet_seen(self):
+            return {}
+
+        async def save_retweet_seen(self, _data):
+            return None
+
+    class Messages:
+        @staticmethod
+        def build_nickname(username, screen_name):
+            return f"@{username} ({screen_name})"
+
+        @staticmethod
+        def build_author_display(username, screen_name):
+            return f"@{username} ({screen_name})"
+
+        @staticmethod
+        def tweet_has_media(_tweet_info):
+            return False
+
+        async def maybe_translate(self, _tweet_info, _umo):
+            return None, None
+
+        async def build_message_chain(self, *_args, **_kwargs):
+            return [Plain("tweet")]
+
+    class Context:
+        def __init__(self):
+            self.sent = []
+
+        async def send_message(self, _umo, message_chain):
+            self.sent.append(message_chain.chain)
+
+    context = Context()
+    delivery = plugin_module.TweetDeliveryService(
+        context,
+        Subscriptions(),
+        Messages(),
+        _delivery_settings(
+            plugin_module,
+            use_node=True,
+            collective_forward=True,
+        ),
+    )
+
+    queued = await delivery.push_to_subscribers(
+        "tester",
+        {
+            "tweet_id": "1",
+            "username": "tester",
+            "screen_name": "Tester",
+            "text": "tweet",
+        },
+    )
+
+    contract = _delivery_contract(plugin_module)
+    assert queued.state is contract.DeliveryState.QUEUED
+    assert delivery.has_collected is True
+    assert context.sent == []
+
+    flushed = await delivery.flush_collected()
+
+    assert delivery.has_collected is False
+    assert len(context.sent) == 1
+    assert isinstance(context.sent[0][0], Nodes)
+    assert flushed.successful_authors == frozenset({"tester"})
+    assert flushed.failed_authors == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_failed_collective_retweet_does_not_persist_dedup(plugin_module):
+    subscriptions_data = {
+        "tester": {
+            "screen_name": "Tester",
+            "subscribers": {
+                "session": {"status": True, "r18": True, "media": False}
+            },
+        }
+    }
+    saved_seen = []
+
+    class Subscriptions:
+        async def get_all(self):
+            return subscriptions_data
+
+        async def get_retweet_seen(self):
+            return {}
+
+        async def save_retweet_seen(self, data):
+            saved_seen.append(data)
+
+        @staticmethod
+        def retweet_seen_by_umo(seen_data, umo, tweet_id):
+            return plugin_module.SubscriptionService.retweet_seen_by_umo(
+                seen_data, umo, tweet_id
+            )
+
+        @staticmethod
+        def mark_retweet_seen(seen_data, umo, tweet_id):
+            plugin_module.SubscriptionService.mark_retweet_seen(
+                seen_data, umo, tweet_id
+            )
+
+    class Messages:
+        @staticmethod
+        def build_nickname(username, screen_name):
+            return f"@{username} ({screen_name})"
+
+        build_author_display = build_nickname
+
+        @staticmethod
+        def tweet_has_media(_tweet_info):
+            return False
+
+        async def maybe_translate(self, _tweet_info, _umo):
+            return None, None
+
+        async def build_message_chain(self, *_args, **_kwargs):
+            return [Plain("retweet")]
+
+    class Context:
+        async def send_message(self, _umo, _message_chain):
+            raise RuntimeError("adapter unavailable")
+
+    delivery = plugin_module.TweetDeliveryService(
+        Context(),
+        Subscriptions(),
+        Messages(),
+        _delivery_settings(
+            plugin_module,
+            use_node=True,
+            collective_forward=True,
+            deduplicate_retweets=True,
+        ),
+    )
+    queued = await delivery.push_to_subscribers(
+        "tester",
+        {
+            "tweet_id": "123",
+            "username": "original",
+            "screen_name": "Original",
+            "text": "retweet",
+            "retweet": {
+                "retweeter_username": "tester",
+                "retweeter_screen_name": "Tester",
+            },
+        },
+    )
+
+    contract = _delivery_contract(plugin_module)
+    assert queued.state is contract.DeliveryState.QUEUED
+    assert saved_seen == []
+
+    flushed = await delivery.flush_collected()
+
+    assert flushed.successful_authors == frozenset()
+    assert flushed.failed_authors == frozenset({"tester"})
+    assert saved_seen == []

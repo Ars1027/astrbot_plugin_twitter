@@ -1,7 +1,7 @@
 name: astrbot_plugin_twitter
 display_name: Twitter 推文转发
 desc: 支持 Nitter 与 FxTwitter API 的推特转发插件，提供订阅、定时推送、链接识别和合并转发
-version: v1.8.0
+version: v1.9.0
 author: Ars1027
 support_platforms: 
   - aiocqhttp
