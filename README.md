@@ -200,7 +200,7 @@ FxTwitter 时间线使用有限 cursor 分页并在本地按推文 ID 去重、�
 > [!WARNING]
 > - 默认数据源仍为 Nitter，以兼容旧配置；需要 FxTwitter 时请显式选择 `fxtwitter`
 > - FxTwitter 是第三方公开 JSON API，并非 X/Twitter 官方 API；可用性、限流和字段可能随其服务更新变化
-> - Nitter 镜像站可能随时失效，~~插件内置了多个镜像地址并支持自动切换~~
+> - ~~Nitter 镜像站可能随时失效，~~插件内置了多个镜像地址并支持自动切换~~2026/8/27 目前nitter原仓库已被律师函警告删库
 > - **强烈建议自行部署 Nitter** 以保证稳定性，项目地址：[https://github.com/zedeus/nitter](https://github.com/zedeus/nitter)
 > - **Nitter本地部署教程**：https://mib7kzqsrf5.feishu.cn/wiki/O1ztwWl3GiBc4AknKvIcyaKsnFb?from=from_copylink
 > - 翻译功能需至少配置一个可用的 LLM Provider
