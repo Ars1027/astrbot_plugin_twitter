@@ -1,6 +1,7 @@
 """推文翻译、文本排版、截图渲染和媒体组件构建。"""
 
 import asyncio
+import base64
 import copy
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -17,6 +18,10 @@ from ..twitter_renderer import (
 
 
 HtmlRender = Callable[..., Awaitable[str]]
+
+# NapCat 等 OneBot 实现限制单条 WebSocket 消息大小（NapCat 为 50MB），
+# base64 编码使体积膨胀约 1/3，代理预下载视频时预留安全余量。
+VIDEO_PRE_DOWNLOAD_MAX_BYTES = 30 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,7 +155,10 @@ class TweetMessageService:
                     )
                     continue
 
-                video_comp = Comp.Video.fromURL(video_url)
+                video_comp = await self.build_video_component(
+                    video_url,
+                    size_bytes,
+                )
                 if video_comp is not None:
                     chain.append(video_comp)
             except Exception as exc:
@@ -180,6 +188,36 @@ class TweetMessageService:
             return Comp.Image.fromURL(img_url)
 
         return Comp.Image.fromBytes(data)
+
+    async def build_video_component(
+        self,
+        video_url: str,
+        size_bytes: int | None = None,
+    ) -> Comp.Video | None:
+        """根据代理配置选择合适的视频组件构建方式。"""
+        video_url = str(video_url or "").strip()
+        if not video_url:
+            return None
+
+        pre_download_allowed = (
+            self.settings.pre_download_media
+            and self.settings.proxy
+            and size_bytes is not None
+            and 0 < size_bytes <= VIDEO_PRE_DOWNLOAD_MAX_BYTES
+        )
+        if not pre_download_allowed:
+            return Comp.Video.fromURL(video_url)
+
+        try:
+            data = await self.twitter_api.download_media(video_url)
+        except Exception as exc:
+            logger.warning(
+                f"通过代理下载视频失败 {video_url}: {exc}，回退为远程 URL"
+            )
+            return Comp.Video.fromURL(video_url)
+
+        encoded = base64.b64encode(data).decode("ascii")
+        return Comp.Video.fromBase64(encoded, url=video_url)
 
     async def maybe_translate(
         self,

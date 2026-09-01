@@ -123,7 +123,7 @@ AstrBot `v4.24.2+` 可在 Dashboard 中直接打开插件的“Twitter 订阅管
 | `twitter_fxtwitter_api_base` | string | `https://api.fxtwitter.com` | FxTwitter API 基础地址，末尾斜杠会自动清理 |
 | `twitter_nitter_url` | string | （空） | Nitter 镜像站地址，留空则使用内置列表自动切换（内置列表仅有1个且可能失效，强烈建议自定义） |
 | `twitter_proxy` | string | （空） | 代理地址，如 `http://127.0.0.1:7890` |
-| `twitter_pre_download_media` | bool | `false` | 配置代理后可预下载图片、头像和视频封面，媒体下载失败时保留文字并回退到原 URL |
+| `twitter_pre_download_media` | bool | `false` | 配置代理后可预下载图片、头像、视频封面及不超过 30MB 的视频（以 base64 转发给 OneBot），媒体下载失败时保留文字并回退到原 URL |
 | `twitter_poll_interval` | int | `5` | 推文轮询间隔（分钟），建议不低于 3 |
 | `twitter_poll_max_tweets_per_user` | int | `5` | 每个推主每轮最多推送的推文数；积压内容按旧到新保留到后续轮询继续推送，最小值为 1 |
 

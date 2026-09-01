@@ -135,16 +135,21 @@ class TweetDeliveryService:
         return nodes, video_parts
 
     @staticmethod
+    def _video_link(component: Comp.Video) -> str:
+        """提取视频组件上的原始远程链接，忽略 base64 与本地文件。"""
+        for attribute in ("url", "file"):
+            value = str(getattr(component, attribute, "") or "").strip()
+            if value.startswith(("http://", "https://")):
+                return value
+        return ""
+
+    @staticmethod
     def build_plain_chain(chain: list) -> list:
         """保留图片，并把视频转换为链接文本。"""
         plain_chain = []
         for component in chain:
             if isinstance(component, Comp.Video):
-                video_url = getattr(component, "file", "") or getattr(
-                    component,
-                    "url",
-                    "",
-                )
+                video_url = TweetDeliveryService._video_link(component)
                 if video_url:
                     plain_chain.append(
                         Comp.Plain(str(f"\n视频: {video_url}"))
@@ -254,11 +259,7 @@ class TweetDeliveryService:
             return True
         except Exception as exc:
             logger.warning(f"视频发送失败，回退为链接: {exc}")
-            video_url = getattr(video_component, "file", "") or getattr(
-                video_component,
-                "url",
-                "",
-            )
+            video_url = self._video_link(video_component)
             if video_url:
                 try:
                     await self.context.send_message(

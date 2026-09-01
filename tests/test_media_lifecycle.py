@@ -1,3 +1,4 @@
+import base64
 import importlib.util
 import sys
 import types
@@ -44,6 +45,10 @@ class Video(_Component):
     @staticmethod
     def fromURL(url):
         return Video(file=url)
+
+    @staticmethod
+    def fromBase64(data, **_kwargs):
+        return Video(file=f"base64://{data}", **_kwargs)
 
 
 class Node(_Component):
@@ -310,6 +315,149 @@ async def test_pre_downloaded_image_uses_from_bytes(plugin_module):
 
     assert isinstance(component, Image)
     assert component.data == image_bytes
+
+
+@pytest.mark.asyncio
+async def test_video_pre_download_uses_base64_within_size_limit(plugin_module):
+    video_bytes = b"fake-video-data"
+
+    class TwitterAPI:
+        async def download_media(self, url):
+            assert url == "https://example.com/video.mp4"
+            return video_bytes
+
+    service = plugin_module.TweetMessageService(
+        object(),
+        TwitterAPI(),
+        None,
+        _message_settings(plugin_module),
+    )
+    component = await service.build_video_component(
+        "https://example.com/video.mp4",
+        size_bytes=len(video_bytes),
+    )
+
+    expected = base64.b64encode(video_bytes).decode("ascii")
+    assert isinstance(component, Video)
+    assert component.file == f"base64://{expected}"
+    assert component.url == "https://example.com/video.mp4"
+
+
+@pytest.mark.asyncio
+async def test_video_pre_download_failure_falls_back_to_remote_url(plugin_module):
+    class TwitterAPI:
+        async def download_media(self, _url):
+            raise RuntimeError("proxy unavailable")
+
+    service = plugin_module.TweetMessageService(
+        object(),
+        TwitterAPI(),
+        None,
+        _message_settings(plugin_module),
+    )
+    video_url = "https://example.com/video.mp4"
+
+    component = await service.build_video_component(video_url, size_bytes=1024)
+
+    assert isinstance(component, Video)
+    assert component.file == video_url
+
+
+@pytest.mark.asyncio
+async def test_video_pre_download_skipped_when_size_unknown_or_too_large(
+    plugin_module,
+):
+    class TwitterAPI:
+        async def download_media(self, _url):
+            raise AssertionError("超出预下载大小限制时不应下载视频")
+
+    service = plugin_module.TweetMessageService(
+        object(),
+        TwitterAPI(),
+        None,
+        _message_settings(plugin_module),
+    )
+
+    message_module = sys.modules[
+        f"{plugin_module.__package__}.services.tweet_message_service"
+    ]
+    oversized = await service.build_video_component(
+        "https://example.com/big.mp4",
+        size_bytes=message_module.VIDEO_PRE_DOWNLOAD_MAX_BYTES + 1,
+    )
+    assert isinstance(oversized, Video)
+    assert oversized.file == "https://example.com/big.mp4"
+
+    unknown = await service.build_video_component(
+        "https://example.com/unknown.mp4",
+        size_bytes=None,
+    )
+    assert isinstance(unknown, Video)
+    assert unknown.file == "https://example.com/unknown.mp4"
+
+
+@pytest.mark.asyncio
+async def test_video_pre_download_skipped_when_disabled(plugin_module):
+    class TwitterAPI:
+        async def download_media(self, _url):
+            raise AssertionError("未开启预下载时不应下载视频")
+
+    service = plugin_module.TweetMessageService(
+        object(),
+        TwitterAPI(),
+        None,
+        _message_settings(plugin_module, pre_download_media=False, proxy=None),
+    )
+    component = await service.build_video_component(
+        "https://example.com/video.mp4",
+        size_bytes=1024,
+    )
+
+    assert isinstance(component, Video)
+    assert component.file == "https://example.com/video.mp4"
+
+
+@pytest.mark.asyncio
+async def test_base64_video_fallback_link_uses_original_url(plugin_module):
+    class VideoFallbackContext:
+        def __init__(self):
+            self.sent = []
+
+        async def send_message(self, _umo, message_chain):
+            self.sent.append(message_chain.chain)
+            if isinstance(message_chain.chain[0], Video):
+                raise RuntimeError("video unavailable")
+
+    context = VideoFallbackContext()
+    delivery = plugin_module.TweetDeliveryService(
+        context,
+        object(),
+        object(),
+        _delivery_settings(plugin_module),
+    )
+    sent = await delivery.send_video_or_fallback(
+        "session",
+        Video(file="base64://ZmFrZQ==", url="https://example.com/video.mp4"),
+    )
+
+    assert sent is True
+    assert len(context.sent) == 2
+    assert context.sent[1][0].text == "视频: https://example.com/video.mp4"
+
+
+def test_plain_chain_uses_original_url_for_base64_video(plugin_module):
+    delivery = plugin_module.TweetDeliveryService(
+        object(),
+        object(),
+        object(),
+        _delivery_settings(plugin_module),
+    )
+    chain = delivery.build_plain_chain(
+        [Video(file="base64://ZmFrZQ==", url="https://example.com/video.mp4")]
+    )
+
+    assert len(chain) == 1
+    assert chain[0].text == "\n视频: https://example.com/video.mp4"
 
 
 @pytest.mark.asyncio
