@@ -87,6 +87,21 @@
       font-weight: 800;
       font-size: 24px;
     }
+    .avatar-frame {
+      position: relative;
+      width: 48px;
+      height: 48px;
+      flex: 0 0 auto;
+    }
+    .avatar-frame .avatar-fallback { width: 100%; height: 100%; }
+    .avatar-frame img {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+    .avatar-frame img[hidden] { display: none; }
+    .avatar-frame.quote-avatar .avatar-fallback { font-size: 14px; }
     .tweet-main { min-width: 0; }
     .tweet-top {
       display: flex;
@@ -311,11 +326,12 @@
     {% endif %}
     <article class="tweet">
       <aside>
-        {% if tweet.avatar %}
-          <img class="avatar" src="{{ tweet.avatar|e }}" alt="">
-        {% else %}
+        <div class="avatar-frame">
           <div class="avatar-fallback">@</div>
-        {% endif %}
+          {% if tweet.avatar %}
+            <img class="avatar" src="{{ tweet.avatar|e }}" alt="" onerror="this.hidden=true">
+          {% endif %}
+        </div>
       </aside>
       <main class="tweet-main">
         <div class="tweet-top">
@@ -339,7 +355,10 @@
           <section class="quote-card">
             <div class="quote-body">
               <div class="quote-author">
-                {% if tweet.quote.avatar %}<img class="quote-avatar" src="{{ tweet.quote.avatar|e }}" alt="">{% endif %}
+                <div class="avatar-frame quote-avatar">
+                  <div class="avatar-fallback">@</div>
+                  {% if tweet.quote.avatar %}<img class="avatar" src="{{ tweet.quote.avatar|e }}" alt="" onerror="this.hidden=true">{% endif %}
+                </div>
                 <span class="quote-name">{{ tweet.quote.name|e }}</span>
                 {% if tweet.quote.verified %}<span class="verified">&#x2713;</span>{% endif %}
                 {% if tweet.quote.username %}<span class="quote-handle">@{{ tweet.quote.username|e }}</span>{% endif %}
