@@ -70,18 +70,27 @@ class FakeTwitterAPI:
         self.kwargs = kwargs
         self.provider = kwargs.get("provider", "nitter")
         self.nitter_url = kwargs.get("nitter_url", "")
+        self.provider_ready = False
         self.fx_checks = 0
         self.nitter_checks = 0
         self.closed = False
         self.__class__.instances.append(self)
 
+    @property
+    def is_ready(self):
+        if self.provider == "fxtwitter":
+            return self.provider_ready
+        return bool(self.nitter_url)
+
     async def check_fxtwitter_available(self):
         self.fx_checks += 1
+        self.provider_ready = True
         return True
 
     async def check_website_available(self, websites):
         self.nitter_checks += 1
         self.nitter_url = websites[0] if websites else "https://nitter.test"
+        self.provider_ready = True
         return self.nitter_url
 
     async def close(self):
@@ -203,6 +212,128 @@ async def test_fxtwitter_initialization_skips_nitter(plugin_module):
     assert fake.closed is True
 
 
+def test_fxtwitter_readiness_stays_in_sync_with_api(plugin_module):
+    plugin = plugin_module.TwitterPlugin(
+        object(),
+        {"basic": {"twitter_data_provider": "fxtwitter"}},
+    )
+
+    plugin.twitter_api.provider_ready = True
+    assert plugin._provider_ready is True
+
+    plugin.twitter_api.provider_ready = False
+    assert plugin._provider_ready is False
+
+    plugin._provider_ready = True
+    assert plugin.twitter_api.is_ready is True
+
+
+@pytest.mark.asyncio
+async def test_fxtwitter_initialization_failure_keeps_recovery_task(
+    plugin_module,
+    monkeypatch,
+):
+    async def unavailable(self):
+        self.fx_checks += 1
+        self.provider_ready = False
+        return False
+
+    monkeypatch.setattr(
+        FakeTwitterAPI,
+        "check_fxtwitter_available",
+        unavailable,
+    )
+    plugin = plugin_module.TwitterPlugin(
+        object(),
+        {"basic": {"twitter_data_provider": "fxtwitter"}},
+    )
+    plugin._poll_tweets = _wait_forever
+
+    await plugin.initialize()
+
+    fake = FakeTwitterAPI.instances[-1]
+    assert fake.fx_checks == 1
+    assert plugin._provider_ready is False
+    assert plugin._running is True
+    assert plugin._poll_task is not None
+
+    await plugin.terminate()
+    assert fake.closed is True
+
+
+@pytest.mark.asyncio
+async def test_fxtwitter_health_exception_keeps_recovery_task(
+    plugin_module,
+    monkeypatch,
+):
+    async def unavailable(self):
+        self.fx_checks += 1
+        self.provider_ready = False
+        raise RuntimeError("proxy unavailable")
+
+    monkeypatch.setattr(
+        FakeTwitterAPI,
+        "check_fxtwitter_available",
+        unavailable,
+    )
+    plugin = plugin_module.TwitterPlugin(
+        object(),
+        {"basic": {"twitter_data_provider": "fxtwitter"}},
+    )
+    plugin._poll_tweets = _wait_forever
+
+    await plugin.initialize()
+
+    fake = FakeTwitterAPI.instances[-1]
+    assert fake.fx_checks == 1
+    assert plugin._provider_ready is False
+    assert plugin._running is True
+    assert plugin._poll_task is not None
+
+    await plugin.terminate()
+    assert fake.closed is True
+
+
+@pytest.mark.asyncio
+async def test_fxtwitter_polling_retries_until_recovered(plugin_module):
+    plugin = plugin_module.TwitterPlugin(
+        object(),
+        {"basic": {"twitter_data_provider": "fxtwitter"}},
+    )
+    fake = FakeTwitterAPI.instances[-1]
+    plugin._provider_ready = False
+    fake.provider_ready = False
+    plugin._running = True
+    waits = 0
+    polls = 0
+    health_results = iter((False, True))
+
+    async def wait_for_next_poll():
+        nonlocal waits
+        waits += 1
+
+    async def recover():
+        fake.fx_checks += 1
+        fake.provider_ready = next(health_results)
+        return fake.provider_ready
+
+    async def check_all():
+        nonlocal polls
+        polls += 1
+        plugin._running = False
+
+    plugin._wait_for_next_poll = wait_for_next_poll
+    plugin.twitter_api.check_fxtwitter_available = recover
+    plugin._check_all_subscriptions = check_all
+
+    await plugin._poll_tweets()
+
+    assert waits == 2
+    assert fake.fx_checks == 2
+    assert polls == 1
+    assert plugin._provider_ready is True
+
+
 @pytest.mark.asyncio
 async def test_nitter_default_preserves_original_initialization(plugin_module):
     plugin = plugin_module.TwitterPlugin(object(), {})
@@ -218,6 +349,37 @@ async def test_nitter_default_preserves_original_initialization(plugin_module):
     assert plugin._provider_ready is True
 
     await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_nitter_initialization_failure_still_skips_polling(
+    plugin_module,
+    monkeypatch,
+):
+    async def unavailable(self, _websites):
+        self.nitter_checks += 1
+        self.nitter_url = ""
+        self.provider_ready = False
+        return None
+
+    monkeypatch.setattr(
+        FakeTwitterAPI,
+        "check_website_available",
+        unavailable,
+    )
+    plugin = plugin_module.TwitterPlugin(object(), {})
+    plugin._poll_tweets = _wait_forever
+
+    await plugin.initialize()
+
+    fake = FakeTwitterAPI.instances[-1]
+    assert fake.nitter_checks == 1
+    assert plugin._provider_ready is False
+    assert plugin._running is False
+    assert plugin._poll_task is None
+
+    await plugin.terminate()
+    assert fake.closed is True
 
 
 def test_flat_and_grouped_provider_config_are_compatible(plugin_module):
@@ -416,6 +578,49 @@ async def test_timeline_failure_does_not_advance_polling_cursor(plugin_module):
     assert result is False
     assert store["tester"]["since_id"] == "100"
     assert save_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_fxtwitter_global_failure_stops_remaining_users(plugin_module):
+    calls = []
+
+    class API:
+        is_ready = True
+
+        async def get_user_timeline_items(self, username, _since_id):
+            calls.append(username)
+            self.is_ready = False
+            raise plugin_module.FxTwitterTimelineError("代理连接失败")
+
+    class Subscriptions:
+        @staticmethod
+        def processed_tweet_ids(_info):
+            return set()
+
+        async def get_all(self):
+            return {
+                "first": {"since_id": "100"},
+                "second": {"since_id": "200"},
+            }
+
+    class Delivery:
+        collective_enabled = False
+
+    polling = plugin_module.PollingService(
+        API(),
+        Subscriptions(),
+        Delivery(),
+        plugin_module.PollingSettings(
+            include_retweets=True,
+            data_provider="fxtwitter",
+            custom_nitter_url="",
+            website_list=(),
+        ),
+    )
+
+    await polling.check_all()
+
+    assert calls == ["first"]
 
 
 def test_timeline_metadata_is_the_only_source_of_retweet_context(plugin_module):

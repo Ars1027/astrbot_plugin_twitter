@@ -258,6 +258,77 @@ async def test_provider_clients_use_matching_request_headers(api_module):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_type",
+    [httpx.ConnectError, httpx.ReadTimeout],
+)
+async def test_transport_failure_rebuilds_client_during_retry(
+    api_module,
+    monkeypatch,
+    error_type,
+):
+    def broken_handler(request):
+        raise error_type(
+            "proxy tunnel unavailable",
+            request=request,
+        )
+
+    def recovered_handler(_request):
+        return httpx.Response(
+            200,
+            json={"code": 200, "results": []},
+        )
+
+    broken_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(broken_handler)
+    )
+    recovered_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(recovered_handler)
+    )
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(api_module.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(
+        api_module.httpx,
+        "AsyncClient",
+        lambda **_kwargs: recovered_client,
+    )
+
+    api = api_module.TwitterAPI(provider="fxtwitter")
+    api._client = broken_client
+    payload = await api._request_fxtwitter_json(
+        "2/profile/tester/statuses",
+        retries=2,
+    )
+
+    assert payload == {"code": 200, "results": []}
+    assert broken_client.is_closed
+    assert api._client is recovered_client
+    assert api.is_ready is True
+
+    await api.close()
+    assert recovered_client.is_closed
+
+
+@pytest.mark.asyncio
+async def test_stale_client_invalidation_does_not_close_replacement(api_module):
+    api = api_module.TwitterAPI(provider="fxtwitter")
+    stale_client = httpx.AsyncClient(transport=httpx.MockTransport(lambda _: None))
+    api._client = stale_client
+
+    assert await api._invalidate_client(stale_client) is True
+    replacement = await api._get_client()
+    assert await api._invalidate_client(stale_client) is False
+
+    assert stale_client.is_closed
+    assert api._client is replacement
+    assert not replacement.is_closed
+    await api.close()
+
+
+@pytest.mark.asyncio
 async def test_first_subscription_uses_only_latest_id(api_module):
     api = api_module.TwitterAPI(provider="fxtwitter")
     page = _fixture("fxtwitter_timeline_page1.json")
@@ -364,9 +435,16 @@ async def test_rate_limit_api_error_and_invalid_json_are_safe(api_module):
     api = api_module.TwitterAPI(provider="fxtwitter")
     api._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
+    api.provider_ready = True
     assert await api._request_fxtwitter_json("rate") is None
+    assert api.is_ready is False
+
+    api.provider_ready = True
     assert await api._request_fxtwitter_json("missing") is None
+    assert api.is_ready is True
+
     assert await api._request_fxtwitter_json("invalid") is None
+    assert api.is_ready is False
 
     messages = [
         message for _level, message in sys.modules["astrbot.api"].logger.messages
@@ -374,3 +452,49 @@ async def test_rate_limit_api_error_and_invalid_json_are_safe(api_module):
     assert any("Retry-After=60" in message for message in messages)
     assert any("JSON 解码失败" in message for message in messages)
     await api.close()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_server_errors_mark_provider_unavailable(api_module):
+    def handler(_request):
+        return httpx.Response(503, json={"code": 503})
+
+    api = api_module.TwitterAPI(provider="fxtwitter")
+    api.provider_ready = True
+    api._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    assert await api._request_fxtwitter_json("unavailable", retries=1) is None
+    assert api.is_ready is False
+    await api.close()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_transport_errors_leave_fresh_start_for_next_poll(
+    api_module,
+    monkeypatch,
+):
+    def handler(request):
+        raise httpx.ProxyError("proxy unavailable", request=request)
+
+    first_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    retry_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(api_module.asyncio, "sleep", no_sleep)
+    monkeypatch.setattr(
+        api_module.httpx,
+        "AsyncClient",
+        lambda **_kwargs: retry_client,
+    )
+
+    api = api_module.TwitterAPI(provider="fxtwitter")
+    api.provider_ready = True
+    api._client = first_client
+
+    assert await api._request_fxtwitter_json("failed", retries=2) is None
+    assert api.is_ready is False
+    assert api._client is None
+    assert first_client.is_closed
+    assert retry_client.is_closed

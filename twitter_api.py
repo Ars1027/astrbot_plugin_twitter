@@ -88,6 +88,7 @@ class TwitterAPI:
         self.fxtwitter_max_items = max(1, min(int(fxtwitter_max_items), 500))
         self.provider_ready = False
         self._client: Optional[httpx.AsyncClient] = None
+        self._client_lock = asyncio.Lock()
         self._status_cache: OrderedDict[str, dict] = OrderedDict()
 
     @property
@@ -99,21 +100,44 @@ class TwitterAPI:
 
     async def _get_client(self) -> httpx.AsyncClient:
         """获取或创建异步 HTTP 客户端"""
-        if self._client is None or self._client.is_closed:
-            proxy = self.proxy if self.proxy else None
-            headers = (
-                FXTWITTER_REQUEST_HEADERS
-                if self.provider == DATA_PROVIDER_FXTWITTER
-                else NITTER_REQUEST_HEADERS
-            )
-            self._client = httpx.AsyncClient(
-                proxy=proxy,
-                http2=True,
-                timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0),
-                follow_redirects=True,
-                headers=dict(headers),
-            )
-        return self._client
+        async with self._client_lock:
+            if self._client is None or self._client.is_closed:
+                proxy = self.proxy if self.proxy else None
+                headers = (
+                    FXTWITTER_REQUEST_HEADERS
+                    if self.provider == DATA_PROVIDER_FXTWITTER
+                    else NITTER_REQUEST_HEADERS
+                )
+                self._client = httpx.AsyncClient(
+                    proxy=proxy,
+                    http2=True,
+                    timeout=httpx.Timeout(
+                        connect=10.0,
+                        read=30.0,
+                        write=30.0,
+                        pool=10.0,
+                    ),
+                    follow_redirects=True,
+                    headers=dict(headers),
+                )
+            return self._client
+
+    async def _invalidate_client(
+        self,
+        failed_client: httpx.AsyncClient,
+    ) -> bool:
+        """仅淘汰发生传输错误的当前客户端。"""
+        async with self._client_lock:
+            if self._client is not failed_client:
+                return False
+            self._client = None
+
+        if not failed_client.is_closed:
+            try:
+                await failed_client.aclose()
+            except Exception as exc:
+                logger.debug(f"关闭异常 HTTP 客户端失败: {exc}")
+        return True
 
     async def _request_fxtwitter_json(
         self,
@@ -122,30 +146,37 @@ class TwitterAPI:
         retries: int = 2,
     ) -> Optional[dict]:
         """请求 FxTwitter JSON，统一处理超时、限流、5xx 与解码错误。"""
-        client = await self._get_client()
         url = f"{self.fxtwitter_api_base}/{str(path or '').lstrip('/')}"
         attempts = max(1, int(retries))
 
         for attempt in range(attempts):
+            client = await self._get_client()
             try:
                 resp = await client.get(url, params=params)
             except httpx.TimeoutException as e:
                 logger.warning(f"FxTwitter API 连接或读取超时: {url}, {e}")
+                client_invalidated = await self._invalidate_client(client)
                 if attempt + 1 < attempts:
                     await asyncio.sleep(0.5 * (attempt + 1))
                     continue
+                if client_invalidated:
+                    self.provider_ready = False
                 return None
             except httpx.RequestError as e:
                 logger.warning(f"FxTwitter API 请求失败: {url}, {e}")
+                client_invalidated = await self._invalidate_client(client)
                 if attempt + 1 < attempts:
                     await asyncio.sleep(0.5 * (attempt + 1))
                     continue
+                if client_invalidated:
+                    self.provider_ready = False
                 return None
 
             if resp.status_code == 429:
                 retry_after = str(resp.headers.get("Retry-After") or "").strip()
                 suffix = f"，Retry-After={retry_after}" if retry_after else ""
                 logger.warning(f"FxTwitter API 触发限流: {url}{suffix}")
+                self.provider_ready = False
                 return None
 
             if 500 <= resp.status_code < 600:
@@ -156,6 +187,7 @@ class TwitterAPI:
                 if attempt + 1 < attempts:
                     await asyncio.sleep(0.5 * (attempt + 1))
                     continue
+                self.provider_ready = False
                 return None
 
             if resp.status_code < 200 or resp.status_code >= 300:
@@ -172,10 +204,12 @@ class TwitterAPI:
                     f"FxTwitter API JSON 解码失败: {url}, 状态码: "
                     f"{resp.status_code}, 响应摘要: {summary!r}"
                 )
+                self.provider_ready = False
                 return None
 
             if not isinstance(payload, dict):
                 logger.warning(f"FxTwitter API 返回非对象 JSON: {url}")
+                self.provider_ready = False
                 return None
 
             api_code = payload.get("code")
@@ -190,6 +224,7 @@ class TwitterAPI:
                     f"message={message!r}"
                 )
                 return None
+            self.provider_ready = True
             return payload
 
         return None
@@ -258,9 +293,11 @@ class TwitterAPI:
 
     async def close(self):
         """关闭 HTTP 客户端"""
-        if self._client and not self._client.is_closed:
-            await self._client.aclose()
+        async with self._client_lock:
+            client = self._client
             self._client = None
+        if client and not client.is_closed:
+            await client.aclose()
 
     @staticmethod
     def _parse_content_length(value: str) -> Optional[int]:

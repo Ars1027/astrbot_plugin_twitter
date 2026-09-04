@@ -7,6 +7,7 @@ from typing import Any
 from astrbot.api import logger
 
 from ..twitter_api import (
+    DATA_PROVIDER_FXTWITTER,
     DATA_PROVIDER_NITTER,
     FxTwitterTimelineError,
     get_next_website,
@@ -141,13 +142,25 @@ class PollingService:
 
         results: list[bool] = []
         for username, info in subscribe_list.items():
+            check_completed = False
             try:
                 result = await self.check_user(username, info)
                 results.append(result)
-                await asyncio.sleep(3)
+                check_completed = True
             except Exception as exc:
                 logger.error(f"检查 {username} 推文失败: {exc}")
                 results.append(False)
+
+            if (
+                self.settings.data_provider == DATA_PROVIDER_FXTWITTER
+                and not bool(getattr(self.twitter_api, "is_ready", True))
+            ):
+                logger.warning(
+                    "FxTwitter API 当前不可用，停止检查本轮剩余推主"
+                )
+                break
+            if check_completed:
+                await asyncio.sleep(3)
 
         if self.delivery.collective_enabled:
             await self.flush_pending_collective()

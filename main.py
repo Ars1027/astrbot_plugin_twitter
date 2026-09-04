@@ -86,6 +86,26 @@ def _normalize_link_recognition_mode(value: Any) -> str:
 class TwitterPlugin(Star):
     """Twitter 推文转发插件主类。"""
 
+    @property
+    def _provider_ready(self) -> bool:
+        """返回与数据访问层同步的数据源状态。"""
+        if (
+            getattr(self, "data_provider", None) == DATA_PROVIDER_FXTWITTER
+            and hasattr(self, "twitter_api")
+        ):
+            return bool(self.twitter_api.is_ready)
+        return bool(getattr(self, "_provider_ready_state", False))
+
+    @_provider_ready.setter
+    def _provider_ready(self, value: bool) -> None:
+        ready = bool(value)
+        self._provider_ready_state = ready
+        if (
+            getattr(self, "data_provider", None) == DATA_PROVIDER_FXTWITTER
+            and hasattr(self, "twitter_api")
+        ):
+            self.twitter_api.provider_ready = ready
+
     def _cfg(self, block: str, key: str, default, *legacy_keys: str):
         """读取分组配置，并兼容旧版顶层扁平配置。"""
         block_config = self.config.get(block, {}) or {}
@@ -386,6 +406,16 @@ class TwitterPlugin(Star):
         """延迟调用 AstrBot HTML 渲染接口。"""
         return await self.html_render(*args, **kwargs)
 
+    async def _refresh_fxtwitter_availability(self) -> bool:
+        """刷新 FxTwitter 健康状态，避免检查异常终止轮询任务。"""
+        try:
+            ready = await self.twitter_api.check_fxtwitter_available()
+        except Exception as exc:
+            logger.warning(f"FxTwitter API 健康检查异常: {exc}")
+            ready = False
+        self._provider_ready = bool(ready)
+        return self._provider_ready
+
     async def initialize(self):
         """初始化数据源并启动轮询任务。"""
         logger.info("Twitter 推文转发插件初始化中...")
@@ -398,9 +428,7 @@ class TwitterPlugin(Star):
 
         if self.data_provider == DATA_PROVIDER_FXTWITTER:
             logger.info("当前使用 Twitter 数据源: FxTwitter API")
-            self._provider_ready = (
-                await self.twitter_api.check_fxtwitter_available()
-            )
+            await self._refresh_fxtwitter_availability()
             if not self._provider_ready:
                 logger.warning("FxTwitter API 健康检查失败，推文轮询功能暂不可用")
         else:
@@ -414,10 +442,22 @@ class TwitterPlugin(Star):
             else:
                 logger.warning("未找到可用 Nitter 镜像站，推文轮询功能暂不可用")
 
-        if self._provider_ready:
+        should_start_polling = (
+            self._provider_ready
+            or self.data_provider == DATA_PROVIDER_FXTWITTER
+        )
+        if should_start_polling:
             self._running = True
             self._poll_task = asyncio.create_task(self._poll_tweets())
-            logger.info(f"推文轮询已启动，间隔 {self.poll_interval} 分钟")
+            if self._provider_ready:
+                logger.info(
+                    f"推文轮询已启动，间隔 {self.poll_interval} 分钟"
+                )
+            else:
+                logger.warning(
+                    "FxTwitter API 暂不可用，已启动后台恢复检查，"
+                    f"间隔 {self.poll_interval} 分钟"
+                )
 
         logger.info("Twitter 推文转发插件初始化完成")
 
@@ -562,12 +602,32 @@ class TwitterPlugin(Star):
 
     async def _poll_tweets(self) -> None:
         """按全局间隔执行轮询。"""
+        wait_before_poll = (
+            self.data_provider == DATA_PROVIDER_FXTWITTER
+            and not self._provider_ready
+        )
         while self._running:
+            if wait_before_poll:
+                await self._wait_for_next_poll()
+                if not self._running:
+                    break
+            wait_before_poll = True
+
+            if (
+                self.data_provider == DATA_PROVIDER_FXTWITTER
+                and not self._provider_ready
+            ):
+                if not await self._refresh_fxtwitter_availability():
+                    continue
+                logger.info("FxTwitter API 已恢复，立即执行订阅轮询")
+
             try:
                 await self._check_all_subscriptions()
             except Exception as exc:
                 logger.error(f"推文轮询出错: {exc}")
-            await self._wait_for_next_poll()
+            finally:
+                if self.data_provider == DATA_PROVIDER_FXTWITTER:
+                    self._provider_ready = bool(self.twitter_api.is_ready)
 
     @filter.command("推特关注", alias={"twitter_follow"})
     async def follow_twitter(
