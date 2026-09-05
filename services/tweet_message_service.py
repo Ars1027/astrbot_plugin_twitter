@@ -3,7 +3,7 @@
 import asyncio
 import copy
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from astrbot.api import logger
@@ -14,6 +14,7 @@ from ..twitter_renderer import (
     load_tweet_card_template,
     tweet_card_render_options,
 )
+from .avatar_cache_service import AvatarCacheService
 
 
 HtmlRender = Callable[..., Awaitable[str]]
@@ -36,6 +37,31 @@ class TweetMessageSettings:
     translate_custom_prompt: str
     pre_download_media: bool
     proxy: str | None
+    translate_timeout_seconds: int = 60
+
+
+@dataclass(slots=True)
+class TranslationCycleState:
+    """仅在一轮轮询内共享的 Provider 失败计数，手动解析不使用。"""
+
+    failures: dict[str, int] = field(default_factory=dict)
+    skipped: int = 0
+
+    def should_skip(self, provider_id: str) -> bool:
+        if self.failures.get(provider_id, 0) < 2:
+            return False
+        self.skipped += 1
+        return True
+
+    def record(self, provider_id: str, failed: bool) -> None:
+        self.failures[provider_id] = (
+            self.failures.get(provider_id, 0) + 1 if failed else 0
+        )
+        if self.failures[provider_id] == 2:
+            logger.warning(
+                f"翻译 Provider {provider_id} 连续两条推文失败，"
+                "本轮剩余推文使用原文，下轮重新尝试"
+            )
 
 
 class TweetMessageService:
@@ -47,11 +73,13 @@ class TweetMessageService:
         twitter_api: Any,
         html_render: HtmlRender,
         settings: TweetMessageSettings,
+        avatar_cache: AvatarCacheService | None = None,
     ) -> None:
         self.context = context
         self.twitter_api = twitter_api
         self.html_render = html_render
         self.settings = settings
+        self.avatar_cache = avatar_cache
 
     @staticmethod
     def build_nickname(username: str, screen_name: str) -> str:
@@ -185,36 +213,73 @@ class TweetMessageService:
         self,
         tweet_info: dict,
         umo: str,
+        cycle: TranslationCycleState | None = None,
     ) -> tuple[str | None, str | None]:
-        """根据配置翻译主推文和引用推文文本。"""
+        """正文、引用和重试共用总时限，保留超时前已完成的译文。"""
+        quote = tweet_info.get("quote") or {}
+        quote.pop("translated_text", None)
         if not self.settings.translate_enabled:
             return None, None
 
         original_text = str(tweet_info.get("text") or "")
-        quote = tweet_info.get("quote") or {}
         quote_text = str(quote.get("text") or "")
+        if not (original_text.strip() or quote_text.strip()):
+            return None, None
 
         translated_text: str | None = None
         translate_model: str | None = None
+        provider_id: str | None = None
+        failed = False
+        skipped = False
+        started = asyncio.get_running_loop().time()
 
-        if original_text.strip():
-            main_translated, main_model = await self.translate_text(
-                original_text,
-                umo,
+        async def translate_parts() -> None:
+            nonlocal provider_id, translated_text, translate_model, failed, skipped
+            provider_id = await self.get_translate_provider_id(umo)
+            if not provider_id:
+                return
+            if cycle is not None and cycle.should_skip(provider_id):
+                skipped = True
+                return
+            if original_text.strip():
+                main_translated, main_model = await self._translate_with_provider(
+                    original_text, provider_id
+                )
+                if main_model:
+                    translated_text, translate_model = main_translated, main_model
+                else:
+                    failed = True
+            if quote_text.strip():
+                quote_translated, quote_model = await self._translate_with_provider(
+                    quote_text, provider_id
+                )
+                if quote_model:
+                    quote["translated_text"] = quote_translated
+                    translate_model = translate_model or quote_model
+                else:
+                    failed = True
+
+        try:
+            await asyncio.wait_for(
+                translate_parts(), timeout=self.settings.translate_timeout_seconds
             )
-            if main_model:
-                translated_text = main_translated
-                translate_model = main_model
-
-        if quote_text.strip():
-            quote_translated, quote_model = await self.translate_text(
-                quote_text,
-                umo,
+        except asyncio.TimeoutError:
+            failed = True
+            logger.warning(
+                f"推文翻译超过总时限 {self.settings.translate_timeout_seconds} 秒，"
+                f"未完成部分使用原文，Provider: {provider_id or '选择中'}"
             )
-            if quote_model:
-                quote["translated_text"] = quote_translated
-                translate_model = translate_model or quote_model
+        except Exception as exc:
+            failed = True
+            logger.warning(f"推文翻译异常，未完成部分使用原文: {type(exc).__name__}")
 
+        if cycle is not None and provider_id and not skipped:
+            cycle.record(provider_id, failed)
+        elapsed = asyncio.get_running_loop().time() - started
+        logger.debug(
+            f"推文翻译处理耗时 {elapsed:.2f} 秒，Provider: {provider_id or '无'}，"
+            f"失败回退: {failed}，本轮跳过: {skipped}"
+        )
         return translated_text, translate_model
 
     async def get_translate_provider_id(self, umo: str) -> str | None:
@@ -254,14 +319,14 @@ class TweetMessageService:
         text: str,
         umo: str,
     ) -> tuple[str, str | None]:
-        """使用 AstrBot LLM Provider 翻译文本，失败时返回原文。"""
-        if not text or not text.strip():
-            return text, None
+        """单段翻译也复用总时限保护，失败时返回原文。"""
+        translated, model = await self.maybe_translate({"text": text}, umo)
+        return translated if translated is not None else text, model
 
-        provider_id = await self.get_translate_provider_id(umo)
-        if not provider_id:
-            return text, None
-
+    async def _translate_with_provider(
+        self, text: str, provider_id: str
+    ) -> tuple[str, str | None]:
+        """在调用方的总时限内翻译一段文本，不拦截任务取消。"""
         if (
             self.settings.translate_custom_prompt_enabled
             and self.settings.translate_custom_prompt
@@ -302,8 +367,9 @@ class TweetMessageService:
                     f"翻译返回为空 (尝试 {attempt + 1}/{max_retries})"
                 )
             except Exception as exc:
-                logger.error(
-                    f"翻译失败 (尝试 {attempt + 1}/{max_retries}): {exc}"
+                logger.warning(
+                    f"翻译失败 (尝试 {attempt + 1}/{max_retries}): "
+                    f"{type(exc).__name__}"
                 )
 
             if attempt < max_retries - 1:
@@ -490,13 +556,9 @@ class TweetMessageService:
         chain: list = []
         has_media = self.tweet_has_media(tweet_info)
         render_text_card = not (self.settings.no_text and has_media)
-        render_tweet_info = tweet_info
 
         if render_text_card:
-            if self.settings.pre_download_media and self.settings.proxy:
-                render_tweet_info = await self.prepare_screenshot_media(
-                    tweet_info
-                )
+            render_tweet_info = await self.prepare_screenshot_media(tweet_info)
 
             context = build_tweet_card_context(
                 username,
@@ -540,14 +602,16 @@ class TweetMessageService:
         return [component for component in chain if component is not None]
 
     async def prepare_screenshot_media(self, tweet_info: dict) -> dict:
-        """把截图所需图片转换为 data URI，并保留失败项的原 URL。"""
+        """头像始终走缓存，其他截图媒体仍按原代理预下载开关处理。"""
         result = copy.deepcopy(tweet_info)
-
-        avatar_url = str(result.get("avatar") or "").strip()
-        if avatar_url:
-            data_uri = await self.download_to_data_uri_safe(avatar_url)
-            if data_uri:
-                result["avatar"] = data_uri
+        for author in (result, result.get("quote") or {}):
+            author["avatar"] = (
+                await self.avatar_cache.get(author.get("avatar"))
+                if self.avatar_cache is not None
+                else None
+            )
+        if not (self.settings.pre_download_media and self.settings.proxy):
+            return result
 
         result["images"] = [
             await self.download_to_data_uri_safe(str(url)) or str(url)
@@ -565,12 +629,6 @@ class TweetMessageService:
 
         quote = result.get("quote") or None
         if quote:
-            quote_avatar = str(quote.get("avatar") or "").strip()
-            if quote_avatar:
-                data_uri = await self.download_to_data_uri_safe(quote_avatar)
-                if data_uri:
-                    quote["avatar"] = data_uri
-
             quote["images"] = [
                 await self.download_to_data_uri_safe(str(url)) or str(url)
                 for url in (quote.get("images") or [])

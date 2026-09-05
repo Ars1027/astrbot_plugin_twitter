@@ -33,7 +33,7 @@
         "description": "通过代理加载图片（需先配置代理地址）",
         "type": "bool",
         "default": false,
-        "hint": "开启后，插件会先通过代理下载图片，再交给 AstrBot 发送或 Chromium 生成截图，避免因直连外部服务器导致图片加载超时。关闭后，图片由 AstrBot 或 Chromium 直接从原链接加载，不使用代理。"
+        "hint": "配置代理并开启后，插件会预下载推文图片和视频封面，失败时回退原链接。关闭后，这些媒体由 AstrBot 或渲染服务从原链接加载。截图头像独立启用小容量本地缓存，始终由插件按代理配置获取，不受此开关影响。"
       },
       "twitter_poll_interval": {
         "description": "推文轮询间隔（分钟）",
@@ -167,6 +167,12 @@
         "default": "",
         "hint": "选择翻译使用的 Provider，留空时按以下顺序自动选择：当前会话 Provider → 第一个可用 Provider",
         "_special": "select_provider"
+      },
+      "twitter_translate_timeout_seconds": {
+        "description": "单条推文翻译总时限（秒）",
+        "type": "int",
+        "default": 60,
+        "hint": "最小为 1 秒。正文、引用正文和重试共用此时限，超时未完成部分使用原文。轮询中同一 Provider 连续两条推文翻译失败后，本轮剩余内容使用原文，下轮重新尝试；手动测试和解析不参与该计数。"
       },
       "twitter_translate_custom_prompt_enabled": {
         "description": "启用自定义翻译提示词",

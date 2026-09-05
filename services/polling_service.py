@@ -18,6 +18,7 @@ from .tweet_delivery_service import (
     DeliveryState,
     TweetDeliveryService,
 )
+from .tweet_message_service import TranslationCycleState
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,10 +142,11 @@ class PollingService:
             return
 
         results: list[bool] = []
+        translation_cycle = TranslationCycleState()
         for username, info in subscribe_list.items():
             check_completed = False
             try:
-                result = await self.check_user(username, info)
+                result = await self.check_user(username, info, cycle=translation_cycle)
                 results.append(result)
                 check_completed = True
             except Exception as exc:
@@ -165,6 +167,11 @@ class PollingService:
         if self.delivery.collective_enabled:
             await self.flush_pending_collective()
 
+        if translation_cycle.skipped:
+            logger.info(
+                f"本轮因翻译服务连续失败，{translation_cycle.skipped} 条推文使用原文"
+            )
+
         if (
             self.settings.data_provider == DATA_PROVIDER_NITTER
             and not self.settings.custom_nitter_url
@@ -183,7 +190,9 @@ class PollingService:
                     logger.info(f"当前镜像站出错过多，切换至: {new_url}")
                     self.twitter_api.nitter_url = new_url
 
-    async def check_user(self, username: str, info: dict) -> bool:
+    async def check_user(
+        self, username: str, info: dict, cycle: TranslationCycleState | None = None
+    ) -> bool:
         """检查一个推主的新推文，并仅推进已成功处理的游标。"""
         try:
             since_id = info.get("since_id", "")
@@ -250,6 +259,7 @@ class PollingService:
                 delivery_result = await self.delivery.push_to_subscribers(
                     username,
                     tweet_info,
+                    cycle=cycle,
                 )
                 if not isinstance(delivery_result, DeliveryResult):
                     logger.error(

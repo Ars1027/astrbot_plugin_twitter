@@ -10,7 +10,7 @@ import astrbot.api.message_components as Comp
 from astrbot.api.message_components import Node, Nodes
 
 from .subscription_service import SubscriptionService
-from .tweet_message_service import TweetMessageService
+from .tweet_message_service import TranslationCycleState, TweetMessageService
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,6 +291,7 @@ class TweetDeliveryService:
         self,
         username: str,
         tweet_info: dict,
+        cycle: TranslationCycleState | None = None,
     ) -> DeliveryResult:
         """将推文推送给订阅者，或加入集体转发缓存。"""
         latest_subs = await self.subscriptions.get_all()
@@ -327,6 +328,7 @@ class TweetDeliveryService:
         translated_text, translate_model = await self.messages.maybe_translate(
             tweet_info,
             first_umo,
+            cycle=cycle,
         )
         if translate_model:
             original_text = str(tweet_info.get("text") or "")

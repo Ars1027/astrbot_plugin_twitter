@@ -100,6 +100,7 @@ def _load_main_module():
 
     star.Context = object
     star.Star = Star
+    star.StarTools = types.SimpleNamespace()
 
     sys.modules.update(
         {
@@ -433,7 +434,7 @@ async def test_partial_subscriber_failure_is_reported(plugin_module):
         def tweet_has_media(_tweet_info):
             return False
 
-        async def maybe_translate(self, _tweet_info, _umo):
+        async def maybe_translate(self, _tweet_info, _umo, cycle=None):
             return None, None
 
         async def build_message_chain(self, *_args, **_kwargs):
@@ -653,7 +654,7 @@ async def test_collective_delivery_flushes_and_clears_cache(plugin_module):
         def tweet_has_media(_tweet_info):
             return False
 
-        async def maybe_translate(self, _tweet_info, _umo):
+        async def maybe_translate(self, _tweet_info, _umo, cycle=None):
             return None, None
 
         async def build_message_chain(self, *_args, **_kwargs):
@@ -747,7 +748,7 @@ async def test_failed_collective_retweet_does_not_persist_dedup(plugin_module):
         def tweet_has_media(_tweet_info):
             return False
 
-        async def maybe_translate(self, _tweet_info, _umo):
+        async def maybe_translate(self, _tweet_info, _umo, cycle=None):
             return None, None
 
         async def build_message_chain(self, *_args, **_kwargs):

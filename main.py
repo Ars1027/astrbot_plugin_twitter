@@ -12,7 +12,7 @@ from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star
+from astrbot.api.star import Context, Star, StarTools
 
 from .services import (
     PollingService,
@@ -23,6 +23,7 @@ from .services import (
     TweetMessageService,
     TweetMessageSettings,
 )
+from .services.avatar_cache_service import AvatarCacheService
 from .twitter_api import (
     DATA_PROVIDER_FXTWITTER,
     DATA_PROVIDER_NITTER,
@@ -282,6 +283,10 @@ class TwitterPlugin(Star):
             )
             or ""
         ).strip()
+        self.translate_timeout_seconds = max(
+            1,
+            int(self._cfg("translation", "twitter_translate_timeout_seconds", 60)),
+        )
         self.translate_custom_prompt_enabled = bool(
             self._cfg(
                 "translation",
@@ -352,12 +357,17 @@ class TwitterPlugin(Star):
                 translate_enabled=self.translate_enabled,
                 translate_target_lang=self.translate_target_lang,
                 translate_provider_id=self.translate_provider_id,
+                translate_timeout_seconds=self.translate_timeout_seconds,
                 translate_custom_prompt_enabled=(
                     self.translate_custom_prompt_enabled
                 ),
                 translate_custom_prompt=self.translate_custom_prompt,
                 pre_download_media=self.pre_download_media,
                 proxy=self.proxy,
+            ),
+            avatar_cache=AvatarCacheService(
+                self.twitter_api,
+                lambda: StarTools.get_data_dir("astrbot_plugin_twitter"),
             ),
         )
         self.delivery_service = TweetDeliveryService(
@@ -478,6 +488,8 @@ class TwitterPlugin(Star):
         ):
             logger.info("正在发送剩余缓存的推文...")
             await self.polling_service.flush_pending_collective()
+        if self.message_service.avatar_cache is not None:
+            await self.message_service.avatar_cache.close()
         await self.twitter_api.close()
         logger.info("Twitter 推文转发插件已停止")
 

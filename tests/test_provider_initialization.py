@@ -136,6 +136,7 @@ def _load_main_module():
 
     star.Context = object
     star.Star = Star
+    star.StarTools = types.SimpleNamespace()
     sys.modules.update(
         {
             "astrbot": astrbot,
@@ -420,6 +421,23 @@ def test_flat_and_grouped_provider_config_are_compatible(plugin_module):
     defaulted = plugin_module.TwitterPlugin(object(), {})
     assert defaulted.poll_max_tweets_per_user == 5
     assert defaulted.link_recognition_mode == "auto"
+
+
+@pytest.mark.parametrize("config,expected", [
+    ({}, 60),
+    ({"twitter_translate_timeout_seconds": 15}, 15),
+    ({"translation": {"twitter_translate_timeout_seconds": 90}}, 90),
+    ({"translation": {"twitter_translate_timeout_seconds": 0}}, 1),
+    ({"twitter_translate_timeout_seconds": -2}, 1),
+])
+def test_translation_timeout_config_compatibility(plugin_module, config, expected):
+    plugin = plugin_module.TwitterPlugin(object(), config)
+    assert plugin.translate_timeout_seconds == expected
+    assert plugin.message_service.settings.translate_timeout_seconds == expected
+    assert plugin.message_service.avatar_cache is not None
+    schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+    item = schema["translation"]["items"]["twitter_translate_timeout_seconds"]
+    assert item["type"] == "int" and item["default"] == 60
 
 
 @pytest.mark.parametrize(
@@ -958,7 +976,7 @@ async def test_test_command_and_link_recognition_share_prepared_delivery(
             }
 
     class Messages:
-        async def maybe_translate(self, _tweet_info, _umo):
+        async def maybe_translate(self, _tweet_info, _umo, cycle=None):
             return None, None
 
         async def build_message_chain(self, *_args, **_kwargs):
@@ -1284,7 +1302,7 @@ async def test_delivery_failure_stops_without_skipping_cursor(plugin_module):
     class Delivery:
         collective_enabled = False
 
-        async def push_to_subscribers(self, _username, tweet_info):
+        async def push_to_subscribers(self, _username, tweet_info, cycle=None):
             attempted.append(tweet_info["tweet_id"])
             state = (
                 delivery_contract.DeliveryState.FAILED
@@ -1468,7 +1486,7 @@ async def test_provider_switch_skips_already_processed_tweet_ids(plugin_module):
     class Delivery:
         collective_enabled = False
 
-        async def push_to_subscribers(self, _username, tweet_info):
+        async def push_to_subscribers(self, _username, tweet_info, cycle=None):
             delivered.append(tweet_info["tweet_id"])
             return delivery_contract.DeliveryResult(
                 delivery_contract.DeliveryState.DELIVERED
