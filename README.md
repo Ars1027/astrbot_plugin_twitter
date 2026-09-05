@@ -73,6 +73,8 @@ _✨ 支持 Nitter 与 FxTwitter API 双数据源的 Twitter 推文转发插件�
 - **自动翻译** — 开启后推文正文自动翻译为目标语言，原文被替换
 - **灵活 Provider** — 支持指定 LLM Provider，留空则自动选择
 - **模型标注** — 翻译后推文末尾标注翻译所用模型名称
+- **翻译时限** — 每条推文的正文、引用内容及重试共用总时限，默认 60 秒；超时未完成的部分使用原文，保留已经完成的译文
+- **轮询降级** — 同一 Provider 连续两条推文翻译失败后，本轮剩余内容直接使用原文，下一轮重新尝试；手动测试和链接解析独立执行，不参与该计数
 
 ### 🛡️ 稳定性保障
 - **实时订阅校验** — 推送时实时读取最新订阅数据，取关即时生效，避免重复推送
@@ -123,7 +125,7 @@ AstrBot `v4.24.2+` 可在 Dashboard 中直接打开插件的“Twitter 订阅管
 | `twitter_fxtwitter_api_base` | string | `https://api.fxtwitter.com` | FxTwitter API 基础地址，末尾斜杠会自动清理 |
 | `twitter_nitter_url` | string | （空） | Nitter 镜像站地址，留空则使用内置列表自动切换（内置列表仅有1个且可能失效，强烈建议自定义） |
 | `twitter_proxy` | string | （空） | 代理地址，如 `http://127.0.0.1:7890` |
-| `twitter_pre_download_media` | bool | `false` | 配置代理后可预下载图片、头像和视频封面，媒体下载失败时保留文字并回退到原 URL |
+| `twitter_pre_download_media` | bool | `false` | 配置代理后可预下载推文图片和视频封面，失败时回退原 URL；截图头像使用独立缓存，不受此开关影响 |
 | `twitter_poll_interval` | int | `5` | 推文轮询间隔（分钟），建议不低于 3 |
 | `twitter_poll_max_tweets_per_user` | int | `5` | 每个推主每轮最多推送的推文数；积压内容按旧到新保留到后续轮询继续推送，最小值为 1 |
 
@@ -141,6 +143,10 @@ twitter_poll_max_tweets_per_user = 5
 FxTwitter 时间线使用有限 cursor 分页并在本地按推文 ID 去重、筛选和排序；首次关注只记录最新 ID，不回放历史。自动轮询获取到超过单轮上限的内容时，会保存本轮最后成功处理的游标并在下一轮继续。API 当前返回的媒体 URL 可能仍属于 `pbs.twimg.com` / `video.twimg.com`，网络受限环境可配置 `twitter_proxy` 并开启 `twitter_pre_download_media`。
 
 ### 消息格式
+
+截图模式始终为主推文和引用帖头像启用本地缓存，按照代理配置下载后内嵌到截图模板，渲染服务无需再次请求头像。缓存位于 AstrBot 插件数据目录的 `avatar_cache` 中，可跨重载复用，最多 200 项、总计 16 MiB，单张下载上限 1 MiB。
+
+头像缓存有效期为 7 天，过期刷新失败时继续使用同 URL 的旧头像；首次获取失败则显示占位，不显示裂图。单次下载最多等待 5 秒，失败后 60 秒内不重复请求。此缓存不包含推文原图或视频，也不改变独立媒体发送开关的行为。
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
@@ -170,6 +176,7 @@ FxTwitter 时间线使用有限 cursor 分页并在本地按推文 ID 去重、�
 | `twitter_translate_enabled` | bool | `false` | 推文内容翻译开关 |
 | `twitter_translate_target_lang` | string | `简体中文` | 翻译目标语言（如：简体中文、日语、英语） |
 | `twitter_translate_provider_id` | string | （空） | 从 AstrBot 已配置的 LLM Provider 中下拉选择，留空自动选择 |
+| `twitter_translate_timeout_seconds` | int | `60` | 单条推文翻译总时限（秒），最小为 1；正文、引用和重试共用预算，超时回退原文 |
 
 > [!TIP]
 > **LLM Provider 自动选择逻辑**：

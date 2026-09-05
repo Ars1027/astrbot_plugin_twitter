@@ -229,7 +229,9 @@ class TwitterAPI:
 
         return None
 
-    async def download_media(self, url: str) -> bytes:
+    async def download_media(
+        self, url: str, *, timeout: float = 30.0, max_bytes: int | None = None
+    ) -> bytes:
         """通过已配置代理的 HTTP 客户端下载媒体文件。
 
         将远程 URL 转换为本地字节数据，避免下游消费者（消息适配器、
@@ -250,7 +252,21 @@ class TwitterAPI:
             raise ValueError("empty URL")
 
         client = await self._get_client()
-        resp = await client.get(url, timeout=30.0)
+        if max_bytes is not None:
+            async with client.stream(
+                "GET", url, timeout=timeout, headers={"Accept-Encoding": "identity"}
+            ) as resp:
+                resp.raise_for_status()
+                declared_size = resp.headers.get("Content-Length", "")
+                if declared_size.isdigit() and int(declared_size) > max_bytes:
+                    raise ValueError("媒体文件超过下载大小限制")
+                data = bytearray()
+                async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
+                    if len(data) + len(chunk) > max_bytes:
+                        raise ValueError("媒体文件超过下载大小限制")
+                    data.extend(chunk)
+                return bytes(data)
+        resp = await client.get(url, timeout=timeout)
         resp.raise_for_status()
         return resp.content
 
