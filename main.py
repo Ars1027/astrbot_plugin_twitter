@@ -29,7 +29,7 @@ from .twitter_api import (
     DATA_PROVIDER_NITTER,
     DATA_PROVIDER_OPTIONS,
     DEFAULT_FXTWITTER_API_BASE,
-    FxTwitterTimelineError,
+    TwitterTimelineError,
     TwitterAPI,
     WEBSITE_LIST,
 )
@@ -670,7 +670,7 @@ class TwitterPlugin(Star):
                 r18=r18,
                 media_only=media_only,
             )
-        except FxTwitterTimelineError as exc:
+        except TwitterTimelineError as exc:
             logger.warning(f"订阅 @{username} 时获取时间线失败: {exc}")
             yield event.plain_result(f"获取 @{username} 时间线失败，请稍后重试")
             return
@@ -756,7 +756,7 @@ class TwitterPlugin(Star):
                     f"✅ @{add_result['username']} "
                     f"({add_result['screen_name']}){r18_str}{media_str}"
                 )
-            except FxTwitterTimelineError as exc:
+            except TwitterTimelineError as exc:
                 logger.warning(
                     f"批量订阅 @{username} 时获取时间线失败: {exc}"
                 )
@@ -915,7 +915,7 @@ class TwitterPlugin(Star):
             timeline_items = await self.twitter_api.get_user_timeline_items(
                 username
             )
-        except FxTwitterTimelineError as exc:
+        except TwitterTimelineError as exc:
             logger.warning(f"测试 @{username} 时获取时间线失败: {exc}")
             yield event.plain_result(
                 f"获取 @{username} 时间线失败，请稍后重试"

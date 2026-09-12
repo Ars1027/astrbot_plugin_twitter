@@ -158,6 +158,7 @@ def _load_main_module():
     twitter_api.DATA_PROVIDER_OPTIONS = ("nitter", "fxtwitter")
     twitter_api.DEFAULT_FXTWITTER_API_BASE = "https://api.fxtwitter.com"
     twitter_api.FxTwitterTimelineError = FakeFxTwitterTimelineError
+    twitter_api.TwitterTimelineError = twitter_api.FxTwitterTimelineError
     twitter_api.TwitterAPI = FakeTwitterAPI
     twitter_api.WEBSITE_LIST = ["https://nitter.test"]
     twitter_api.get_next_website = lambda *_args, **_kwargs: None
@@ -169,6 +170,17 @@ def _load_main_module():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    # 旧用例隔离分页，只验证各自的发送/生命周期逻辑。
+    backlog = sys.modules[f"{package_name}.services.timeline_backlog_service"]
+
+    async def legacy_batch(service, username):
+        subs = await service.subscriptions.get_all()
+        items = await service.api.get_user_timeline_items(
+            username, subs.get(username, {}).get("since_id", "")
+        )
+        return backlog.TimelineBatch(items)
+
+    backlog.TimelineBacklogService.get_batch = legacy_batch
     return module
 
 
@@ -659,7 +671,7 @@ async def test_timeline_failure_does_not_advance_polling_cursor(plugin_module):
 
     class API:
         async def get_user_timeline_items(self, _username, _since_id):
-            raise plugin_module.FxTwitterTimelineError("第二页请求失败")
+            raise plugin_module.TwitterTimelineError("第二页请求失败")
 
     async def get_kv(_key, _default):
         return copy.deepcopy(store)
@@ -708,7 +720,7 @@ async def test_fxtwitter_global_failure_stops_remaining_users(plugin_module):
         async def get_user_timeline_items(self, username, _since_id):
             calls.append(username)
             self.is_ready = False
-            raise plugin_module.FxTwitterTimelineError("代理连接失败")
+            raise plugin_module.TwitterTimelineError("代理连接失败")
 
     class Subscriptions:
         @staticmethod
@@ -787,10 +799,10 @@ async def test_commands_report_timeline_failures_clearly(plugin_module):
             }
 
         async def get_user_newtimeline(self, _username):
-            raise plugin_module.FxTwitterTimelineError("首页请求失败")
+            raise plugin_module.TwitterTimelineError("首页请求失败")
 
         async def get_user_timeline_items(self, _username):
-            raise plugin_module.FxTwitterTimelineError("首页请求失败")
+            raise plugin_module.TwitterTimelineError("首页请求失败")
 
     class Event:
         message_str = "/推特关注 tester"

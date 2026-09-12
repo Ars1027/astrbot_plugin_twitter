@@ -123,6 +123,7 @@ def _load_main_module():
     twitter_api.DATA_PROVIDER_OPTIONS = ("nitter", "fxtwitter")
     twitter_api.DEFAULT_FXTWITTER_API_BASE = "https://api.fxtwitter.com"
     twitter_api.FxTwitterTimelineError = RuntimeError
+    twitter_api.TwitterTimelineError = twitter_api.FxTwitterTimelineError
     twitter_api.TwitterAPI = object
     twitter_api.WEBSITE_LIST = []
     twitter_api.get_next_website = lambda *_args, **_kwargs: None
@@ -134,6 +135,17 @@ def _load_main_module():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    # 旧用例隔离分页，只验证各自的发送/生命周期逻辑。
+    backlog = sys.modules[f"{package_name}.services.timeline_backlog_service"]
+
+    async def legacy_batch(service, username):
+        subs = await service.subscriptions.get_all()
+        items = await service.api.get_user_timeline_items(
+            username, subs.get(username, {}).get("since_id", "")
+        )
+        return backlog.TimelineBatch(items)
+
+    backlog.TimelineBacklogService.get_batch = legacy_batch
     return module
 
 

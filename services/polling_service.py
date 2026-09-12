@@ -9,10 +9,11 @@ from astrbot.api import logger
 from ..twitter_api import (
     DATA_PROVIDER_FXTWITTER,
     DATA_PROVIDER_NITTER,
-    FxTwitterTimelineError,
+    TwitterTimelineError,
     get_next_website,
 )
 from .subscription_service import SubscriptionService
+from .timeline_backlog_service import TimelineBacklogService
 from .tweet_delivery_service import (
     DeliveryResult,
     DeliveryState,
@@ -46,6 +47,7 @@ class PollingService:
         self.subscriptions = subscriptions
         self.delivery = delivery
         self.settings = settings
+        self.timeline_backlog = TimelineBacklogService(twitter_api, subscriptions)
         self._pending_collective_cursors: dict[str, str] = {}
         self._pending_collective_tweet_ids: dict[str, list[str]] = {}
 
@@ -197,10 +199,15 @@ class PollingService:
         try:
             since_id = info.get("since_id", "")
             processed_tweet_ids = self.subscriptions.processed_tweet_ids(info)
-            new_tweet_items = await self.twitter_api.get_user_timeline_items(
-                username,
-                since_id,
-            )
+            if self.settings.data_provider == DATA_PROVIDER_NITTER:
+                batch = await self.timeline_backlog.get_batch(username)
+                if batch.pending:
+                    return True
+                new_tweet_items = batch.items
+            else:
+                new_tweet_items = await self.twitter_api.get_user_timeline_items(
+                    username, since_id,
+                )
 
             if not new_tweet_items:
                 return True
@@ -280,7 +287,7 @@ class PollingService:
                     pushed_count += 1
 
             return not detail_failed
-        except FxTwitterTimelineError as exc:
+        except TwitterTimelineError as exc:
             logger.warning(
                 f"获取 @{username} 时间线失败，保留当前游标: {exc}"
             )

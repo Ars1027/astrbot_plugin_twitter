@@ -7,9 +7,10 @@ import asyncio
 import base64
 import re
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
 from bs4 import BeautifulSoup, Tag
@@ -56,8 +57,19 @@ FXTWITTER_REQUEST_HEADERS = {
 BROADCAST_LINK_PATTERN = re.compile(r'/i/broadcasts/', re.IGNORECASE)
 
 
-class FxTwitterTimelineError(RuntimeError):
+class TwitterTimelineError(RuntimeError):
+    """时间线请求失败或分页结果不完整。"""
+
+
+class FxTwitterTimelineError(TwitterTimelineError):
     """FxTwitter 时间线请求失败或分页结果不完整。"""
+
+
+@dataclass(frozen=True)
+class TimelinePage:
+    items: list[dict]
+    next_cursor: str | None
+    exhausted: bool
 
 
 class TwitterAPI:
@@ -758,26 +770,76 @@ class TwitterAPI:
                 username, since_id=since_id, limit=limit
             )
 
-        if not self.nitter_url:
-            return []
-
-        client = await self._get_client()
-        url = f"{self.nitter_url}/{username}"
-        try:
-            resp = await client.get(url, timeout=15.0)
-            if resp.status_code != 200:
-                return []
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-            return self._parse_timeline_items(
-                soup,
-                username=username,
-                since_id=since_id,
-                limit=limit,
+        # 无状态入口不消费后台积压；增量不完整时不得返回较新的部分结果。
+        items: dict[str, dict] = {}
+        cursor = ""
+        seen_cursors: set[str] = set()
+        since = int(since_id) if since_id else None
+        for _ in range(4):
+            page = await self.get_user_timeline_page(username, cursor=cursor)
+            for item in page.items:
+                if since is None or int(item["tweet_id"]) > since:
+                    items.setdefault(item["tweet_id"], item)
+            boundary = since is not None and any(
+                int(item["tweet_id"]) <= since and not item["is_retweet"]
+                for item in page.items
             )
-        except Exception as e:
-            logger.error(f"获取用户时间线失败 {username}: {e}")
-            return []
+            if since is None or boundary or page.exhausted:
+                return self._finalize_fxtwitter_items(list(items.values()), since, limit)
+            if page.next_cursor in seen_cursors:
+                raise TwitterTimelineError("Nitter 分页游标重复")
+            seen_cursors.add(page.next_cursor)
+            cursor = page.next_cursor
+        raise TwitterTimelineError("Nitter 分页预算耗尽，尚未确认增量完整")
+
+    async def get_user_timeline_page(
+        self, username: str, *, cursor: str = ""
+    ) -> TimelinePage:
+        """读取完整单页；调用方负责分页进度和发送游标。"""
+        if not self.nitter_url:
+            raise TwitterTimelineError("Nitter 镜像未就绪")
+        url = f"{self.nitter_url.rstrip('/')}/{quote(username, safe='')}"
+        try:
+            client = await self._get_client()
+            resp = await client.get(
+                url, params={"cursor": cursor} if cursor else None, timeout=15.0
+            )
+            if resp.status_code != 200:
+                raise TwitterTimelineError(f"Nitter 时间线 HTTP {resp.status_code}")
+            soup = BeautifulSoup(resp.text, "html.parser")
+            timeline = soup.select_one(".timeline")
+            if timeline is None or soup.select_one(".error-panel"):
+                raise TwitterTimelineError("Nitter 时间线结构异常")
+            items = self._parse_timeline_items(timeline, username)
+            for entry in timeline.select(".timeline-item"):
+                if entry.select_one(".pinned, .icon-pin") or "show-more" in entry.get("class", []):
+                    continue
+                link = entry.select_one("a.tweet-link")
+                if link is None or not re.search(r"/[^/]+/status/\d+", str(link.get("href", ""))):
+                    raise TwitterTimelineError("Nitter 时间线条目结构异常")
+            # 带 Load newest 的 timeline-item 不是下一页。
+            more = timeline.select_one(".show-more:not(.timeline-item) a")
+            next_cursor = None
+            if more is not None:
+                target = urlsplit(urljoin(url, str(more.get("href") or "")))
+                base = urlsplit(url)
+                cursors = [v for k, v in parse_qsl(target.query) if k == "cursor"]
+                if (
+                    (target.scheme, target.netloc, target.path.rstrip('/'))
+                    != (base.scheme, base.netloc, base.path.rstrip('/'))
+                    or len(cursors) != 1 or not cursors[0]
+                ):
+                    raise TwitterTimelineError("Nitter 下一页链接异常")
+                next_cursor = cursors[0]
+            if not items and more is None and not timeline.select_one(
+                ".pinned, .icon-pin, .timeline-none, .timeline-end"
+            ):
+                raise TwitterTimelineError("Nitter 时间线缺少条目或结束标记")
+            return TimelinePage(items, next_cursor, next_cursor is None)
+        except TwitterTimelineError:
+            raise
+        except Exception as exc:
+            raise TwitterTimelineError(f"获取 @{username} Nitter 时间线失败") from exc
 
     def _build_image_url(self, a_href: str, img_src: str) -> str:
         """根据图片质量配置构建图片 URL

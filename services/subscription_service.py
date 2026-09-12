@@ -46,6 +46,25 @@ class SubscriptionService:
         async with self._lock:
             return copy.deepcopy(await self.get_all())
 
+    async def save_timeline_backlog(
+        self, username: str, expected: dict | None, state: dict | None,
+        *, expected_since_id: str | None = None,
+    ) -> bool:
+        """比较快照后写回；拒绝旧扫描、取关重订及并发提交的过期结果。"""
+        async with self._lock:
+            subs = copy.deepcopy(await self.get_all())
+            key = self.find_key(subs, username)
+            if key is None or subs[key].get("timeline_backlog") != expected:
+                return False
+            if expected_since_id is not None and str(subs[key].get("since_id") or "0") != expected_since_id:
+                return False
+            if state is None:
+                subs[key].pop("timeline_backlog", None)
+            else:
+                subs[key]["timeline_backlog"] = copy.deepcopy(state)
+            await self.save_all(subs)
+            return True
+
     @staticmethod
     def find_key(subs: dict, username: str) -> str | None:
         """按不区分大小写的用户名查找现有推主键。"""
@@ -304,7 +323,7 @@ class SubscriptionService:
             return False
 
         async with self._lock:
-            subs = await self.get_all()
+            subs = copy.deepcopy(await self.get_all())
             key = self.find_key(subs, username)
             if key is None:
                 return False
@@ -320,6 +339,20 @@ class SubscriptionService:
             ):
                 author_info["since_id"] = next_id
                 changed = True
+
+            backlog = author_info.get("timeline_backlog")
+            if isinstance(backlog, dict) and backlog.get("phase") == "ready":
+                committed = int(author_info.get("since_id") or "0")
+                remaining = [
+                    item for item in backlog["items"]
+                    if int(item["tweet_id"]) > committed
+                ]
+                if remaining != backlog["items"]:
+                    backlog["items"] = remaining
+                    changed = True
+                if not remaining:
+                    author_info.pop("timeline_backlog")
+                    changed = True
 
             if changed:
                 await self.save_all(subs)
