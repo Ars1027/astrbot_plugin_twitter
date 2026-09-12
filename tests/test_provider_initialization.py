@@ -52,7 +52,8 @@ class Node(_Component):
 
 
 class Nodes(_Component):
-    pass
+    def __init__(self, nodes):
+        super().__init__(nodes=nodes)
 
 
 class MessageChain(_Component):
@@ -185,6 +186,105 @@ def _delivery_contract(plugin_module):
     return sys.modules[
         f"{plugin_module.__package__}.services.tweet_delivery_service"
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "use_node,collective", [(False, False), (True, False), (True, True)]
+)
+async def test_false_send_retains_cursor_and_recovers(
+    plugin_module, use_node, collective
+):
+    store = {
+        "twitter_subs": {
+            "tester": {
+                "since_id": "100",
+                "subscribers": {umo: {"status": True} for umo in ("good", "bad")},
+            }
+        },
+        "twitter_retweet_dedup_seen": {},
+    }
+    recovered = False
+    calls = []
+
+    def texts(chain):
+        for part in chain:
+            if isinstance(part, Nodes):
+                for node in part.nodes:
+                    yield from texts(node.content)
+            elif isinstance(part, Plain):
+                yield part.text
+
+    async def send_message(umo, message):
+        ids = [
+            tweet_id for tweet_id in ("101", "102", "103")
+            if any(f"status/{tweet_id}" in text for text in texts(message.chain))
+        ]
+        calls.append((umo, ids))
+        return recovered or umo == "good" or ids == ["101"]
+
+    async def get_kv(key, default):
+        return copy.deepcopy(store.get(key, default))
+
+    async def put_kv(key, value):
+        store[key] = copy.deepcopy(value)
+
+    async def timeline(_username, since_id):
+        return [
+            {
+                "tweet_id": str(i), "username": "original", "is_retweet": True,
+                "retweeter_username": "tester",
+            }
+            for i in range(101, 104) if i > int(since_id)
+        ]
+
+    async def get_tweet(username, tweet_id):
+        return {
+            "status": True, "tweet_id": tweet_id, "username": username, "text": "body"
+        }
+
+    plugin = plugin_module.TwitterPlugin(
+        types.SimpleNamespace(send_message=send_message),
+        {
+            "twitter_use_node": use_node,
+            "twitter_collective_forward": collective,
+            "twitter_deduplicate_retweets": True,
+        },
+    )
+    plugin.get_kv_data = get_kv
+    plugin.put_kv_data = put_kv
+    plugin.twitter_api.get_user_timeline_items = timeline
+    plugin.twitter_api.get_tweet = get_tweet
+    polling = plugin.polling_service
+    await polling.check_user("tester", copy.deepcopy(store["twitter_subs"]["tester"]))
+    if collective:
+        assert store["twitter_subs"]["tester"]["since_id"] == "100"
+        assert store["twitter_retweet_dedup_seen"] == {}
+        await polling.flush_pending_collective()
+        assert not plugin.delivery_service.has_collected
+        assert not polling.has_pending_collective
+
+    author = store["twitter_subs"]["tester"]
+    assert author["since_id"] == ("100" if collective else "101")
+    assert author.get("processed_tweet_ids", []) == ([] if collective else ["101"])
+    assert store["twitter_retweet_dedup_seen"]["bad"] == ["101"]
+    assert store["twitter_retweet_dedup_seen"]["good"] == (
+        ["101", "102", "103"] if collective else ["101", "102"]
+    )
+    assert all(ids for _, ids in calls)
+    if not collective:
+        assert all("103" not in ids for _, ids in calls)
+
+    recovered = True
+    calls.clear()
+    await polling.check_user("tester", copy.deepcopy(author))
+    await polling.flush_pending_collective()
+    author = store["twitter_subs"]["tester"]
+    assert author["since_id"] == "103"
+    assert author["processed_tweet_ids"] == ["101", "102", "103"]
+    assert store["twitter_retweet_dedup_seen"]["bad"] == ["101", "102", "103"]
+    assert not any(umo == "good" and "102" in ids for umo, ids in calls)
+    assert any(umo == "bad" and "102" in ids for umo, ids in calls)
 
 
 @pytest.mark.asyncio

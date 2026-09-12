@@ -186,12 +186,22 @@ class TweetDeliveryService:
         plain_chain, videos = self.split_plain_chain_and_videos(chain)
         return PreparedDelivery(plain_chain, videos)
 
+    async def _send_message_checked(
+        self,
+        umo: str,
+        message_chain: MessageChain,
+    ) -> None:
+        """将明确的 False 转为发送异常，保留其他无异常返回的既有行为。"""
+        result = await self.context.send_message(umo, message_chain)
+        if result is False:
+            raise RuntimeError("Context.send_message returned False")
+
     async def send_plain_chain_resilient(self, umo: str, chain: list) -> bool:
         """发送普通消息；媒体失败时优先补发文字，再逐图尝试。"""
         if not chain:
             return True
         try:
-            await self.context.send_message(umo, MessageChain(chain=chain))
+            await self._send_message_checked(umo, MessageChain(chain=chain))
             return True
         except Exception as exc:
             logger.warning(f"包含媒体的消息发送失败，尝试保留文字内容: {exc}")
@@ -210,7 +220,7 @@ class TweetDeliveryService:
         text_sent = False
         if text_parts:
             try:
-                await self.context.send_message(
+                await self._send_message_checked(
                     umo,
                     MessageChain(chain=text_parts),
                 )
@@ -221,7 +231,7 @@ class TweetDeliveryService:
         image_sent = False
         for image_part in image_parts:
             try:
-                await self.context.send_message(
+                await self._send_message_checked(
                     umo,
                     MessageChain(chain=[image_part]),
                 )
@@ -247,7 +257,7 @@ class TweetDeliveryService:
     ) -> bool:
         """发送视频组件，失败时回退为链接。"""
         try:
-            await self.context.send_message(
+            await self._send_message_checked(
                 umo,
                 MessageChain(chain=[video_component]),
             )
@@ -261,7 +271,7 @@ class TweetDeliveryService:
             )
             if video_url:
                 try:
-                    await self.context.send_message(
+                    await self._send_message_checked(
                         umo,
                         MessageChain(
                             chain=[Comp.Plain(str(f"视频: {video_url}"))]
@@ -453,7 +463,7 @@ class TweetDeliveryService:
                         nickname,
                     )
                     if nodes:
-                        await self.context.send_message(
+                        await self._send_message_checked(
                             umo,
                             MessageChain(chain=[Nodes(nodes)]),
                         )
@@ -625,7 +635,7 @@ class TweetDeliveryService:
                                 f"（第{batch_index + 1}/{len(author_batches)}批）"
                             )
                         try:
-                            await self.context.send_message(
+                            await self._send_message_checked(
                                 umo,
                                 MessageChain(chain=[Nodes(nodes)]),
                             )
