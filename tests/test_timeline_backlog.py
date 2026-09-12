@@ -440,3 +440,116 @@ async def test_old_retweet_only_page_does_not_freeze_upper_below_anchor(harness)
     batch = await plugin.polling_service.timeline_backlog.get_batch("tester")
     assert [i["tweet_id"] for i in batch.items] == ["103", "104"]
     await plugin.twitter_api.close()
+
+
+def fx_pages(env):
+    def respond(request):
+        assert request.url.params['count'] == '20'
+        page = int(request.url.params.get('cursor', '1'))
+        env.calls.append(page)
+        if page == 5 and env.failure:
+            if env.failure == 'json':
+                return httpx.Response(200, text='invalid-json')
+            return httpx.Response(int(env.failure))
+        ids = [107 - page] if page < 6 else [101, 100]
+        return httpx.Response(200, json={
+            'code': 200, 'results': [dict(type='status', id=str(i), author={'screen_name': 'tester'}) for i in ids],
+            'cursor': {'bottom': str(page + 1) if page < 6 else None},
+        })
+    return respond
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('collective', [False, True])
+async def test_fx_six_pages_persist_across_reload_and_send_failure(harness, collective):
+    env = harness
+    plugin = env.create(fx_pages(env), collective, 'fxtwitter')
+    assert await check(plugin, env)
+    assert env.calls == [1, 2, 3, 4] and not env.sent
+    assert author(env)['timeline_backlog']['next_cursor'] == '5'
+    await plugin.twitter_api.close()
+    plugin = env.create(fx_pages(env), collective, 'fxtwitter')
+    batch = await plugin.polling_service.timeline_backlog.get_batch('tester')
+    assert [i['tweet_id'] for i in batch.items] == ['101', '102', '103', '104', '105', '106']
+    assert env.calls == [1, 2, 3, 4, 5, 6] and not env.sent
+    env.failure = 'send'
+    await check(plugin, env)
+    await plugin.polling_service.flush_pending_collective()
+    assert author(env)['since_id'] == '100'
+    env.failure = ''
+    await check(plugin, env)
+    await plugin.polling_service.flush_pending_collective()
+    assert author(env)['since_id'] == '105'
+    await check(plugin, env)
+    await plugin.polling_service.flush_pending_collective()
+    assert 'timeline_backlog' not in author(env)
+    assert author(env)['processed_tweet_ids'] == ['101', '102', '103', '104', '105', '106']
+    assert env.calls == [1, 2, 3, 4, 5, 6]
+    await plugin.twitter_api.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['429', '503', 'json'])
+async def test_fx_fifth_page_failure_preserves_progress(harness, monkeypatch, failure):
+    env = harness
+
+    async def no_sleep(_seconds):
+        pass
+
+    monkeypatch.setattr(asyncio, 'sleep', no_sleep)
+    plugin = env.create(fx_pages(env), provider='fxtwitter')
+    assert await check(plugin, env)
+    env.failure = failure
+    assert not await check(plugin, env)
+    assert author(env)['timeline_backlog']['next_cursor'] == '5'
+    assert author(env)['timeline_backlog']['cursor_failures'] == 1
+    assert author(env)['since_id'] == '100' and not env.sent
+    env.failure = ''
+    assert await check(plugin, env)
+    assert env.calls[-2:] == [5, 6]
+    assert author(env)['since_id'] == '105'
+    await plugin.twitter_api.close()
+
+
+@pytest.mark.asyncio
+async def test_fx_reload_can_fetch_details_evicted_from_memory_cache(harness, runtime):
+    env = harness
+    pages = fx_pages(env)
+    detail_calls = []
+
+    def respond(request):
+        if '/2/status/' in request.url.path:
+            tweet_id = request.url.path.rsplit('/', 1)[1]
+            detail_calls.append(tweet_id)
+            return httpx.Response(200, json={'code': 200, 'status': {
+                'type': 'status', 'id': tweet_id, 'author': {'screen_name': 'tester'}, 'text': 'body',
+            }})
+        return pages(request)
+
+    plugin = env.create(respond, provider='fxtwitter')
+    await check(plugin, env)
+    await plugin.twitter_api.close()
+    plugin = env.create(respond, provider='fxtwitter')
+    plugin.twitter_api.get_tweet = types.MethodType(runtime.api.TwitterAPI.get_tweet, plugin.twitter_api)
+    assert await check(plugin, env)
+    assert detail_calls == ['103', '104', '105']
+    assert author(env)['since_id'] == '105'
+    await plugin.twitter_api.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('providers', [('nitter', 'fxtwitter'), ('fxtwitter', 'nitter')])
+async def test_provider_switch_preserves_items_but_restarts_cursor(harness, providers):
+    env = harness
+    readers = {'nitter': six_pages(env), 'fxtwitter': fx_pages(env)}
+    plugin = env.create(readers[providers[0]], provider=providers[0])
+    await check(plugin, env)
+    before = author(env)['timeline_backlog']['items']
+    await plugin.twitter_api.close()
+    plugin = env.create(readers[providers[1]], provider=providers[1])
+    await check(plugin, env)
+    assert env.calls == [1, 2, 3, 4, 1, 2, 3, 4]
+    assert author(env)['timeline_backlog']['items'] == before and not env.sent
+    await check(plugin, env)
+    assert author(env)['processed_tweet_ids'] == ['101', '102', '103', '104', '105']
+    await plugin.twitter_api.close()

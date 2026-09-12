@@ -204,7 +204,7 @@ async def test_timeline_discards_partial_results_when_later_page_fails(api_modul
 
     with pytest.raises(api_module.FxTwitterTimelineError, match="第 2 页请求失败"):
         await api.get_user_timeline_items("tester", since_id="101")
-    assert api._status_cache == {}
+    assert "105" in api._status_cache  # 已校验页面的缓存不等于已提交增量。
 
 
 @pytest.mark.asyncio
@@ -219,7 +219,42 @@ async def test_timeline_page_limit_before_since_id_is_incomplete(api_module):
 
     with pytest.raises(api_module.FxTwitterTimelineError, match="尚未找到上次游标"):
         await api.get_user_timeline_items("tester", since_id="101")
-    assert api._status_cache == {}
+    assert "105" in api._status_cache  # 已校验页面的缓存不等于已提交增量。
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('payload', [
+    {'results': {}}, {'results': [], 'cursor': []},
+    {'results': [], 'cursor': {'bottom': 123}},
+    {'results': [{'type': 'thread', 'statuses': {}}]},
+    {'results': [{'type': 'status', 'id': 'invalid'}]},
+    {'results': [None]}, {'results': [{'type': 'unknown'}]},
+])
+async def test_single_page_rejects_malformed_structure_before_caching(api_module, payload):
+    api = api_module.TwitterAPI(provider='fxtwitter')
+
+    async def request(_path, params=None):
+        return payload
+
+    api._request_fxtwitter_json = request
+    with pytest.raises(api_module.FxTwitterTimelineError):
+        await api.get_user_timeline_page('tester')
+    assert not api._status_cache
+
+
+@pytest.mark.asyncio
+async def test_single_page_preserves_full_thread_and_opaque_cursor(api_module):
+    api = api_module.TwitterAPI(provider='fxtwitter', fxtwitter_max_items=5)
+    statuses = [dict(type='status', id=str(i), author={'screen_name': 'tester'}) for i in range(120, 0, -1)]
+
+    async def request(_path, params=None):
+        assert params == {'count': 20, 'cursor': 'opaque+/='}
+        return {'results': [{'type': 'thread', 'statuses': statuses}], 'cursor': {'bottom': 'next+/='}}
+
+    api._request_fxtwitter_json = request
+    page = await api.get_user_timeline_page('tester', cursor='opaque+/=')
+    assert len(page.items) == 120 and page.items[-1]['tweet_id'] == '1'
+    assert page.next_cursor == 'next+/=' and not page.exhausted
 
 
 @pytest.mark.asyncio

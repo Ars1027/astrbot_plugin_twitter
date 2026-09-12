@@ -633,6 +633,48 @@ class TwitterAPI:
             ).strip(),
         }
 
+    async def _get_fxtwitter_timeline_page(
+        self, username: str, *, cursor: str = ""
+    ) -> TimelinePage:
+        params = {"count": 20, **({"cursor": cursor} if cursor else {})}
+        payload = await self._request_fxtwitter_json(
+            f"2/profile/{quote(username, safe='')}/statuses", params=params,
+        )
+        if payload is None:
+            raise FxTwitterTimelineError("请求失败")
+        results, cursor_info = payload.get("results"), payload.get("cursor")
+        if not isinstance(results, list):
+            raise FxTwitterTimelineError("响应结构异常")
+        if cursor_info is not None and not isinstance(cursor_info, dict):
+            raise FxTwitterTimelineError("分页游标结构异常")
+        bottom = cursor_info.get("bottom") if cursor_info else None
+        if bottom is not None and not isinstance(bottom, str):
+            raise FxTwitterTimelineError("分页游标结构异常")
+        for result in results:
+            if not isinstance(result, dict) or result.get("type") not in {"thread", "status"}:
+                raise FxTwitterTimelineError("时间线条目结构异常")
+            if result["type"] == "thread" and (
+                not isinstance(result.get("statuses"), list)
+                or any(not isinstance(s, dict) or s.get("type") != "status" for s in result["statuses"])
+            ):
+                raise FxTwitterTimelineError("thread 条目结构异常")
+        statuses = self._flatten_fxtwitter_results(results)
+        items, cacheable = [], []
+        for status in statuses:
+            if status.get("is_pinned") is True:
+                continue
+            if not str(status.get("id") or "").isdigit() or any(
+                status.get(k) is not None and not isinstance(status[k], dict)
+                for k in ("author", "reposted_by")
+            ):
+                raise FxTwitterTimelineError("状态条目结构异常")
+            items.append(self._fxtwitter_timeline_item(status, username))
+            cacheable.append(status)
+        # 整页校验成功后可填充有界详情缓存；缓存不代表已发送或提交。
+        for status in cacheable:
+            self._cache_fxtwitter_status(status)
+        return TimelinePage(items, bottom or None, not bottom)
+
     async def _get_fxtwitter_timeline_items(
         self, username: str, since_id: str = "", limit: int = 0
     ) -> list[dict]:
@@ -652,7 +694,6 @@ class TwitterAPI:
             return []
 
         items: list[dict] = []
-        statuses_to_cache: list[dict] = []
         seen_ids: set[str] = set()
         cursor = ""
         previous_cursor = ""
@@ -662,46 +703,23 @@ class TwitterAPI:
         local_item_limit_reached = False
 
         for page_index in range(self.fxtwitter_max_pages):
-            params: dict[str, Any] = {"count": 20}
-            if cursor:
-                params["cursor"] = cursor
-
-            payload = await self._request_fxtwitter_json(
-                f"2/profile/{quote(username, safe='')}/statuses",
-                params=params,
-            )
-            if payload is None:
-                page_label = "首页" if page_index == 0 else f"第 {page_index + 1} 页"
-                raise FxTwitterTimelineError(
-                    f"获取 @{username} 的 FxTwitter 时间线失败：{page_label}请求失败"
-                )
-
-            raw_results = payload.get("results")
-            if not isinstance(raw_results, list):
-                raise FxTwitterTimelineError(
-                    f"获取 @{username} 的 FxTwitter 时间线失败："
-                    f"第 {page_index + 1} 页响应结构异常"
-                )
-
-            statuses = self._flatten_fxtwitter_results(raw_results)
-            for status in statuses:
-                tweet_id = str(status.get("id") or "")
-                if not tweet_id or tweet_id in seen_ids or status.get("is_pinned") is True:
+            try:
+                page = await self._get_fxtwitter_timeline_page(username, cursor=cursor)
+            except FxTwitterTimelineError as exc:
+                label = "首页" if page_index == 0 else f"第 {page_index + 1} 页"
+                raise FxTwitterTimelineError(f"获取 @{username} 时间线失败：{label}{exc}") from exc
+            for item in page.items:
+                tweet_id = item["tweet_id"]
+                if tweet_id in seen_ids:
                     continue
                 seen_ids.add(tweet_id)
-
-                item = self._fxtwitter_timeline_item(status, username)
-                try:
-                    tweet_int = int(tweet_id)
-                except ValueError:
-                    continue
+                tweet_int = int(tweet_id)
 
                 if since_int is not None and tweet_int <= since_int:
                     if tweet_int == since_int or not item.get("is_retweet"):
                         boundary_found = True
                     continue
 
-                statuses_to_cache.append(status)
                 items.append(item)
 
                 if since_int is None and limit > 0 and len(items) >= limit:
@@ -721,17 +739,7 @@ class TwitterAPI:
                     )
                 break
 
-            cursor_info = payload.get("cursor")
-            if cursor_info is not None and not isinstance(cursor_info, dict):
-                raise FxTwitterTimelineError(
-                    f"获取 @{username} 的 FxTwitter 时间线失败："
-                    f"第 {page_index + 1} 页分页游标结构异常"
-                )
-            next_cursor = (
-                str(cursor_info.get("bottom") or "")
-                if isinstance(cursor_info, dict)
-                else ""
-            )
+            next_cursor = page.next_cursor
             if not next_cursor:
                 timeline_exhausted = True
                 break
@@ -747,8 +755,6 @@ class TwitterAPI:
                 f"在 {self.fxtwitter_max_pages} 页内尚未找到上次游标"
             )
 
-        for status in statuses_to_cache:
-            self._cache_fxtwitter_status(status)
         return self._finalize_fxtwitter_items(items, since_int, limit)
 
     @staticmethod
@@ -796,6 +802,8 @@ class TwitterAPI:
         self, username: str, *, cursor: str = ""
     ) -> TimelinePage:
         """读取完整单页；调用方负责分页进度和发送游标。"""
+        if self.provider == DATA_PROVIDER_FXTWITTER:
+            return await self._get_fxtwitter_timeline_page(username, cursor=cursor)
         if not self.nitter_url:
             raise TwitterTimelineError("Nitter 镜像未就绪")
         url = f"{self.nitter_url.rstrip('/')}/{quote(username, safe='')}"

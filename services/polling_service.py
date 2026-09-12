@@ -197,17 +197,11 @@ class PollingService:
     ) -> bool:
         """检查一个推主的新推文，并仅推进已成功处理的游标。"""
         try:
-            since_id = info.get("since_id", "")
             processed_tweet_ids = self.subscriptions.processed_tweet_ids(info)
-            if self.settings.data_provider == DATA_PROVIDER_NITTER:
-                batch = await self.timeline_backlog.get_batch(username)
-                if batch.pending:
-                    return True
-                new_tweet_items = batch.items
-            else:
-                new_tweet_items = await self.twitter_api.get_user_timeline_items(
-                    username, since_id,
-                )
+            batch = await self.timeline_backlog.get_batch(username)
+            if batch.pending:
+                return True
+            new_tweet_items = batch.items
 
             if not new_tweet_items:
                 return True

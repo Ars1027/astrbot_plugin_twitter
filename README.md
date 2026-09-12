@@ -141,9 +141,9 @@ twitter_poll_interval = 5
 twitter_poll_max_tweets_per_user = 5
 ```
 
-FxTwitter 时间线使用有限 cursor 分页并在本地按推文 ID 去重、筛选和排序；首次关注只记录最新 ID，不回放历史。自动轮询获取到超过单轮上限的内容时，会保存本轮最后成功处理的游标并在下一轮继续。API 当前返回的媒体 URL 可能仍属于 `pbs.twimg.com` / `video.twimg.com`，网络受限环境可配置 `twitter_proxy` 并开启 `twitter_pre_download_media`。
+FxTwitter 无状态时间线接口使用有限 cursor 分页并在本地按推文 ID 去重、筛选和排序；首次关注只记录最新 ID，不回放历史。自动轮询获取到超过单轮上限的内容时，会保存本轮最后成功处理的游标并在下一轮继续。API 当前返回的媒体 URL 可能仍属于 `pbs.twimg.com` / `video.twimg.com`，网络受限环境可配置 `twitter_proxy` 并开启 `twitter_pre_download_media`。
 
-Nitter 后台轮询每个推主每轮最多抓取 4 个完整页面。尚未找到旧游标边界时，仅保存分页进度；确认增量完整后才按旧到新发送，并沿用每轮发送上限。分页 cursor 和条目元数据保存在现有 `twitter_subs` 的可选 `timeline_backlog` 字段中，插件重载或 AstrBot 重启后可以继续抓取；不会持久化 HTML、图片、视频或推文详情。发送或详情获取失败不会清除未提交的积压，集体转发在刷新成功后才提交。
+Nitter 和 FxTwitter 后台轮询共用持久化分页机制，每个推主每轮最多抓取 4 个完整页面（四页是单轮工作预算，不是整个积压的页数上限）。尚未找到旧游标边界时，仅保存分页进度；确认增量完整后才按旧到新发送，并沿用每轮发送上限。分页 cursor 和条目元数据保存在现有 `twitter_subs` 的可选 `timeline_backlog` 字段中，插件重载或 AstrBot 重启后可以继续抓取；不会持久化 HTML、图片、视频或推文详情。发送或详情获取失败不会清除未提交的积压，集体转发在刷新成功后才提交。
 
 分页失败保留已保存页面；同一非空 cursor 连续 3 轮失败或出现循环时，下一轮从首页重新确认完整性，保留已抓条目并去重。更换数据源地址也会重新扫描，不复用其他地址的 cursor。本批次扫描期间出现的更高 ID 留到下一批次。
 
