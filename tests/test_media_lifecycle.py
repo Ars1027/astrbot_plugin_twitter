@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import sys
 import types
@@ -176,6 +177,96 @@ def _delivery_settings(plugin_module, **overrides):
     }
     values.update(overrides)
     return plugin_module.TweetDeliverySettings(**values)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["plain", "image", "node", "video"])
+@pytest.mark.parametrize("outcome", [False, True, None, "fallback"])
+async def test_send_return_values_and_fallback(plugin_module, mode, outcome):
+    calls = []
+
+    async def send_message(_umo, message):
+        calls.append(message.chain)
+        if outcome == "fallback":
+            return len(calls) > 1
+        return outcome
+
+    chain = (
+        [Image.fromURL("https://example.com/image.jpg")]
+        if mode == "image"
+        else [Plain("body")]
+    )
+
+    async def build_message_chain(*_args, **_kwargs):
+        return chain
+
+    delivery = plugin_module.TweetDeliveryService(
+        types.SimpleNamespace(send_message=send_message),
+        object(),
+        types.SimpleNamespace(build_message_chain=build_message_chain),
+        _delivery_settings(plugin_module, use_node=mode == "node"),
+    )
+    if mode == "video":
+        sent = await delivery.send_video_or_fallback(
+            "session", Video.fromURL("https://example.com/video.mp4")
+        )
+    else:
+        sent = await delivery.send_to_subscriber("session", "u", {}, {}, "u")
+
+    assert sent is (outcome is not False)
+    if outcome is False or outcome == "fallback":
+        assert len(calls) >= 2
+        expected_type = Image if mode == "image" else Plain
+        assert isinstance(calls[-1][0], expected_type)
+    else:
+        assert len(calls) == 1
+    if mode == "node":
+        assert isinstance(calls[0][0], Nodes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body_succeeds", [False, True])
+async def test_false_media_result_preserves_primary_semantics(
+    plugin_module, body_succeeds
+):
+    async def send_message(_umo, message):
+        is_body = any(
+            isinstance(part, Plain) and part.text == "body"
+            for part in message.chain
+        )
+        return body_succeeds if is_body else not body_succeeds
+
+    async def build_message_chain(*_args, **_kwargs):
+        return [Plain("body"), Video.fromURL("https://example.com/video.mp4")]
+
+    delivery = plugin_module.TweetDeliveryService(
+        types.SimpleNamespace(send_message=send_message),
+        object(),
+        types.SimpleNamespace(build_message_chain=build_message_chain),
+        _delivery_settings(plugin_module),
+    )
+    assert await delivery.send_to_subscriber(
+        "session", "u", {}, {}, "u"
+    ) is body_succeeds
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_node", [False, True])
+async def test_send_cancellation_propagates(plugin_module, use_node):
+    async def send_message(*_args):
+        raise asyncio.CancelledError
+
+    async def build_message_chain(*_args, **_kwargs):
+        return [Plain("body")]
+
+    delivery = plugin_module.TweetDeliveryService(
+        types.SimpleNamespace(send_message=send_message),
+        object(),
+        types.SimpleNamespace(build_message_chain=build_message_chain),
+        _delivery_settings(plugin_module, use_node=use_node),
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await delivery.send_to_subscriber("session", "u", {}, {}, "u")
 
 
 @pytest.mark.asyncio
