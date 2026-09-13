@@ -833,9 +833,46 @@ class TwitterPlugin(Star):
             f"{cleared['relations']} 个订阅关系"
         )
 
+    @staticmethod
+    def _subscription_list_pages(lines: list[str]) -> list[str]:
+        """按完整条目分页，为标题和翻页提示预留字符预算。"""
+        total = len(lines)
+        header = "当前订阅列表（共 {total} 个，第 {page}/{pages} 页）:\n"
+        footer = "\n下一页：/推特列表 {page}"
+        # 页数不会超过条目数；按最大可能页码预留，避免页数位数变化后超长。
+        budget = (
+            1000 - len(header.format(total=total, page=total, pages=total))
+            - len(footer.format(page=total + 1))
+        )
+        pages = []
+        current = []
+        size = 0
+        for index, line in enumerate(lines, 1):
+            row = f"{index}. {line}"
+            if current and (len(current) >= 50 or size + 1 + len(row) > budget):
+                pages.append("\n".join(current))
+                current = []
+                size = 0
+            size += len(row) + bool(current)
+            current.append(row)
+        if current:
+            pages.append("\n".join(current))
+        return [
+            header.format(total=total, page=index, pages=len(pages)) + body
+            + (footer.format(page=index + 1) if index < len(pages) else "")
+            for index, body in enumerate(pages, 1)
+        ]
+
     @filter.command("推特列表", alias={"twitter_list"})
-    async def list_follows(self, event: AstrMessageEvent):
-        """查看当前会话订阅的推主列表。"""
+    async def list_follows(self, event: AstrMessageEvent, page: str = "1"):
+        """分页查看当前会话订阅的推主列表。"""
+        try:
+            page_number = int(page)
+        except ValueError:
+            page_number = 0
+        if page_number < 1:
+            yield event.plain_result("页码必须为正整数，用法：/推特列表 [页码]")
+            return
         umo = event.unified_msg_origin
         subs = await self._get_subs()
         lines = []
@@ -847,7 +884,9 @@ class TwitterPlugin(Star):
             status_icon = "🟢" if sub_config.get("status", True) else "🔴"
             r18_str = " | R18" if sub_config.get("r18") else ""
             media_str = " | 仅媒体" if sub_config.get("media") else ""
-            screen_name = info.get("screen_name", username)
+            screen_name = " ".join(str(info.get("screen_name") or username).split())
+            if len(screen_name) > 50:
+                screen_name = screen_name[:49] + "…"
             lines.append(
                 f"{status_icon} @{username} ({screen_name})"
                 f"{r18_str}{media_str}"
@@ -857,13 +896,11 @@ class TwitterPlugin(Star):
             yield event.plain_result("当前没有订阅任何推主")
             return
 
-        yield event.plain_result(
-            "当前订阅列表:\n"
-            + "\n".join(
-                f"{index}. {line}"
-                for index, line in enumerate(lines, 1)
-            )
-        )
+        pages = self._subscription_list_pages(lines)
+        if page_number > len(pages):
+            yield event.plain_result(f"页码超出范围，请输入 1～{len(pages)} 页")
+            return
+        yield event.plain_result(pages[page_number - 1])
 
     @filter.command("推特推送", alias={"twitter_push"})
     async def toggle_push(
