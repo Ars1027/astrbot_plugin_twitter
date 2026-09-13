@@ -231,7 +231,9 @@ class TimelineBacklogService:
                         ordered.add(tweet_id)
             candidate["items"] = list(items.values())
             complete = page.exhausted or any(
-                int(i["tweet_id"]) <= lower and not i["is_retweet"] for i in page.items
+                (int(i["tweet_id"]) <= lower and not i["is_retweet"])
+                or (self.api.provider == "fxtwitter" and int(i["tweet_id"]) == lower)
+                for i in page.items
             )
             if complete:
                 # 未重新定位的旧条目放在新到旧列表尾部，交付时优先且保留相对顺序。
@@ -271,6 +273,9 @@ class TimelineBacklogService:
                 username, saved, candidate
             ):
                 return TimelineBatch([], True)
+            self.api.cache_timeline_items(
+                page, set(items) - {i["tweet_id"] for i in saved["items"]}
+            )
             state = candidate
             saved = copy.deepcopy(state)
             if looping:

@@ -7,7 +7,7 @@ import asyncio
 import base64
 import re
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit, urlunsplit
@@ -70,6 +70,7 @@ class TimelinePage:
     items: list[dict]
     next_cursor: str | None
     exhausted: bool
+    statuses: dict[str, dict] = field(default_factory=dict)
 
 
 class TwitterAPI:
@@ -659,7 +660,7 @@ class TwitterAPI:
             ):
                 raise FxTwitterTimelineError("thread 条目结构异常")
         statuses = self._flatten_fxtwitter_results(results)
-        items, cacheable = [], []
+        items, statuses_by_id = [], {}
         for status in statuses:
             if status.get("is_pinned") is True:
                 continue
@@ -668,12 +669,17 @@ class TwitterAPI:
                 for k in ("author", "reposted_by")
             ):
                 raise FxTwitterTimelineError("状态条目结构异常")
-            items.append(self._fxtwitter_timeline_item(status, username))
-            cacheable.append(status)
-        # 整页校验成功后可填充有界详情缓存；缓存不代表已发送或提交。
-        for status in cacheable:
-            self._cache_fxtwitter_status(status)
-        return TimelinePage(items, bottom or None, not bottom)
+            tweet_id = str(status["id"])
+            if tweet_id not in statuses_by_id:
+                items.append(self._fxtwitter_timeline_item(status, username))
+                statuses_by_id[tweet_id] = status
+        return TimelinePage(items, bottom or None, not bottom, statuses_by_id)
+
+    def cache_timeline_items(self, page: TimelinePage, tweet_ids: set[str]) -> None:
+        """只缓存调用方首次接受的条目；临时详情不参与 KV 持久化。"""
+        for tweet_id, status in page.statuses.items():
+            if tweet_id in tweet_ids:
+                self._cache_fxtwitter_status(status)
 
     async def _get_fxtwitter_timeline_items(
         self, username: str, since_id: str = "", limit: int = 0
@@ -708,6 +714,7 @@ class TwitterAPI:
             except FxTwitterTimelineError as exc:
                 label = "首页" if page_index == 0 else f"第 {page_index + 1} 页"
                 raise FxTwitterTimelineError(f"获取 @{username} 时间线失败：{label}{exc}") from exc
+            accepted_ids: set[str] = set()
             for item in page.items:
                 tweet_id = item["tweet_id"]
                 if tweet_id in seen_ids:
@@ -721,6 +728,7 @@ class TwitterAPI:
                     continue
 
                 items.append(item)
+                accepted_ids.add(tweet_id)
 
                 if since_int is None and limit > 0 and len(items) >= limit:
                     requested_limit_reached = True
@@ -729,6 +737,7 @@ class TwitterAPI:
                     local_item_limit_reached = True
                     break
 
+            self.cache_timeline_items(page, accepted_ids)
             if boundary_found or requested_limit_reached:
                 break
             if local_item_limit_reached:

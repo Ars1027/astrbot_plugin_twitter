@@ -1,10 +1,12 @@
 import asyncio
+import copy
 from dataclasses import replace
 
 import httpx
 import pytest
 
 from test_nitter_timeline import html_page
+from test_fxtwitter_api import _fixture
 from test_timeline_backlog import author, check, harness as harness, runtime as runtime
 
 
@@ -251,4 +253,173 @@ async def test_concurrent_ack_of_inflight_id_rejects_page_and_prevents_replay(ha
     batch = await service.get_batch("tester")
     assert [i["tweet_id"] for i in batch.items] == ["120"]
     assert not env.sent
+    await plugin.twitter_api.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("background", [False, True])
+async def test_fx_cache_matches_first_item_on_same_and_later_pages(harness, background):
+    env = harness
+    first = _fixture("fxtwitter_timeline_page1.json")
+    second = _fixture("fxtwitter_timeline_page2.json")
+    duplicate = copy.deepcopy(first["results"][0])
+    duplicate["text"] = "later page duplicate"
+    second["results"].insert(0, duplicate)
+
+    def respond(request):
+        return httpx.Response(
+            200, json=second if request.url.params.get("cursor") else first
+        )
+
+    plugin = env.create(respond, provider="fxtwitter")
+    del plugin.twitter_api.get_tweet  # 使用真实详情缓存与适配。
+    if background:
+        await plugin.polling_service.timeline_backlog.get_batch("tester")
+    else:
+        await plugin.twitter_api.get_user_timeline_items("tester", "101")
+    assert (await plugin.twitter_api.get_tweet("tester", "105"))["text"] == "five"
+    await plugin.twitter_api.close()
+
+
+@pytest.mark.asyncio
+async def test_fx_exact_retweet_anchor_finishes_on_first_page(harness):
+    env = harness
+    calls = []
+
+    def respond(request):
+        page = int(request.url.params.get("cursor", "1"))
+        calls.append(page)
+        return fx_response(
+            [110, 100] if page == 1 else [99 - page],
+            str(page + 1),
+            retweets=[110, 100, 99 - page],
+        )
+
+    plugin = env.create(respond, provider="fxtwitter")
+    batch = await plugin.polling_service.timeline_backlog.get_batch("tester")
+    assert not batch.pending and calls == [1]
+    assert [i["tweet_id"] for i in batch.items] == ["110"]
+    await plugin.twitter_api.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("background", [False, True])
+async def test_new_scan_can_refresh_previously_cached_details(harness, background):
+    env = harness
+    payload = _fixture("fxtwitter_timeline_page1.json")
+    payload["cursor"]["bottom"] = None
+    plugin = env.create(
+        lambda _: httpx.Response(200, json=payload), provider="fxtwitter"
+    )
+    del plugin.twitter_api.get_tweet
+    if background:
+        await plugin.polling_service.timeline_backlog.get_batch("tester")
+    else:
+        await plugin.twitter_api.get_user_timeline_items("tester", "100")
+    assert (await plugin.twitter_api.get_tweet("tester", "105"))["text"] == "five"
+    payload["results"][0]["text"] = "refreshed"
+    if background:
+        # 另一个订阅的独立扫描可以刷新同一原帖，不能把全局缓存永久冻结。
+        data = env.read()["twitter_subs"]
+        data["other"] = dict(since_id="100", subscribers={"group": {"status": True}})
+        await env.put_kv("twitter_subs", data)
+        await plugin.polling_service.timeline_backlog.get_batch("other")
+    else:
+        await plugin.twitter_api.get_user_timeline_items("tester", "100")
+    assert (await plugin.twitter_api.get_tweet("tester", "105"))["text"] == "refreshed"
+    await plugin.twitter_api.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_page_save_does_not_overwrite_cache_or_persist_details(harness):
+    env = harness
+    payload = _fixture("fxtwitter_timeline_page1.json")
+    payload["cursor"]["bottom"] = None
+    fail = True
+
+    def respond(_request):
+        env.writes_fail = fail
+        return httpx.Response(200, json=payload)
+
+    plugin = env.create(respond, provider="fxtwitter")
+    plugin.twitter_api._cache_fxtwitter_status(
+        dict(payload["results"][0], text="existing")
+    )
+    with pytest.raises(OSError):
+        await plugin.polling_service.timeline_backlog.get_batch("tester")
+    assert plugin.twitter_api._status_cache["105"]["text"] == "existing"
+    assert not author(env)["timeline_backlog"]["items"]
+    fail = False
+    env.writes_fail = False
+    await plugin.polling_service.timeline_backlog.get_batch("tester")
+    assert plugin.twitter_api._status_cache["105"]["text"] == "five"
+    for item in author(env)["timeline_backlog"]["items"]:
+        assert "text" not in item and "media" not in item and "statuses" not in item
+    await plugin.twitter_api.close()
+
+
+@pytest.mark.asyncio
+async def test_reload_does_not_cache_later_duplicate_as_first_details(harness):
+    env = harness
+    first = _fixture("fxtwitter_timeline_page1.json")
+    second = _fixture("fxtwitter_timeline_page2.json")
+    second["results"].insert(0, dict(first["results"][0], text="late duplicate"))
+    details = []
+
+    def respond(request):
+        if request.url.path.endswith("/2/status/105"):
+            details.append("105")
+            return httpx.Response(
+                200,
+                json={
+                    "code": 200,
+                    "status": dict(first["results"][0], text="fresh detail"),
+                },
+            )
+        return httpx.Response(
+            200, json=second if request.url.params.get("cursor") else first
+        )
+
+    plugin = env.create(respond, provider="fxtwitter")
+    plugin.polling_service.timeline_backlog.MAX_PAGES = 1
+    assert (await plugin.polling_service.timeline_backlog.get_batch("tester")).pending
+    await plugin.twitter_api.close()
+    plugin = env.create(respond, provider="fxtwitter")
+    del plugin.twitter_api.get_tweet
+    await plugin.polling_service.timeline_backlog.get_batch("tester")
+    assert "105" not in plugin.twitter_api._status_cache
+    assert (await plugin.twitter_api.get_tweet("tester", "105"))[
+        "text"
+    ] == "fresh detail"
+    assert details == ["105"]
+    await plugin.twitter_api.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider,old_id", [("fxtwitter", 95), ("nitter", 100)])
+async def test_smaller_retweet_and_nitter_exact_id_do_not_end_scan(
+    harness, provider, old_id
+):
+    env = harness
+    calls = []
+
+    def respond(request):
+        cursor = request.url.params.get("cursor")
+        calls.append(cursor)
+        ids = [90] if cursor else [110, old_id]
+        if provider == "fxtwitter":
+            return fx_response(
+                ids, None if cursor else "2", retweets=[] if cursor else ids
+            )
+        return httpx.Response(
+            200,
+            text=timeline(
+                ids, retweets=[] if cursor else ids, cursor=None if cursor else "2"
+            ),
+        )
+
+    plugin = env.create(respond, provider=provider)
+    batch = await plugin.polling_service.timeline_backlog.get_batch("tester")
+    assert not batch.pending and calls == [None, "2"]
+    assert [i["tweet_id"] for i in batch.items] == ["110"]
     await plugin.twitter_api.close()
