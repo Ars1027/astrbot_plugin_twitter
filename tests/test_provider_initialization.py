@@ -206,16 +206,14 @@ def subscription_list_query(plugin_module):
             get_kv, put_kv, object(), lambda: False
         )
 
-        async def query(page=None, umo="session"):
+        async def query(umo="session"):
             event = types.SimpleNamespace(
-                unified_msg_origin=umo, plain_result=lambda text: text
+                unified_msg_origin=umo,
+                plain_result=lambda text: text,
+                chain_result=lambda chain: MessageChain(chain=chain),
+                get_self_id=lambda: "123456789",
             )
-            results = [
-                result async for result in (
-                    plugin.list_follows(event) if page is None
-                    else plugin.list_follows(event, page)
-                )
-            ]
+            results = [result async for result in plugin.list_follows(event)]
             assert len(results) == 1
             assert store == original
             return results[0]
@@ -227,67 +225,64 @@ def subscription_list_query(plugin_module):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("count", [1, 50, 51, 104, 115])
-async def test_subscription_list_pages_are_complete(subscription_list_query, count):
+async def test_subscription_list_forward_is_complete(subscription_list_query, count):
     query = subscription_list_query(count)
-    first = await query()
-    assert len(first) <= 1000
-    assert first == await query("1")
-    assert f"共 {count} 个" in first
-    total_pages = int(re.search(r"第 1/(\d+) 页", first).group(1))
+    result = await query()
+    assert isinstance(result, MessageChain)
+    assert len(result.chain) == 1
+    assert isinstance(result.chain[0], Nodes)
+    nodes = result.chain[0].nodes
     seen = []
-    for page in range(1, total_pages + 1):
-        text = await query(str(page))
+    for index, node in enumerate(nodes, 1):
+        assert isinstance(node, Node)
+        assert node.uin == "123456789"
+        assert node.name == "推特订阅列表"
+        assert len(node.content) == 1
+        assert isinstance(node.content[0], Plain)
+        text = node.content[0].text
         assert len(text) <= 1000
-        assert f"第 {page}/{total_pages} 页" in text
+        assert f"共 {count} 个，第 {index}/{len(nodes)} 段" in text
         rows = re.findall(r"^(\d+)\. 🟢 @(\w+) \(x\)$", text, re.MULTILINE)
         assert 1 <= len(rows) <= 50
         seen.extend(rows)
-        if page < total_pages:
-            assert f"下一页：/推特列表 {page + 1}" in text
-        else:
-            assert "下一页" not in text
+        assert "下一页" not in text
+        assert "private_only" not in text
     assert seen == [(str(i + 1), f"u{i}") for i in range(count)]
-    assert "private_only" not in first
-    assert "@private_only (private_only)" in await query(umo="private")
+    private_result = await query(umo="private")
+    private_nodes = private_result.chain[0].nodes
+    assert len(private_nodes) == 1
+    assert "@private_only (private_only)" in private_nodes[0].content[0].text
     if count == 50:
-        assert total_pages == 1
+        assert len(nodes) == 1
     if count == 51:
-        assert total_pages == 2
+        assert len(nodes) == 2
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("name", ["测试\n\t 用户  名", "测😀" * 80])
 async def test_subscription_list_limits_long_names(subscription_list_query, name):
     query = subscription_list_query(115, name, flags=True)
-    first = await query()
-    total_pages = int(re.search(r"第 1/(\d+) 页", first).group(1))
+    result = await query()
+    assert isinstance(result, MessageChain)
+    nodes = result.chain[0].nodes
     display_name = " ".join(name.split())
     if len(display_name) > 50:
         display_name = display_name[:49] + "…"
     rows = []
-    for page in range(1, total_pages + 1):
-        text = await query(str(page))
+    for node in nodes:
+        text = node.content[0].text
         assert len(text) <= 1000
         rows.extend(line for line in text.splitlines() if re.match(r"\d+\. ", line))
     assert rows == [
         f"{i + 1}. 🔴 @u{i} ({display_name}) | R18 | 仅媒体"
         for i in range(115)
     ]
-    assert len(re.findall(r"^\d+\. ", first, re.MULTILINE)) < 50
+    assert len(re.findall(r"^\d+\. ", nodes[0].content[0].text, re.MULTILINE)) < 50
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("page", ["0", "-1", "abc", "1.5", ""])
-async def test_subscription_list_rejects_invalid_page(subscription_list_query, page):
-    text = await subscription_list_query(1)(page)
-    assert text == "页码必须为正整数，用法：/推特列表 [页码]"
-
-
-@pytest.mark.asyncio
-async def test_subscription_list_empty_and_out_of_range(subscription_list_query):
+async def test_subscription_list_empty(subscription_list_query):
     assert await subscription_list_query(0)() == "当前没有订阅任何推主"
-    text = await subscription_list_query(1)("2")
-    assert text == "页码超出范围，请输入 1～1 页"
 
 
 async def _wait_forever():
