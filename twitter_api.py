@@ -634,7 +634,8 @@ class TwitterAPI:
         }
 
     async def _get_fxtwitter_timeline_items(
-        self, username: str, since_id: str = "", limit: int = 0
+        self, username: str, since_id: str = "", limit: int = 0,
+        *, preserve_order: bool = False,
     ) -> list[dict]:
         """获取完整的 FxTwitter 时间线增量，并保持既有排序语义。"""
         username = str(username or "").strip().lstrip("@")
@@ -749,6 +750,8 @@ class TwitterAPI:
 
         for status in statuses_to_cache:
             self._cache_fxtwitter_status(status)
+        if preserve_order:
+            return items[:limit] if limit > 0 else items
         return self._finalize_fxtwitter_items(items, since_int, limit)
 
     @staticmethod
@@ -785,7 +788,10 @@ class TwitterAPI:
                 for item in page.items
             )
             if since is None or boundary or page.exhausted:
-                return self._finalize_fxtwitter_items(list(items.values()), since, limit)
+                result = list(items.values())
+                if since is not None:
+                    result.reverse()
+                return result[:limit] if limit > 0 else result
             if page.next_cursor in seen_cursors:
                 raise TwitterTimelineError("Nitter 分页游标重复")
             seen_cursors.add(page.next_cursor)
@@ -793,9 +799,15 @@ class TwitterAPI:
         raise TwitterTimelineError("Nitter 分页预算耗尽，尚未确认增量完整")
 
     async def get_user_timeline_page(
-        self, username: str, *, cursor: str = ""
+        self, username: str, *, cursor: str = "", since_id: str = ""
     ) -> TimelinePage:
         """读取完整单页；调用方负责分页进度和发送游标。"""
+        if self.provider == DATA_PROVIDER_FXTWITTER:
+            # 过渡通道：旧 FxTwitter 必须一次取全后才能接管未完成的 Nitter 积压。
+            items = await self._get_fxtwitter_timeline_items(
+                username, since_id, preserve_order=True
+            )
+            return TimelinePage(items, None, True)
         if not self.nitter_url:
             raise TwitterTimelineError("Nitter 镜像未就绪")
         url = f"{self.nitter_url.rstrip('/')}/{quote(username, safe='')}"

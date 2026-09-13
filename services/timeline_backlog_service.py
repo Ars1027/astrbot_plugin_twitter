@@ -42,27 +42,26 @@ class TimelineBacklogService:
         if not isinstance(state, dict):
             return False
         try:
-            return (
-                state["version"] == 1
+            ids = [i["tweet_id"] for i in state["items"]]
+            common = (
+                state["version"] in (1, 2)
                 and isinstance(state["generation"], str)
                 and bool(state["generation"])
                 and isinstance(state["source"], str)
                 and str(state["anchor_since_id"]).isdigit()
-                and (state["upper_id"] is None or str(state["upper_id"]).isdigit())
                 and state["phase"] in {"scanning", "ready", "blocked"}
                 and isinstance(state["next_cursor"], str)
                 and isinstance(state["seen_cursors"], list)
                 and all(isinstance(c, str) for c in state["seen_cursors"])
                 and isinstance(state["cursor_failures"], int)
                 and state["cursor_failures"] >= 0
+                and isinstance(state["blocked_reason"], str)
                 and isinstance(state["items"], list)
+                and len(ids) == len(set(ids))
                 and all(
                     isinstance(i, dict)
-                    and str(i["tweet_id"]).isdigit()
-                    and state["upper_id"] is not None
-                    and int(state["anchor_since_id"])
-                    < int(i["tweet_id"])
-                    <= int(state["upper_id"])
+                    and isinstance(i["tweet_id"], str)
+                    and i["tweet_id"].isdigit()
                     and isinstance(i["is_retweet"], bool)
                     and all(
                         isinstance(i[k], str)
@@ -80,9 +79,29 @@ class TimelineBacklogService:
                         isinstance(state["required"], dict)
                         and all(
                             isinstance(state["required"][k], int)
+                            and state["required"][k] >= 0
                             for k in ("items", "bytes", "cursors")
                         )
                     )
+                )
+            )
+            if not common:
+                return False
+            if state["version"] == 1:
+                return (
+                    state["upper_id"] is None or str(state["upper_id"]).isdigit()
+                ) and all(
+                    int(state["anchor_since_id"]) < int(i) <= int(state["upper_id"])
+                    for i in ids
+                )
+            return (
+                isinstance(state["scan_order"], list)
+                and len(state["scan_order"]) == len(set(state["scan_order"]))
+                and set(state["scan_order"]).issubset(ids)
+                and isinstance(state["acknowledged_ids"], list)
+                and all(
+                    isinstance(i, str) and i.isdigit()
+                    for i in state["acknowledged_ids"]
                 )
             )
         except (KeyError, TypeError, ValueError):
@@ -106,11 +125,12 @@ class TimelineBacklogService:
                 logger.error(f"@{username} 游标无效，暂停分页")
                 return TimelineBatch([], True)
             state = dict(
-                version=1,
+                version=2,
                 generation=uuid4().hex,
                 source=self._source(),
                 anchor_since_id=anchor,
-                upper_id=None,
+                scan_order=[],
+                acknowledged_ids=[],
                 phase="scanning",
                 next_cursor="",
                 seen_cursors=[],
@@ -127,6 +147,38 @@ class TimelineBacklogService:
             return TimelineBatch([], True)
 
         saved = copy.deepcopy(state)
+        if state["version"] == 1:
+            # v1 的上限可能已过滤掉合法转帖；保留条目并重新确认完整性。
+            state.update(
+                version=2,
+                generation=uuid4().hex,
+                scan_order=[],
+                next_cursor="",
+                seen_cursors=[],
+                cursor_failures=0,
+                acknowledged_ids=[
+                    str(i)
+                    for i in author.get("processed_tweet_ids", [])
+                    if str(i).isdigit()
+                ],
+            )
+            state.pop("upper_id")
+            acknowledged = set(state["acknowledged_ids"])
+            state["items"] = [
+                i for i in state["items"] if i["tweet_id"] not in acknowledged
+            ]
+            if state["phase"] != "blocked":
+                state["phase"] = "scanning"
+            if not await self.subscriptions.save_timeline_backlog(
+                username, saved, state
+            ):
+                return TimelineBatch([], True)
+            saved = copy.deepcopy(state)
+        # 已确认完整的队列跨来源也先交付，不按新来源重新扫描或重新排序。
+        if state["phase"] == "ready":
+            if not state["items"]:
+                await self.subscriptions.save_timeline_backlog(username, saved, None)
+            return TimelineBatch(list(reversed(state["items"])))
         if state["phase"] == "blocked":
             required = state["required"]
             if (
@@ -147,6 +199,7 @@ class TimelineBacklogService:
                 source=self._source(),
                 next_cursor="",
                 seen_cursors=[],
+                scan_order=[],
                 cursor_failures=0,
                 phase="scanning",
             )
@@ -155,7 +208,9 @@ class TimelineBacklogService:
                 break
             try:
                 page = await self.api.get_user_timeline_page(
-                    username, cursor=state["next_cursor"]
+                    username,
+                    cursor=state["next_cursor"],
+                    since_id=state["anchor_since_id"],
                 )
             except TwitterTimelineError:
                 if state["next_cursor"]:
@@ -163,19 +218,25 @@ class TimelineBacklogService:
                 await self.subscriptions.save_timeline_backlog(username, saved, state)
                 raise
             candidate = copy.deepcopy(state)
-            if candidate["upper_id"] is None and page.items:
-                newest = max(int(i["tweet_id"]) for i in page.items)
-                if newest > int(state["anchor_since_id"]):
-                    candidate["upper_id"] = newest
-            lower, upper = int(state["anchor_since_id"]), candidate["upper_id"]
+            lower = int(state["anchor_since_id"])
             items = {i["tweet_id"]: i for i in candidate["items"]}
+            ordered = set(candidate["scan_order"])
+            acknowledged = set(candidate["acknowledged_ids"])
             for item in page.items:
-                if lower < int(item["tweet_id"]) <= int(upper or 0):
-                    items.setdefault(item["tweet_id"], item)
+                tweet_id = item["tweet_id"]
+                if int(tweet_id) > lower and tweet_id not in acknowledged:
+                    items.setdefault(tweet_id, item)
+                    if tweet_id not in ordered:
+                        candidate["scan_order"].append(tweet_id)
+                        ordered.add(tweet_id)
             candidate["items"] = list(items.values())
             complete = page.exhausted or any(
                 int(i["tweet_id"]) <= lower and not i["is_retweet"] for i in page.items
             )
+            if complete:
+                # 未重新定位的旧条目放在新到旧列表尾部，交付时优先且保留相对顺序。
+                order = candidate["scan_order"] + [i for i in items if i not in ordered]
+                candidate["items"] = [items[i] for i in order]
             candidate["cursor_failures"] = 0
             candidate["seen_cursors"].append(state["next_cursor"])
             candidate["next_cursor"] = page.next_cursor or ""
@@ -218,4 +279,4 @@ class TimelineBacklogService:
             return TimelineBatch([], True)
         if not state["items"]:
             await self.subscriptions.save_timeline_backlog(username, saved, None)
-        return TimelineBatch(sorted(state["items"], key=lambda i: int(i["tweet_id"])))
+        return TimelineBatch(list(reversed(state["items"])))

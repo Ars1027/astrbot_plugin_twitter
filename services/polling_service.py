@@ -199,7 +199,7 @@ class PollingService:
         try:
             since_id = info.get("since_id", "")
             processed_tweet_ids = self.subscriptions.processed_tweet_ids(info)
-            if self.settings.data_provider == DATA_PROVIDER_NITTER:
+            if self.settings.data_provider == DATA_PROVIDER_NITTER or "timeline_backlog" in info:
                 batch = await self.timeline_backlog.get_batch(username)
                 if batch.pending:
                     return True
