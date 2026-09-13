@@ -341,16 +341,20 @@ class SubscriptionService:
                 changed = True
 
             backlog = author_info.get("timeline_backlog")
-            if isinstance(backlog, dict) and backlog.get("phase") == "ready":
-                committed = int(author_info.get("since_id") or "0")
-                remaining = [
-                    item for item in backlog["items"]
-                    if int(item["tweet_id"]) > committed
-                ]
-                if remaining != backlog["items"]:
-                    backlog["items"] = remaining
+            if isinstance(backlog, dict) and isinstance(backlog.get("items"), list):
+                confirmed = set(normalized_ids)
+                removed = [i["tweet_id"] for i in backlog["items"] if i["tweet_id"] in confirmed]
+                if removed:
+                    backlog["items"] = [i for i in backlog["items"] if i["tweet_id"] not in confirmed]
+                    if backlog.get("version") == 2:
+                        backlog["scan_order"] = [i for i in backlog["scan_order"] if i not in confirmed]
                     changed = True
-                if not remaining:
+                if backlog.get("version") == 2:
+                    acknowledged = list(dict.fromkeys(backlog["acknowledged_ids"] + normalized_ids))
+                    if acknowledged != backlog["acknowledged_ids"]:
+                        backlog["acknowledged_ids"] = acknowledged
+                        changed = True
+                if backlog.get("version") == 2 and backlog.get("phase") == "ready" and not backlog["items"]:
                     author_info.pop("timeline_backlog")
                     changed = True
 

@@ -220,7 +220,7 @@ async def test_capacity_blocks_without_eviction_and_resumes_after_raising_limit(
 
 
 @pytest.mark.asyncio
-async def test_three_cursor_failures_rescan_preserving_items_and_upper_bound(harness):
+async def test_three_cursor_failures_rescan_preserving_items_and_anchor(harness):
     env = harness
     plugin = env.create(six_pages(env))
     env.failure = "page3"
@@ -248,7 +248,7 @@ async def test_source_change_rescans_without_reusing_cursor_or_replacing_context
     await check(plugin, env)
     after = author(env)["timeline_backlog"]
     assert env.calls == [1, 2, 3, 4, 1, 2, 3, 4]
-    assert after["items"] == before["items"] and after["upper_id"] == before["upper_id"]
+    assert after["items"] == before["items"] and after["anchor_since_id"] == before["anchor_since_id"]
     await plugin.twitter_api.close()
 
 
@@ -276,7 +276,7 @@ async def test_inflight_page_cannot_attach_after_unsubscribe_and_readd(harness):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "mutation", [{"version": 99}, {"items": None}, {"upper_id": "broken"}]
+    "mutation", [{"version": 99}, {"items": None}, {"scan_order": "broken"}]
 )
 async def test_corrupt_state_is_preserved_without_network_requests(harness, mutation):
     env = harness
@@ -357,7 +357,7 @@ async def test_cursor_loop_restarts_next_cycle_without_losing_metadata(harness):
     assert await check(plugin, env)
     before = author(env)["timeline_backlog"]
     assert before["cursor_failures"] == 3 and calls == ["", "loop"]
-    assert {i["tweet_id"] for i in before["items"]} == {"102", "103", "104"}
+    assert {i["tweet_id"] for i in before["items"]} == {"102", "103", "104", "999"}
     assert await check(plugin, env)
     assert calls == ["", "loop", "", "loop"]
     assert author(env)["timeline_backlog"]["items"] == before["items"]

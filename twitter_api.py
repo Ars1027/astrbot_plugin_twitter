@@ -791,7 +791,10 @@ class TwitterAPI:
                 for item in page.items
             )
             if since is None or boundary or page.exhausted:
-                return self._finalize_fxtwitter_items(list(items.values()), since, limit)
+                result = list(items.values())
+                if since is not None:
+                    result.reverse()
+                return result[:limit] if limit > 0 else result
             if page.next_cursor in seen_cursors:
                 raise TwitterTimelineError("Nitter 分页游标重复")
             seen_cursors.add(page.next_cursor)
@@ -799,7 +802,7 @@ class TwitterAPI:
         raise TwitterTimelineError("Nitter 分页预算耗尽，尚未确认增量完整")
 
     async def get_user_timeline_page(
-        self, username: str, *, cursor: str = ""
+        self, username: str, *, cursor: str = "", since_id: str = ""
     ) -> TimelinePage:
         """读取完整单页；调用方负责分页进度和发送游标。"""
         if self.provider == DATA_PROVIDER_FXTWITTER:
