@@ -12,6 +12,7 @@ from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Node, Nodes, Plain
 from astrbot.api.star import Context, Star, StarTools
 
 from .services import (
@@ -833,9 +834,34 @@ class TwitterPlugin(Star):
             f"{cleared['relations']} 个订阅关系"
         )
 
+    @staticmethod
+    def _subscription_list_chunks(lines: list[str]) -> list[str]:
+        """按完整条目分段，限制每个转发节点的条数与字符数。"""
+        total = len(lines)
+        header = "当前订阅列表（共 {total} 个，第 {index}/{chunks} 段）:\n"
+        # 段数不会超过条目数，按最大可能段号为标题预留字符预算。
+        budget = 1000 - len(header.format(total=total, index=total, chunks=total))
+        chunks = []
+        current = []
+        size = 0
+        for index, line in enumerate(lines, 1):
+            row = f"{index}. {line}"
+            if current and (len(current) >= 50 or size + 1 + len(row) > budget):
+                chunks.append("\n".join(current))
+                current = []
+                size = 0
+            size += len(row) + bool(current)
+            current.append(row)
+        if current:
+            chunks.append("\n".join(current))
+        return [
+            header.format(total=total, index=index, chunks=len(chunks)) + body
+            for index, body in enumerate(chunks, 1)
+        ]
+
     @filter.command("推特列表", alias={"twitter_list"})
     async def list_follows(self, event: AstrMessageEvent):
-        """查看当前会话订阅的推主列表。"""
+        """以分段合并转发查看当前会话的完整订阅列表。"""
         umo = event.unified_msg_origin
         subs = await self._get_subs()
         lines = []
@@ -847,7 +873,9 @@ class TwitterPlugin(Star):
             status_icon = "🟢" if sub_config.get("status", True) else "🔴"
             r18_str = " | R18" if sub_config.get("r18") else ""
             media_str = " | 仅媒体" if sub_config.get("media") else ""
-            screen_name = info.get("screen_name", username)
+            screen_name = " ".join(str(info.get("screen_name") or username).split())
+            if len(screen_name) > 50:
+                screen_name = screen_name[:49] + "…"
             lines.append(
                 f"{status_icon} @{username} ({screen_name})"
                 f"{r18_str}{media_str}"
@@ -857,13 +885,11 @@ class TwitterPlugin(Star):
             yield event.plain_result("当前没有订阅任何推主")
             return
 
-        yield event.plain_result(
-            "当前订阅列表:\n"
-            + "\n".join(
-                f"{index}. {line}"
-                for index, line in enumerate(lines, 1)
-            )
-        )
+        nodes = [
+            Node(content=[Plain(text)], name="推特订阅列表", uin=event.get_self_id())
+            for text in self._subscription_list_chunks(lines)
+        ]
+        yield event.chain_result([Nodes(nodes)])
 
     @filter.command("推特推送", alias={"twitter_push"})
     async def toggle_push(

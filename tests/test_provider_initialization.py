@@ -2,6 +2,7 @@ import asyncio
 import copy
 import importlib.util
 import json
+import re
 import sys
 import types
 from pathlib import Path
@@ -176,6 +177,112 @@ def _load_main_module():
 def plugin_module():
     FakeTwitterAPI.instances.clear()
     return _load_main_module()
+
+
+@pytest.fixture
+def subscription_list_query(plugin_module):
+    def make_query(count, name="x", flags=False):
+        store = {
+            f"u{i}": {
+                "screen_name": name,
+                "subscribers": {
+                    "session": {"status": not flags, "r18": flags, "media": flags}
+                },
+            }
+            for i in range(count)
+        }
+        store["private_only"] = {"subscribers": {"private": {}}}
+        original = copy.deepcopy(store)
+
+        async def get_kv(key, default):
+            assert key == "twitter_subs"
+            return store
+
+        async def put_kv(*_args):
+            pytest.fail("查询列表不得写入 KV")
+
+        plugin = plugin_module.TwitterPlugin.__new__(plugin_module.TwitterPlugin)
+        plugin.subscription_service = plugin_module.SubscriptionService(
+            get_kv, put_kv, object(), lambda: False
+        )
+
+        async def query(umo="session"):
+            event = types.SimpleNamespace(
+                unified_msg_origin=umo,
+                plain_result=lambda text: text,
+                chain_result=lambda chain: MessageChain(chain=chain),
+                get_self_id=lambda: "123456789",
+            )
+            results = [result async for result in plugin.list_follows(event)]
+            assert len(results) == 1
+            assert store == original
+            return results[0]
+
+        return query
+
+    return make_query
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [1, 50, 51, 104, 115])
+async def test_subscription_list_forward_is_complete(subscription_list_query, count):
+    query = subscription_list_query(count)
+    result = await query()
+    assert isinstance(result, MessageChain)
+    assert len(result.chain) == 1
+    assert isinstance(result.chain[0], Nodes)
+    nodes = result.chain[0].nodes
+    seen = []
+    for index, node in enumerate(nodes, 1):
+        assert isinstance(node, Node)
+        assert node.uin == "123456789"
+        assert node.name == "推特订阅列表"
+        assert len(node.content) == 1
+        assert isinstance(node.content[0], Plain)
+        text = node.content[0].text
+        assert len(text) <= 1000
+        assert f"共 {count} 个，第 {index}/{len(nodes)} 段" in text
+        rows = re.findall(r"^(\d+)\. 🟢 @(\w+) \(x\)$", text, re.MULTILINE)
+        assert 1 <= len(rows) <= 50
+        seen.extend(rows)
+        assert "下一页" not in text
+        assert "private_only" not in text
+    assert seen == [(str(i + 1), f"u{i}") for i in range(count)]
+    private_result = await query(umo="private")
+    private_nodes = private_result.chain[0].nodes
+    assert len(private_nodes) == 1
+    assert "@private_only (private_only)" in private_nodes[0].content[0].text
+    if count == 50:
+        assert len(nodes) == 1
+    if count == 51:
+        assert len(nodes) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["测试\n\t 用户  名", "测😀" * 80])
+async def test_subscription_list_limits_long_names(subscription_list_query, name):
+    query = subscription_list_query(115, name, flags=True)
+    result = await query()
+    assert isinstance(result, MessageChain)
+    nodes = result.chain[0].nodes
+    display_name = " ".join(name.split())
+    if len(display_name) > 50:
+        display_name = display_name[:49] + "…"
+    rows = []
+    for node in nodes:
+        text = node.content[0].text
+        assert len(text) <= 1000
+        rows.extend(line for line in text.splitlines() if re.match(r"\d+\. ", line))
+    assert rows == [
+        f"{i + 1}. 🔴 @u{i} ({display_name}) | R18 | 仅媒体"
+        for i in range(115)
+    ]
+    assert len(re.findall(r"^\d+\. ", nodes[0].content[0].text, re.MULTILINE)) < 50
+
+
+@pytest.mark.asyncio
+async def test_subscription_list_empty(subscription_list_query):
+    assert await subscription_list_query(0)() == "当前没有订阅任何推主"
 
 
 async def _wait_forever():
