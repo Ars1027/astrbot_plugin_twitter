@@ -196,6 +196,15 @@ class TweetDeliveryService:
         if result is False:
             raise RuntimeError("Context.send_message returned False")
 
+    async def _record_recent_delivery(
+        self, umo: str, username: str, tweet_info: dict
+    ) -> None:
+        try:
+            await self.subscriptions.record_delivery(umo, username, tweet_info)
+        except Exception as exc:
+            # History is observational; its failure must not trigger a resend.
+            logger.warning(f"保存最近推送记录失败 {umo} -> @{username}: {exc}")
+
     async def send_plain_chain_resilient(self, umo: str, chain: list) -> bool:
         """发送普通消息；媒体失败时优先补发文字，再逐图尝试。"""
         if not chain:
@@ -496,6 +505,7 @@ class TweetDeliveryService:
                 sent = primary_sent if plain_chain else any(video_results)
 
             if sent:
+                await self._record_recent_delivery(umo, username, tweet_info)
                 logger.info(f"推文已推送至 {umo}")
             else:
                 logger.error(f"推文主要内容未能推送至 {umo}")
@@ -669,6 +679,10 @@ class TweetDeliveryService:
                             for video in tweet_videos
                         ]
                         succeeded = bool(tweet_nodes) or any(video_results)
+                        if succeeded:
+                            await self._record_recent_delivery(
+                                umo, cached_tweet.username, cached_tweet.tweet_info
+                            )
                         record_result(umo, cached_tweet, succeeded)
 
             if retweet_seen_dirty:

@@ -26,6 +26,12 @@ class TwitterWebUIController:
         routes = (
             ("overview", self.overview, ["GET"], "Twitter 订阅概览"),
             (
+                "subscriptions/recent",
+                self.recent_deliveries,
+                ["POST"],
+                "读取单个订阅的最近推送记录",
+            ),
+            (
                 "settings/poll-interval",
                 self.save_poll_interval,
                 ["POST"],
@@ -355,6 +361,24 @@ class TwitterWebUIController:
         except Exception as exc:
             logger.exception(f"生成 Twitter 订阅概览失败: {exc}")
             return error_response("读取订阅数据失败", status_code=500)
+
+    async def recent_deliveries(self):
+        payload = await self._payload()
+        if payload is None:
+            return error_response("请求内容必须是 JSON 对象", status_code=400)
+        username = self._normalize_username(payload.get("username"))
+        if self._parse_umo(payload.get("umo")) is None or username is None:
+            return error_response("会话或推主用户名格式不正确", status_code=400)
+        try:
+            records = await self.plugin.subscription_service.get_recent_deliveries(
+                payload["umo"], username
+            )
+        except Exception as exc:
+            logger.warning(f"读取最近推送记录失败: {exc}")
+            return error_response("读取推送记录失败，请稍后重试", status_code=500)
+        if records is None:
+            return error_response("当前会话不存在这个订阅", status_code=404)
+        return json_response({"items": records})
 
     async def save_poll_interval(self):
         payload = await self._payload()

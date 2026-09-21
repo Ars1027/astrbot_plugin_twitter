@@ -3,6 +3,7 @@
 import asyncio
 import copy
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -10,6 +11,8 @@ KV_SUBS_KEY = "twitter_subs"
 KV_RETWEET_DEDUP_KEY = "twitter_retweet_dedup_seen"
 RETWEET_DEDUP_MAX_ITEMS = 500
 PROCESSED_TWEET_MAX_ITEMS = 500
+RECENT_DELIVERY_MAX_ITEMS = 5
+RECENT_DELIVERY_TEXT_LIMIT = 500
 
 KVGetter = Callable[[str, Any], Awaitable[Any]]
 KVSetter = Callable[[str, Any], Awaitable[None]]
@@ -85,6 +88,11 @@ class SubscriptionService:
                         "username": existing_key,
                     }
                 replaced = umo in subscribers
+                history = subscribers.get(umo, {}).get("recent_deliveries")
+                if isinstance(history, list):
+                    session_config["recent_deliveries"] = copy.deepcopy(
+                        history[:RECENT_DELIVERY_MAX_ITEMS]
+                    )
                 subscribers[umo] = session_config
                 await self.save_all(subs)
                 return {
@@ -123,6 +131,11 @@ class SubscriptionService:
                         "username": existing_key,
                     }
                 replaced = umo in subscribers
+                history = subscribers.get(umo, {}).get("recent_deliveries")
+                if isinstance(history, list):
+                    session_config["recent_deliveries"] = copy.deepcopy(
+                        history[:RECENT_DELIVERY_MAX_ITEMS]
+                    )
                 subscribers[umo] = session_config
                 await self.save_all(subs)
                 return {
@@ -175,6 +188,54 @@ class SubscriptionService:
                     subscriber[target] = value
             await self.save_all(subs)
             return {"ok": True, "username": key}
+
+    async def get_recent_deliveries(self, umo: str, username: str) -> list | None:
+        """按订阅关系读取最近实际发送记录；旧订阅默认没有历史。"""
+        async with self._lock:
+            subs = await self.get_all()
+            key = self.find_key(subs, username)
+            subscriber = subs.get(key, {}).get("subscribers", {}).get(umo)
+            if not isinstance(subscriber, dict):
+                return None
+            records = subscriber.get("recent_deliveries", [])
+            if not isinstance(records, list):
+                return []
+            return copy.deepcopy(
+                [item for item in records if isinstance(item, dict)]
+                [:RECENT_DELIVERY_MAX_ITEMS]
+            )
+
+    async def record_delivery(self, umo: str, username: str, tweet_info: dict) -> None:
+        """只存有界摘要，不缓存媒体；与订阅一起删除，不更改轮询游标。"""
+        tweet_id = str(tweet_info.get("tweet_id") or "")
+        if not tweet_id.isascii() or not tweet_id.isdigit() or len(tweet_id) > 40:
+            return
+        text = str(tweet_info.get("text") or "")
+        quote_text = str((tweet_info.get("quote") or {}).get("text") or "")
+        if quote_text:
+            text += f"\n\n引用：{quote_text}"
+        record = {
+            "tweet_id": tweet_id,
+            "text": text[:RECENT_DELIVERY_TEXT_LIMIT],
+            "truncated": len(text) > RECENT_DELIVERY_TEXT_LIMIT,
+            "delivered_at": datetime.now(timezone.utc).isoformat(),
+            "is_retweet": bool(tweet_info.get("retweet")),
+        }
+        async with self._lock:
+            # Avoid publishing an in-memory history entry if persistence fails.
+            subs = copy.deepcopy(await self.get_all())
+            key = self.find_key(subs, username)
+            subscriber = subs.get(key, {}).get("subscribers", {}).get(umo)
+            if not isinstance(subscriber, dict):
+                return
+            previous = subscriber.get("recent_deliveries", [])
+            if not isinstance(previous, list):
+                previous = []
+            subscriber["recent_deliveries"] = ([record] + [
+                item for item in previous
+                if isinstance(item, dict) and item.get("tweet_id") != tweet_id
+            ])[:RECENT_DELIVERY_MAX_ITEMS]
+            await self.save_all(subs)
 
     async def remove(self, umo: str, username: str) -> dict:
         """移除订阅关系，并清理没有订阅者的推主。"""

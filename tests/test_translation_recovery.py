@@ -328,10 +328,14 @@ async def test_blocked_translation_still_delivers_and_commits_cursors(
         return copy.deepcopy(store.get(key, default))
 
     async def put_kv(key, data):
+        previous = store.get(key, {})
         store[key] = copy.deepcopy(data)
         if key == "twitter_subs":
             assert sent_text  # 原文送达之后才能保存处理结果。
-            checkpoints.append(copy.deepcopy(data))
+            # History-only writes are not cursor checkpoints.
+            if any(info["since_id"] != previous[user]["since_id"]
+                   for user, info in data.items()):
+                checkpoints.append(copy.deepcopy(data))
 
     async def no_delay(_seconds):
         pass
@@ -365,6 +369,9 @@ async def test_blocked_translation_still_delivers_and_commits_cursors(
     assert all("翻译自原文" not in text for text in sent_text)
     assert all(author["since_id"] == "3" for author in store["twitter_subs"].values())
     assert len(checkpoints) == (2 if collective else 6)
+    for author in store["twitter_subs"].values():
+        history = author["subscribers"]["session"]["recent_deliveries"]
+        assert [item["tweet_id"] for item in history] == ["3", "2", "1"]
     assert not delivery.has_collected and not polling.has_pending_collective
 
     # 下一轮重新建立失败计数，不沿用上一轮的跳过状态。
