@@ -10,12 +10,15 @@
     <div class="page-shell">
       <header class="topbar">
         <div class="title-block">
-          <h1>Twitter 订阅管理</h1>
+          <span class="brand-mark" aria-hidden="true">𝕏</span>
+          <div><p class="eyebrow">SUBSCRIPTION WORKSPACE</p><h1>Twitter 订阅管理</h1>
+            <p class="page-description">推主、会话与每一次更新，尽在这里。</p></div>
+        </div>
+        <div class="topbar-actions">
           <div class="runtime-status" id="runtime-status" aria-live="polite">
             <span class="status-dot" aria-hidden="true"></span>
             <span>正在连接</span>
           </div>
-        </div>
         <button
           class="icon-button"
           id="refresh-button"
@@ -23,8 +26,9 @@
           title="刷新数据"
           aria-label="刷新数据"
         >
-          ↻
+          <span aria-hidden="true">↻</span><span>刷新</span>
         </button>
+        </div>
       </header>
 
       <section class="summary-band" aria-label="订阅概况">
@@ -44,7 +48,9 @@
           <span class="metric-label">已启用</span>
           <strong id="metric-active">-</strong>
         </div>
+      </section>
         <form class="interval-form" id="interval-form">
+          <div class="interval-description"><strong>自动追踪更新</strong><span>轮询间隔对所有会话生效</span></div>
           <label for="poll-interval">轮询间隔</label>
           <div class="number-field">
             <input
@@ -60,12 +66,12 @@
           </div>
           <button class="primary-button" type="submit">保存</button>
         </form>
-      </section>
 
       <div class="notice error-notice is-hidden" id="error-notice" role="alert"></div>
 
       <main class="workspace" aria-busy="true">
         <aside class="session-browser" aria-label="会话列表">
+          <div class="browser-heading"><span class="eyebrow">会话空间</span><span class="muted">按会话独立管理</span></div>
           <div class="browser-toolbar">
             <div class="segmented-control" role="tablist" aria-label="会话类型">
               <button
@@ -117,6 +123,46 @@
           <button class="danger-button" id="confirm-remove" value="confirm">移除</button>
         </div>
       </form>
+    </dialog>
+
+    <dialog class="batch-dialog" id="batch-dialog" aria-labelledby="batch-title" aria-describedby="batch-target">
+      <header class="dialog-header">
+        <div><p class="eyebrow">添加到当前群聊</p><h2 id="batch-title">批量添加推主</h2></div>
+        <button class="icon-button dialog-close" id="batch-close" type="button" aria-label="关闭批量添加">×</button>
+      </header>
+      <p class="batch-target" id="batch-target"></p>
+      <form id="batch-form">
+        <label class="field-label" for="batch-input">推主用户名</label>
+        <textarea id="batch-input" rows="5" spellcheck="false" placeholder="@AstrBot&#10;elonmusk, OpenAI" aria-describedby="batch-help"></textarea>
+        <p class="field-hint" id="batch-help">支持换行、空格、逗号或分号分隔，每批最多 100 个不同账号。请填写用户名，不填写链接。</p>
+        <div class="batch-options">
+          <label class="option-check"><input type="checkbox" id="batch-r18" />允许 R18</label>
+          <label class="option-check"><input type="checkbox" id="batch-media" />仅媒体</label>
+          <span class="muted">仅作用于新订阅</span>
+        </div>
+        <div class="batch-summary" id="batch-summary" role="status" aria-live="polite"></div>
+        <progress id="batch-progress" max="1" value="0" aria-label="批量添加进度" hidden></progress>
+        <div class="notice error-notice is-hidden" id="batch-error" role="alert"></div>
+        <div class="batch-entries" id="batch-entries" aria-label="账号处理结果"></div>
+        <p class="field-hint">停止仅影响后续请求，已经添加的订阅会保留。关闭页面后队列不再继续，已发出的请求仍可能完成。</p>
+        <footer class="dialog-actions batch-actions">
+          <button class="secondary-button" id="batch-reset" type="button" hidden>重新填写</button>
+          <button class="secondary-button" id="batch-stop" type="button" hidden>停止后续添加</button>
+          <button class="secondary-button" id="batch-retry" type="button" hidden>核对并重试未完成项</button>
+          <button class="primary-button" id="batch-start" type="submit" disabled>开始添加</button>
+        </footer>
+      </form>
+    </dialog>
+
+    <dialog class="history-dialog" id="history-dialog" aria-labelledby="history-title" aria-describedby="history-target">
+      <header class="dialog-header">
+        <div><p class="eyebrow">当前会话的推送记录</p><h2 id="history-title">最近推送</h2></div>
+        <button class="icon-button dialog-close" id="history-close" type="button" aria-label="关闭推送记录">×</button>
+      </header>
+      <p class="batch-target" id="history-target"></p>
+      <p class="field-hint">最多保留最近 5 条成功推送的摘要。</p>
+      <div id="history-content" class="history-content" aria-live="polite"></div>
+      <div class="dialog-actions"><button class="secondary-button" id="history-refresh" type="button">刷新记录</button></div>
     </dialog>
 
     <div class="toast is-hidden" id="toast" role="status" aria-live="polite"></div>

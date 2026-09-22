@@ -195,9 +195,10 @@ async def test_registers_routes_and_builds_multi_bot_overview(webui_module):
     context = FakeContext([platform_a, platform_b])
     controller = webui_module.TwitterWebUIController(FakePlugin(subs), context)
 
-    assert len(context.routes) == 6
+    assert len(context.routes) == 7
     assert {route for route, *_rest in context.routes} == {
         "/astrbot_plugin_twitter/overview",
+        "/astrbot_plugin_twitter/subscriptions/recent",
         "/astrbot_plugin_twitter/settings/poll-interval",
         "/astrbot_plugin_twitter/subscriptions/add",
         "/astrbot_plugin_twitter/subscriptions/update",
@@ -297,6 +298,101 @@ async def test_add_subscription_validates_group_and_options(webui_module):
     }
     _payload, status = await controller.add_subscription()
     assert status == 400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "umo, unavailable, expected_status",
+    [
+        ("bot-b:GroupMessage:100", False, 400),
+        ("bot-a:GroupMessage:200", False, 404),
+        ("bot-a:GroupMessage:100", True, 503),
+    ],
+)
+async def test_add_rechecks_group_membership(
+    webui_module, umo, unavailable, expected_status
+):
+    plugin = FakePlugin()
+    platform = FakePlatform(
+        "bot-a",
+        [{"group_id": "100", "group_name": "Alpha"}],
+        error=RuntimeError("offline") if unavailable else None,
+    )
+    controller = webui_module.TwitterWebUIController(plugin, FakeContext([platform]))
+    webui_module.fake_request.payload = {"umo": umo, "username": "tester"}
+
+    payload, status = await controller.add_subscription()
+
+    assert status == expected_status
+    assert not payload.get("saved")
+    assert plugin.last_add is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason, expected_status",
+    [("duplicate", 409), ("not_found", 404), ("provider_unavailable", 503)],
+)
+async def test_add_reports_rejected_subscription(webui_module, reason, expected_status):
+    plugin = FakePlugin()
+    plugin.add_result = {"ok": False, "reason": reason}
+    platform = FakePlatform("bot-a", [{"group_id": "100", "group_name": "Alpha"}])
+    controller = webui_module.TwitterWebUIController(plugin, FakeContext([platform]))
+    webui_module.fake_request.payload = {
+        "umo": "bot-a:GroupMessage:100", "username": "tester", "r18": True
+    }
+
+    payload, status = await controller.add_subscription()
+
+    assert status == expected_status
+    assert not payload.get("saved")
+    assert plugin.last_add[2]["reject_duplicate"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("umo, username, expected", [
+    ("bot-a:GroupMessage:100", "@Tester", 200),
+    ("bot-b:GroupMessage:100", "Tester", 404),
+    ("bot-a:GroupMessage:100", "other", 404),
+    ("invalid", "Tester", 400),
+    ("bot-a:GroupMessage:100", "invalid!", 400),
+])
+async def test_recent_history_route_respects_subscription_target(
+    webui_module, umo, username, expected
+):
+    records = [{"tweet_id": "123", "text": "最近推送"}]
+
+    async def get_recent(target_umo, target_name):
+        if target_umo == "bot-a:GroupMessage:100" and target_name == "Tester":
+            return records
+        return None
+
+    plugin = FakePlugin()
+    plugin.subscription_service = types.SimpleNamespace(get_recent_deliveries=get_recent)
+    controller = webui_module.TwitterWebUIController(plugin, FakeContext())
+    webui_module.fake_request.payload = {"umo": umo, "username": username}
+    payload, status = await controller.recent_deliveries()
+    assert status == expected
+    if status == 200:
+        assert payload == {"items": records}
+    else:
+        assert "items" not in payload
+
+
+@pytest.mark.asyncio
+async def test_recent_history_storage_error_is_not_an_empty_success(webui_module):
+    async def unavailable(*_args):
+        raise OSError("storage unavailable")
+
+    plugin = FakePlugin()
+    plugin.subscription_service = types.SimpleNamespace(get_recent_deliveries=unavailable)
+    controller = webui_module.TwitterWebUIController(plugin, FakeContext())
+    webui_module.fake_request.payload = {
+        "umo": "bot-a:GroupMessage:100", "username": "tester"
+    }
+    payload, status = await controller.recent_deliveries()
+    assert status == 500
+    assert "items" not in payload
 
 
 @pytest.mark.asyncio

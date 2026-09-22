@@ -379,6 +379,10 @@ async def test_false_send_retains_cursor_and_recovers(
         ["101", "102", "103"] if collective else ["101", "102"]
     )
     assert all(ids for _, ids in calls)
+    histories = {umo: [item["tweet_id"] for item in config.get("recent_deliveries", [])]
+                 for umo, config in author["subscribers"].items()}
+    assert histories["bad"] == ["101"]
+    assert histories["good"] == (["103", "102", "101"] if collective else ["102", "101"])
     if not collective:
         assert all("103" not in ids for _, ids in calls)
 
@@ -1760,3 +1764,87 @@ async def test_processed_tweet_history_is_bounded_and_legacy_safe(plugin_module)
     assert len(store["tester"]["processed_tweet_ids"]) == 500
     assert store["tester"]["processed_tweet_ids"][0] == "6"
     assert store["tester"]["processed_tweet_ids"][-1] == "505"
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_node,collective", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("outcome", ["success", "cancel_before_save", "cancel_after_save", "failure"])
+async def test_delivery_history_and_cursor_share_one_write(plugin_module, use_node, collective, outcome):
+    store = {"twitter_subs": {"tester": {
+        "since_id": "100", "processed_tweet_ids": ["100"],
+        "subscribers": {"group": {"status": True}},
+    }}}
+    before = copy.deepcopy(store)
+    entered, release = asyncio.Event(), asyncio.Event()
+    writes, sends = [], []
+
+    async def get_kv(key, default):
+        return store.get(key, default)  # Also exercise getters returning live objects.
+
+    async def put_kv(key, value):
+        writes.append((key, copy.deepcopy(value)))
+        entered.set()
+        await release.wait()
+        if outcome == "failure":
+            raise OSError("KV unavailable")
+        store[key] = copy.deepcopy(value)
+        if outcome == "cancel_after_save":
+            raise asyncio.CancelledError
+
+    async def send_message(_umo, _message):
+        sends.append(True)
+        return True
+
+    async def timeline(_username, since_id):
+        return [{"tweet_id": "101", "username": "tester"}] if since_id == "100" else []
+
+    async def get_tweet(_username, tweet_id):
+        return {"status": True, "tweet_id": tweet_id, "text": "body"}
+
+    plugin = plugin_module.TwitterPlugin(types.SimpleNamespace(send_message=send_message), {
+        "twitter_use_node": use_node, "twitter_collective_forward": collective,
+        "twitter_deduplicate_retweets": False,
+    })
+    plugin.get_kv_data, plugin.put_kv_data = get_kv, put_kv
+    plugin.twitter_api.get_user_timeline_items = timeline
+    plugin.twitter_api.get_tweet = get_tweet
+
+    async def run_poll():
+        await plugin.polling_service.check_user("tester", copy.deepcopy(store["twitter_subs"]["tester"]))
+        await plugin.polling_service.flush_pending_collective()
+
+    task = asyncio.create_task(run_poll())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert sends == [True]
+        assert len(writes) == 1
+        key, candidate = writes[0]
+        assert key == "twitter_subs"
+        author = candidate["tester"]
+        assert author["since_id"] == "101"  # Old code first writes history with cursor 100.
+        assert author["processed_tweet_ids"] == ["100", "101"]
+        assert author["subscribers"]["group"]["recent_deliveries"][0]["tweet_id"] == "101"
+        assert store == before  # No live cache mutation while the write is blocked.
+        if outcome == "cancel_before_save":
+            task.cancel()
+        else:
+            release.set()
+        if outcome.startswith("cancel"):
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif outcome == "failure" and collective:
+            with pytest.raises(OSError):
+                await task
+        else:
+            await task
+        assert len(writes) == 1
+        if outcome in {"failure", "cancel_before_save"}:
+            assert store == before
+        else:
+            assert store["twitter_subs"]["tester"] == author
+            # A restarted poll sees the committed cursor and never sends it again.
+            await run_poll()
+            assert sends == [True]
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

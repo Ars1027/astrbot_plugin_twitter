@@ -180,6 +180,66 @@ def _delivery_settings(plugin_module, **overrides):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["plain", "node", "collective"])
+@pytest.mark.parametrize("mode", ["success", "failure", "fallback", "empty", "history_error"])
+async def test_recent_history_records_only_actual_session_success(
+    plugin_module, transport, mode
+):
+    collective = transport == "collective"
+    history = []
+    subscriptions_data = {"tester": {"subscribers": {
+        "good": {"status": True}, "bad": {"status": True},
+        "paused": {"status": False},
+    }}}
+
+    class Subscriptions:
+        async def get_all(self):
+            return subscriptions_data
+
+        async def get_retweet_seen(self):
+            return {}
+
+        async def record_delivery(self, umo, username, tweet_info):
+            if mode == "history_error":
+                raise OSError("history unavailable")
+            history.append((umo, username, tweet_info["tweet_id"]))
+
+    class Messages:
+        build_nickname = staticmethod(lambda username, _name: username)
+
+        async def maybe_translate(self, *_args, **_kwargs):
+            return None, None
+
+        async def build_message_chain(self, *_args, **_kwargs):
+            return [] if mode == "empty" else [Plain("tweet")]
+
+    async def send(umo, message):
+        if umo == "bad" or mode == "failure":
+            return False
+        if mode == "fallback" and isinstance(message.chain[0], Nodes):
+            return False
+        return True
+
+    delivery = plugin_module.TweetDeliveryService(
+        types.SimpleNamespace(send_message=send), Subscriptions(), Messages(),
+        _delivery_settings(plugin_module, use_node=transport != "plain", collective_forward=collective),
+    )
+    result = await delivery.push_to_subscribers("tester", {"tweet_id": "123", "text": "tweet"})
+    contract = _delivery_contract(plugin_module)
+    if collective:
+        assert result.state is contract.DeliveryState.QUEUED
+        assert history == []  # Merely queued is not a delivery.
+        result = await delivery.flush_collected()
+    assert history == []  # Polling persists summaries with its cursor, not during send.
+    assert [(item.umo, item.username, item.record["tweet_id"]) for item in result.recent_deliveries] == (
+        [] if mode in {"failure", "empty"} else [("good", "tester", "123")]
+    )
+    # A recording failure must not turn a successful send into a failed send.
+    if mode == "history_error":
+        assert await delivery.send_to_subscriber("good", "tester", {}, {}, "Tester")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["plain", "image", "node", "video"])
 @pytest.mark.parametrize("outcome", [False, True, None, "fallback"])
 async def test_send_return_values_and_fallback(plugin_module, mode, outcome):
