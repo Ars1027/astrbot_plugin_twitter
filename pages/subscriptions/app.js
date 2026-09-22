@@ -1,4 +1,5 @@
 import { parseBatch, BatchQueue } from "./batch.mjs";
+import { element as el, emptyState } from "./dom.mjs";
 
 const bridge = window.AstrBotPluginPage;
 
@@ -53,17 +54,9 @@ function busy() {
 
 function syncBusy() {
   document.querySelectorAll(".page-shell button, .page-shell input").forEach((control) => {
-    control.disabled = Boolean(busy());
+    // Dialogs manage their own controls, including the active batch stop button.
+    if (!control.closest("dialog")) control.disabled = Boolean(busy());
   });
-}
-
-function escapeHtml(value) {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
 }
 
 function showToast(message, isError = false) {
@@ -148,182 +141,94 @@ function renderRuntime() {
 
 function renderSessionList() {
   const sessions = filteredSessions();
-  elements.sessionSearch.placeholder = state.view === "groups"
-    ? "搜索群名或群号"
-    : "搜索会话";
-
+  const isGroup = state.view === "groups";
+  elements.sessionSearch.placeholder = isGroup ? "搜索群名或群号" : "搜索会话";
   if (!sessions.length) {
-    const title = state.search ? "没有匹配结果" : state.view === "groups" ? "暂无群聊" : "暂无其他会话";
-    elements.sessionList.innerHTML = `
-      <div class="list-empty">
-        <strong>${title}</strong>
-        <span>${state.search ? "请尝试其他关键词" : "当前没有可管理的会话"}</span>
-      </div>
-    `;
+    elements.sessionList.replaceChildren(emptyState(
+      state.search ? "没有匹配结果" : isGroup ? "暂无群聊" : "暂无其他会话",
+      state.search ? "请尝试其他关键词" : "当前没有可管理的会话", "list-empty"));
     return;
   }
-
-  elements.sessionList.innerHTML = sessions
-    .map((session) => {
-      const isGroup = state.view === "groups";
-      const name = isGroup ? session.group_name : session.session_name;
-      const id = isGroup ? session.group_id : session.session_id;
-      const unavailable = isGroup && !session.available;
-      return `
-        <button
-          class="session-item ${session.umo === state.selectedUmo ? "is-active" : ""}"
-          aria-current="${session.umo === state.selectedUmo ? "true" : "false"}"
-          type="button"
-          data-umo="${escapeHtml(session.umo)}"
-        >
-          <span class="session-avatar" aria-hidden="true">${isGroup ? "#" : "@"}</span><span class="session-copy">
-            <span class="session-name">${escapeHtml(name)}</span>
-            <span class="session-meta">
-              ${escapeHtml(id)} · ${escapeHtml(session.platform_id)}${unavailable ? ' · <span class="availability-mark">未连接</span>' : ""}
-            </span>
-          </span>
-          <span class="session-count">${session.subscriptions.length}</span>
-        </button>
-      `;
-    })
-    .join("");
+  elements.sessionList.replaceChildren(...sessions.map((session) => {
+    const active = session.umo === state.selectedUmo;
+    return el("button", {
+      class: `session-item ${active ? "is-active" : ""}`, type: "button",
+      "aria-current": String(active), "data-umo": session.umo,
+    },
+    el("span", { class: "session-avatar", "aria-hidden": "true" }, isGroup ? "#" : "@"),
+    el("span", { class: "session-copy" },
+      el("span", { class: "session-name" }, isGroup ? session.group_name : session.session_name),
+      el("span", { class: "session-meta" },
+        `${isGroup ? session.group_id : session.session_id} · ${session.platform_id}`,
+        isGroup && !session.available ? el("span", { class: "availability-mark" }, " · 未连接") : null)),
+    el("span", { class: "session-count" }, session.subscriptions.length));
+  }));
 }
 
 function subscriptionRow(session, subscription) {
-  return `
-    <div class="subscription-row" data-username="${escapeHtml(subscription.username)}">
-      <button class="author-cell author-open" type="button" data-show-history data-umo="${escapeHtml(session.umo)}" data-username="${escapeHtml(subscription.username)}" aria-label="查看 @${escapeHtml(subscription.username)} 的最近推送">
-        <span class="author-avatar" aria-hidden="true">${escapeHtml(Array.from(subscription.screen_name || subscription.username)[0])}</span>
-        <span class="author-copy"><span class="author-name">${escapeHtml(subscription.screen_name)}</span>
-        <span class="author-handle">@${escapeHtml(subscription.username)} <span class="history-link">最近推送 ↗</span></span></span>
-      </button>
-      <label class="switch-field">
-        <input
-          type="checkbox"
-          data-subscription-field="enabled"
-          data-umo="${escapeHtml(session.umo)}"
-          data-username="${escapeHtml(subscription.username)}"
-          ${subscription.enabled ? "checked" : ""}
-        />
-        <span>推送</span>
-      </label>
-      <label class="switch-field">
-        <input
-          type="checkbox"
-          data-subscription-field="r18"
-          data-umo="${escapeHtml(session.umo)}"
-          data-username="${escapeHtml(subscription.username)}"
-          ${subscription.r18 ? "checked" : ""}
-        />
-        <span>R18</span>
-      </label>
-      <label class="switch-field">
-        <input
-          type="checkbox"
-          data-subscription-field="media_only"
-          data-umo="${escapeHtml(session.umo)}"
-          data-username="${escapeHtml(subscription.username)}"
-          ${subscription.media_only ? "checked" : ""}
-        />
-        <span>仅媒体</span>
-      </label>
-      <button
-        class="remove-button"
-        type="button"
-        data-remove-subscription
-        data-umo="${escapeHtml(session.umo)}"
-        data-username="${escapeHtml(subscription.username)}"
-        data-screen-name="${escapeHtml(subscription.screen_name)}"
-        title="移除订阅"
-        aria-label="移除 @${escapeHtml(subscription.username)}"
-      >×</button>
-    </div>
-  `;
+  const target = { "data-umo": session.umo, "data-username": subscription.username };
+  return el("div", { class: "subscription-row", "data-username": subscription.username },
+    el("button", { class: "author-cell author-open", type: "button", "data-show-history": true,
+      ...target, "aria-label": `查看 @${subscription.username} 的最近推送` },
+      el("span", { class: "author-avatar", "aria-hidden": "true" },
+        Array.from(subscription.screen_name || subscription.username)[0]),
+      el("span", { class: "author-copy" },
+        el("span", { class: "author-name" }, subscription.screen_name),
+        el("span", { class: "author-handle" }, `@${subscription.username} `,
+          el("span", { class: "history-link" }, "最近推送 ↗")))),
+    ...[["enabled", "推送"], ["r18", "R18"], ["media_only", "仅媒体"]].map(([field, label]) =>
+      el("label", { class: "switch-field" },
+        el("input", { type: "checkbox", "data-subscription-field": field,
+          ...target, checked: Boolean(subscription[field]) }), el("span", {}, label))),
+    el("button", { class: "remove-button", type: "button", "data-remove-subscription": true,
+      ...target, "data-screen-name": subscription.screen_name, title: "移除订阅",
+      "aria-label": `移除 @${subscription.username}` }, "×"));
 }
 
 function renderDetail() {
   const session = selectedSession();
   if (!session) {
-    elements.detailView.innerHTML = `
-      <div class="detail-empty">
-        <strong>未选择会话</strong>
-        <span>从列表中选择一个会话</span>
-      </div>
-    `;
+    elements.detailView.replaceChildren(emptyState("未选择会话", "从列表中选择一个会话"));
     return;
   }
-
   const isGroup = state.view === "groups";
   const name = isGroup ? session.group_name : session.session_name;
   const id = isGroup ? session.group_id : session.session_id;
   const allEnabled = session.subscriptions.length > 0 && session.subscriptions.every((item) => item.enabled);
   const groupSwitch = isGroup && session.subscriptions.length
-    ? `
-      <label class="group-switch">
-        <input
-          id="group-status"
-          type="checkbox"
-          data-umo="${escapeHtml(session.umo)}"
-          ${allEnabled ? "checked" : ""}
-        />
-        <span>全部推送</span>
-      </label>
-    `
-    : "";
-
-  let addSection = "";
+    ? el("label", { class: "group-switch" },
+      el("input", { id: "group-status", type: "checkbox", "data-umo": session.umo, checked: allEnabled }),
+      el("span", {}, "全部推送")) : null;
+  let addSection = null;
   if (isGroup) {
     addSection = session.available
-      ? `
-        <section class="add-section">
-          <div class="section-title">添加推主<span class="muted">订阅从最新推文开始</span></div>
-          <form class="add-form" id="add-form" data-umo="${escapeHtml(session.umo)}">
-            <input
-              name="username"
-              type="text"
-              maxlength="16"
-              autocomplete="off"
-              placeholder="推主用户名，例如 elonmusk"
-              aria-label="推主用户名"
-              required
-            />
-            <label class="option-check">
-              <input name="r18" type="checkbox" />
-              <span>R18</span>
-            </label>
-            <label class="option-check">
-              <input name="media_only" type="checkbox" />
-              <span>仅媒体</span>
-            </label>
-            <button class="primary-button" type="submit">添加订阅</button>
-            <button class="secondary-button" type="button" id="open-batch">批量添加</button>
-          </form>
-        </section>
-      `
-      : `
-        <section class="add-section">
-          <p class="unavailable-note">机器人当前未连接到这个群，暂不能新增订阅。</p>
-        </section>
-      `;
+      ? el("section", { class: "add-section" },
+        el("div", { class: "section-title" }, "添加推主",
+          el("span", { class: "muted" }, "订阅从最新推文开始")),
+        el("form", { class: "add-form", id: "add-form", "data-umo": session.umo },
+          el("input", { name: "username", type: "text", maxlength: "16", autocomplete: "off",
+            placeholder: "推主用户名，例如 elonmusk", "aria-label": "推主用户名", required: true }),
+          ...[["r18", "R18"], ["media_only", "仅媒体"]].map(([field, label]) =>
+            el("label", { class: "option-check" },
+              el("input", { name: field, type: "checkbox" }), el("span", {}, label))),
+          el("button", { class: "primary-button", type: "submit" }, "添加订阅"),
+          el("button", { class: "secondary-button", type: "button", id: "open-batch" }, "批量添加")))
+      : el("section", { class: "add-section" },
+        el("p", { class: "unavailable-note" }, "机器人当前未连接到这个群，暂不能新增订阅。"));
   }
-
-  elements.detailView.innerHTML = `
-    <header class="detail-header">
-      <div class="detail-heading">
-        <h2>${escapeHtml(name)}</h2>
-        <p><span class="type-badge">${isGroup ? "群聊" : "其他会话"}</span>${escapeHtml(id)} · ${escapeHtml(session.platform_id)}</p>
-      </div>
-      ${groupSwitch}
-    </header>
-    ${addSection}
-    <section class="subscription-section">
-      <div class="subscription-heading">
-        <div class="section-title">订阅名单 <span class="count-badge">${session.subscriptions.length}</span></div>
-        <label class="author-search"><span class="visually-hidden">搜索推主</span><input id="author-search" type="search" placeholder="搜索名称或 @用户名" value="${escapeHtml(state.authorSearch)}" /></label>
-      </div>
-      <div class="subscription-list" id="subscription-list"></div>
-    </section>
-  `;
+  elements.detailView.replaceChildren(
+    el("header", { class: "detail-header" },
+      el("div", { class: "detail-heading" }, el("h2", {}, name),
+        el("p", {}, el("span", { class: "type-badge" }, isGroup ? "群聊" : "其他会话"),
+          `${id} · ${session.platform_id}`)), groupSwitch),
+    ...(addSection ? [addSection] : []),
+    el("section", { class: "subscription-section" },
+      el("div", { class: "subscription-heading" },
+        el("div", { class: "section-title" }, "订阅名单 ",
+          el("span", { class: "count-badge" }, session.subscriptions.length)),
+        el("label", { class: "author-search" }, el("span", { class: "visually-hidden" }, "搜索推主"),
+          el("input", { id: "author-search", type: "search", placeholder: "搜索名称或 @用户名", value: state.authorSearch }))),
+      el("div", { class: "subscription-list", id: "subscription-list" })));
   renderSubscriptions();
   syncBusy();
 }
@@ -335,9 +240,13 @@ function renderSubscriptions() {
   const query = state.authorSearch.trim().replace(/^@/, "").toLowerCase();
   const matches = session.subscriptions.filter((item) =>
     `${item.username} ${item.screen_name}`.toLowerCase().includes(query));
-  list.innerHTML = matches.length
-    ? matches.map((item) => subscriptionRow(session, item)).join("")
-    : `<div class="detail-empty"><span class="empty-icon" aria-hidden="true">${query ? "⌕" : "+"}</span><strong>${query ? "没有匹配的推主" : "从第一位推主开始"}</strong><span>${query ? "试试其他名称或用户名" : "添加订阅后，就能在这里管理推送偏好。"}</span></div>`;
+  if (matches.length) list.replaceChildren(...matches.map((item) => subscriptionRow(session, item)));
+  else {
+    const empty = emptyState(query ? "没有匹配的推主" : "从第一位推主开始",
+      query ? "试试其他名称或用户名" : "添加订阅后，就能在这里管理推送偏好。");
+    empty.prepend(el("span", { class: "empty-icon", "aria-hidden": "true" }, query ? "⌕" : "+"));
+    list.replaceChildren(empty);
+  }
   syncBusy();
 }
 
@@ -366,8 +275,8 @@ async function loadOverview({ announce = false } = {}) {
   } catch (error) {
     setError(error?.message || "读取订阅数据失败");
     if (!state.overview) {
-      elements.sessionList.innerHTML = '<div class="list-empty"><strong>暂时无法读取会话</strong><span>点击顶部刷新重试</span></div>';
-      elements.detailView.innerHTML = '<div class="detail-empty"><strong>订阅数据加载失败</strong><span>请检查连接后刷新页面。</span></div>';
+      elements.sessionList.replaceChildren(emptyState("暂时无法读取会话", "点击顶部刷新重试", "list-empty"));
+      elements.detailView.replaceChildren(emptyState("订阅数据加载失败", "请检查连接后刷新页面。"));
     }
     if (announce) showToast("刷新失败", true);
     return false;
@@ -568,11 +477,12 @@ function renderBatch() {
   else if (state.batch?.stopRequested && !state.batchPreparing) batch.summary.textContent += " · 已停止后续添加";
   if (!state.batch && draft.overLimit) batch.summary.textContent += " · 超过 100 个账号，请分批添加";
   batch.summary.classList.toggle("is-error", !state.batch && draft.overLimit);
-  batch.entries.innerHTML = entries.length ? entries.map((entry) => `
-    <div class="batch-entry" data-status="${entry.status}">
-      <span class="batch-entry-name">${escapeHtml(entry.input)}</span><span class="result-badge">${labels[entry.status]}</span>
-      ${entry.error ? `<p>${escapeHtml(entry.error)}；请核对订阅后再重试。</p>` : ""}
-    </div>`).join("") : '<div class="batch-placeholder">粘贴用户名后，会在这里自动检查并去重。</div>';
+  batch.entries.replaceChildren(...(entries.length ? entries.map((entry) =>
+    el("div", { class: "batch-entry", "data-status": entry.status },
+      el("span", { class: "batch-entry-name" }, entry.input),
+      el("span", { class: "result-badge" }, labels[entry.status]),
+      entry.error ? el("p", {}, `${entry.error}；请核对订阅后再重试。`) : null))
+    : [el("div", { class: "batch-placeholder" }, "粘贴用户名后，会在这里自动检查并去重。")]));
   batch.progress.hidden = !state.batch;
   batch.progress.max = Math.max(1, entries.filter((entry) => !["invalid", "duplicate"].includes(entry.status)).length);
   batch.progress.value = counts.added + counts.existing + counts.failed;
@@ -686,21 +596,23 @@ async function loadHistory() {
   const requestId = ++state.historyRequest;
   historyRefresh.disabled = true;
   historyContent.setAttribute("aria-busy", "true");
-  historyContent.innerHTML = '<div class="detail-empty"><strong>正在读取推送记录</strong></div>';
+  historyContent.replaceChildren(emptyState("正在读取推送记录", ""));
   try {
     const result = await bridge.apiPost("subscriptions/recent", { ...state.historyTarget });
     if (requestId !== state.historyRequest) return;
-    historyContent.innerHTML = result.items.length ? result.items.map((item, index) => {
+    historyContent.replaceChildren(...(result.items.length ? result.items.map((item, index) => {
       const deliveredAt = new Date(item.delivered_at);
       const time = Number.isNaN(deliveredAt.getTime()) ? "时间未知" : deliveredAt.toLocaleString();
       const link = /^[0-9]+$/.test(item.tweet_id)
-        ? `<a class="history-original" href="https://x.com/i/status/${item.tweet_id}" target="_blank" rel="noopener noreferrer">查看原帖 ↗</a>` : "";
-      return `<article class="history-entry">
-        <div class="history-meta"><span class="type-badge">${index ? `第 ${index + 1} 条` : "最新推送"}</span><time>${escapeHtml(time)}</time>${item.is_retweet ? '<span class="muted">转帖</span>' : ""}</div>
-        <p class="history-text">${escapeHtml(item.text || "这条推文没有文字内容，请打开原帖查看。")}</p>
-        ${item.truncated ? '<p class="field-hint">此处仅显示前 500 字符摘要。</p>' : ""}${link}
-      </article>`;
-    }).join("") : '<div class="detail-empty"><strong>暂无推送记录</strong><span>该订阅后续成功推送后，记录会显示在这里。旧游标和已处理 ID 不会补作历史推送。</span></div>';
+        ? el("a", { class: "history-original", href: `https://x.com/i/status/${item.tweet_id}`,
+          target: "_blank", rel: "noopener noreferrer" }, "查看原帖 ↗") : null;
+      return el("article", { class: "history-entry" },
+        el("div", { class: "history-meta" },
+          el("span", { class: "type-badge" }, index ? `第 ${index + 1} 条` : "最新推送"),
+          el("time", {}, time), item.is_retweet ? el("span", { class: "muted" }, "转帖") : null),
+        el("p", { class: "history-text" }, item.text || "这条推文没有文字内容，请打开原帖查看。"),
+        item.truncated ? el("p", { class: "field-hint" }, "此处仅显示前 500 字符摘要。") : null, link);
+    }) : [emptyState("暂无推送记录", "该订阅后续成功推送后，记录会显示在这里。旧游标和已处理 ID 不会补作历史推送。")]));
   } catch (error) {
     if (requestId !== state.historyRequest) return;
     historyContent.textContent = error?.message || "读取推送记录失败，请重试";
@@ -723,7 +635,7 @@ async function start() {
   if (!bridge) {
     setError("当前页面未运行在 AstrBot Dashboard 中。" );
     elements.workspace.setAttribute("aria-busy", "false");
-    elements.detailView.innerHTML = '<div class="detail-empty"><strong>请从 AstrBot Dashboard 打开</strong><span>在插件详情中进入「Twitter 订阅管理」。</span></div>';
+    elements.detailView.replaceChildren(emptyState("请从 AstrBot Dashboard 打开", "在插件详情中进入「Twitter 订阅管理」。"));
     syncBusy();
     return;
   }
