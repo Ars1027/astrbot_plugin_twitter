@@ -12,7 +12,7 @@ from ..twitter_api import (
     FxTwitterTimelineError,
     get_next_website,
 )
-from .subscription_service import SubscriptionService
+from .subscription_service import RecentDelivery, SubscriptionService
 from .tweet_delivery_service import (
     DeliveryResult,
     DeliveryState,
@@ -76,6 +76,7 @@ class PollingService:
         self,
         username: str,
         tweet_id: str,
+        recent_deliveries: tuple[RecentDelivery, ...] = (),
     ) -> None:
         """普通模式立即落盘，集体转发模式延迟到实际发送后。"""
         if getattr(self.delivery, "collective_enabled", False):
@@ -85,7 +86,17 @@ class PollingService:
             username,
             [tweet_id],
             tweet_id,
+            **({"recent_deliveries": recent_deliveries} if recent_deliveries else {}),
         )
+
+    async def _save_partial_history(self, deliveries: tuple[RecentDelivery, ...]) -> None:
+        """部分会话成功但不能推进游标时，尽力保存实际发送记录。"""
+        if not deliveries:
+            return
+        try:
+            await self.subscriptions.save_recent_deliveries(deliveries)
+        except Exception as exc:
+            logger.warning(f"保存最近推送记录失败: {exc}")
 
     async def flush_pending_collective(self) -> None:
         """发送集体转发缓存，并只提交发送成功推主的候选游标。"""
@@ -105,6 +116,7 @@ class PollingService:
             self.delivery.clear_collected()
             return
 
+        recent_deliveries = flush_result.recent_deliveries
         for username, tweet_id in pending_cursors.items():
             if username in flush_result.failed_authors:
                 logger.warning(
@@ -115,7 +127,15 @@ class PollingService:
                 username,
                 pending_tweet_ids.get(username, []),
                 tweet_id,
+                **({"recent_deliveries": tuple(
+                    item for item in recent_deliveries if item.username == username
+                )} if recent_deliveries else {}),
             )
+        # Never put a separate history write ahead of successful authors' cursors.
+        await self._save_partial_history(tuple(
+            item for item in recent_deliveries
+            if item.username in flush_result.failed_authors or item.username not in pending_cursors
+        ))
 
     @staticmethod
     def attach_timeline_item_metadata(tweet_info: dict, item: dict) -> None:
@@ -272,9 +292,10 @@ class PollingService:
                         f"@{username} 推文发送失败，保留游标等待重试: "
                         f"{tweet_id}"
                     )
+                    await self._save_partial_history(delivery_result.recent_deliveries)
                     break
 
-                await self._record_processed_cursor(username, tweet_id)
+                await self._record_processed_cursor(username, tweet_id, delivery_result.recent_deliveries)
                 processed_tweet_ids.add(tweet_id)
                 if delivery_result.counts_toward_limit:
                     pushed_count += 1

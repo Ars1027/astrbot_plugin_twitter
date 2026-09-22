@@ -114,6 +114,31 @@
       assert(calls.length === 2, "移动布局后停止仍不能调度后续请求");
       pass("弹窗内嵌布局下仍保留停止能力");
 
+      for (const settleWhileHidden of [true, false]) {
+        select("#batch-reset").click();
+        fill("#batch-input", settleWhileHidden ? "hidden_one hidden_two" : "return_one return_two");
+        finishRequest = null;
+        const beforeCalls = calls.length;
+        select("#batch-start").click();
+        await waitFor(() => Boolean(finishRequest));
+        window.dispatchEvent(new PageTransitionEvent("pagehide", {persisted: true}));
+        if (settleWhileHidden) {
+          finishRequest();
+          // Let the request and executeBatch finally settle while UI updates are suppressed.
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+        window.dispatchEvent(new PageTransitionEvent("pageshow", {persisted: true}));
+        if (!settleWhileHidden) {
+          assert(select("#batch-close").disabled, "返回时仍在请求中应继续锁定弹窗");
+          finishRequest();
+        }
+        await waitFor(() => !select("#batch-close").disabled && !select(".session-item").disabled);
+        assert(!select("#batch-retry").hidden, "恢复后应能重试未执行项");
+        assert(calls.length === beforeCalls + 1, "页面恢复不能自动重启队列");
+        assert(document.querySelectorAll('.batch-entry[data-status="pending"]').length === 1, "恢复后保留未执行项");
+        pass(settleWhileHidden ? "隐藏期间请求完成后恢复控件" : "恢复后等待当前请求结束再解锁");
+      }
+
       select("#batch-reset").click();
       fill("#batch-input", "failed_user");
       failNext = true;

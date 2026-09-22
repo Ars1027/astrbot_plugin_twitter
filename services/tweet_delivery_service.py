@@ -9,7 +9,7 @@ from astrbot.api.event import MessageChain
 import astrbot.api.message_components as Comp
 from astrbot.api.message_components import Node, Nodes
 
-from .subscription_service import SubscriptionService
+from .subscription_service import RecentDelivery, SubscriptionService
 from .tweet_message_service import TranslationCycleState, TweetMessageService
 
 
@@ -42,9 +42,10 @@ class DeliveryState(Enum):
 
 @dataclass(frozen=True, slots=True)
 class DeliveryResult:
-    """轮询层据此决定是否计数、停止或推进游标。"""
+    """轮询状态及未落盘的成功会话摘要，由轮询层与游标一起提交。"""
 
     state: DeliveryState
+    recent_deliveries: tuple[RecentDelivery, ...] = ()
 
     @property
     def counts_toward_limit(self) -> bool:
@@ -56,10 +57,11 @@ class DeliveryResult:
 
 @dataclass(frozen=True, slots=True)
 class CollectiveFlushResult:
-    """集体转发完成后各推主的发送结果。"""
+    """集体转发结果及成功会话摘要；失败推主的摘要也须保留。"""
 
     successful_authors: frozenset[str]
     failed_authors: frozenset[str]
+    recent_deliveries: tuple[RecentDelivery, ...] = ()
 
 
 @dataclass(slots=True)
@@ -197,10 +199,16 @@ class TweetDeliveryService:
             raise RuntimeError("Context.send_message returned False")
 
     async def _record_recent_delivery(
-        self, umo: str, username: str, tweet_info: dict
+        self, umo: str, username: str, tweet_info: dict,
+        recent_deliveries: list[RecentDelivery] | None = None,
     ) -> None:
         try:
-            await self.subscriptions.record_delivery(umo, username, tweet_info)
+            if recent_deliveries is None:
+                await self.subscriptions.record_delivery(umo, username, tweet_info)
+            else:
+                record = SubscriptionService.prepare_delivery(umo, username, tweet_info)
+                if record is not None:
+                    recent_deliveries.append(record)
         except Exception as exc:
             # History is observational; its failure must not trigger a resend.
             logger.warning(f"保存最近推送记录失败 {umo} -> @{username}: {exc}")
@@ -312,7 +320,7 @@ class TweetDeliveryService:
         tweet_info: dict,
         cycle: TranslationCycleState | None = None,
     ) -> DeliveryResult:
-        """将推文推送给订阅者，或加入集体转发缓存。"""
+        """推送或加入集体缓存；返回实际成功的摘要，不单独写历史 KV。"""
         latest_subs = await self.subscriptions.get_all()
         if username not in latest_subs:
             return DeliveryResult(DeliveryState.SKIPPED)
@@ -360,6 +368,7 @@ class TweetDeliveryService:
             )
 
         had_target = False
+        recent_deliveries: list[RecentDelivery] = []
         delivery_failed = False
         retweet_dedup_dirty = False
         for umo, sub_config in subscribers.items():
@@ -420,6 +429,7 @@ class TweetDeliveryService:
                 nickname,
                 translated_text=translated_text,
                 translate_model=translate_model,
+                recent_deliveries=recent_deliveries,
             )
             if not sent:
                 delivery_failed = True
@@ -436,12 +446,12 @@ class TweetDeliveryService:
             await self.subscriptions.save_retweet_seen(retweet_dedup_seen)
 
         if delivery_failed:
-            return DeliveryResult(DeliveryState.FAILED)
+            return DeliveryResult(DeliveryState.FAILED, tuple(recent_deliveries))
         if not had_target:
             return DeliveryResult(DeliveryState.SKIPPED)
         if self.collective_enabled:
             return DeliveryResult(DeliveryState.QUEUED)
-        return DeliveryResult(DeliveryState.DELIVERED)
+        return DeliveryResult(DeliveryState.DELIVERED, tuple(recent_deliveries))
 
     async def send_to_subscriber(
         self,
@@ -452,8 +462,15 @@ class TweetDeliveryService:
         nickname: str,
         translated_text: str | None = None,
         translate_model: str | None = None,
+        *,
+        recent_deliveries: list[RecentDelivery] | None = None,
     ) -> bool:
-        """向单个订阅者发送推文消息。"""
+        """向单个订阅者发送推文，成功后尽力记录最近历史。
+
+        轮询传入 recent_deliveries 时只追加内存摘要，由调用方与游标一起
+        持久化；直接调用未传入时会写入 KV。历史生成或单独写入失败只记
+        告警，不改变发送结果；任务取消仍向上传播。
+        """
         try:
             chain = await self.messages.build_message_chain(
                 username,
@@ -505,7 +522,7 @@ class TweetDeliveryService:
                 sent = primary_sent if plain_chain else any(video_results)
 
             if sent:
-                await self._record_recent_delivery(umo, username, tweet_info)
+                await self._record_recent_delivery(umo, username, tweet_info, recent_deliveries)
                 logger.info(f"推文已推送至 {umo}")
             else:
                 logger.error(f"推文主要内容未能推送至 {umo}")
@@ -515,7 +532,7 @@ class TweetDeliveryService:
             return False
 
     async def flush_collected(self) -> CollectiveFlushResult:
-        """发送集体转发缓存，并按推主汇总最终结果。"""
+        """发送集体缓存，返回按推主汇总的结果和待持久化的成功摘要。"""
         if not self._collected_tweets:
             self._pending_retweet_seen.clear()
             return CollectiveFlushResult(frozenset(), frozenset())
@@ -531,6 +548,7 @@ class TweetDeliveryService:
         retweet_seen = await self.subscriptions.get_retweet_seen()
         retweet_seen_dirty = False
         retweet_seen_authors: set[str] = set()
+        recent_deliveries: list[RecentDelivery] = []
 
         def record_result(
             umo: str,
@@ -669,6 +687,7 @@ class TweetDeliveryService:
                                 cached_tweet.nickname,
                                 translated_text=cached_tweet.translated_text,
                                 translate_model=cached_tweet.translate_model,
+                                recent_deliveries=recent_deliveries,
                             )
                             record_result(umo, cached_tweet, sent)
                         continue
@@ -681,7 +700,8 @@ class TweetDeliveryService:
                         succeeded = bool(tweet_nodes) or any(video_results)
                         if succeeded:
                             await self._record_recent_delivery(
-                                umo, cached_tweet.username, cached_tweet.tweet_info
+                                umo, cached_tweet.username, cached_tweet.tweet_info,
+                                recent_deliveries,
                             )
                         record_result(umo, cached_tweet, succeeded)
 
@@ -705,4 +725,4 @@ class TweetDeliveryService:
             for username, succeeded in author_success.items()
             if not succeeded
         )
-        return CollectiveFlushResult(successful_authors, failed_authors)
+        return CollectiveFlushResult(successful_authors, failed_authors, tuple(recent_deliveries))

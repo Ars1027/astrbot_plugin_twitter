@@ -569,7 +569,13 @@ window.addEventListener("pagehide", () => {
   state.leaving = true;
   state.batch?.stop();
 });
-window.addEventListener("pageshow", () => { state.leaving = false; });
+window.addEventListener("pageshow", (event) => {
+  state.leaving = false;
+  if (!event.persisted) return;
+  // A request may have settled while hidden and skipped its final UI update.
+  renderBatch();
+  loadOverview();
+});
 document.querySelectorAll("[data-view]").forEach((button, index, tabs) => {
   button.addEventListener("keydown", (event) => {
     if (busy() || !["ArrowLeft", "ArrowRight"].includes(event.key)) return;

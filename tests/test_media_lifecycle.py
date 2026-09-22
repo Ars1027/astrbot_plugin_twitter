@@ -229,9 +229,11 @@ async def test_recent_history_records_only_actual_session_success(
     if collective:
         assert result.state is contract.DeliveryState.QUEUED
         assert history == []  # Merely queued is not a delivery.
-        await delivery.flush_collected()
-    assert history == ([] if mode in {"failure", "empty", "history_error"}
-                       else [("good", "tester", "123")])
+        result = await delivery.flush_collected()
+    assert history == []  # Polling persists summaries with its cursor, not during send.
+    assert [(item.umo, item.username, item.record["tweet_id"]) for item in result.recent_deliveries] == (
+        [] if mode in {"failure", "empty"} else [("good", "tester", "123")]
+    )
     # A recording failure must not turn a successful send into a failed send.
     if mode == "history_error":
         assert await delivery.send_to_subscriber("good", "tester", {}, {}, "Tester")
