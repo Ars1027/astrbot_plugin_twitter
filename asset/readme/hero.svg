@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="420" viewBox="0 0 1200 420" role="img" aria-labelledby="hero-title hero-desc">
+  <title id="hero-title">Twitter / X 推文订阅与转发</title>
+  <desc id="hero-desc">AstrBot 插件从 Nitter 或 FxTwitter 获取推文，处理后推送到多个独立订阅的聊天会话。</desc>
+
+  <rect width="1200" height="420" rx="28" fill="#0d1421"/>
+  <path d="M60 223H1140" stroke="#29384e" stroke-width="2"/>
+
+  <g id="identity" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+    <rect x="60" y="47" width="198" height="34" rx="17" fill="#213654"/>
+    <text x="81" y="70" fill="#b4d0ff" font-size="18" font-weight="700" letter-spacing="1.2">ASTRBOT PLUGIN</text>
+    <text x="58" y="145" fill="#f3f7ff" font-size="68" font-weight="750" letter-spacing="-2">Twitter / X</text>
+    <text x="485" y="143" fill="#8bb6ff" font-size="49" font-weight="700">推文订阅与转发</text>
+    <text x="62" y="194" fill="#b4c3d9" font-size="23">追踪推主更新，按会话推送到聊天</text>
+  </g>
+
+  <g id="sources" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+    <text x="62" y="260" fill="#91a6c3" font-size="18" font-weight="650">双数据源</text>
+    <rect x="60" y="278" width="285" height="94" rx="16" fill="#151f30" stroke="#3d5574" stroke-width="2"/>
+    <rect x="78" y="298" width="112" height="54" rx="10" fill="#213654"/>
+    <text x="134" y="332" text-anchor="middle" fill="#dceaff" font-size="23" font-weight="700">Nitter</text>
+    <rect x="199" y="298" width="128" height="54" rx="10" fill="#213654"/>
+    <text x="263" y="332" text-anchor="middle" fill="#dceaff" font-size="22" font-weight="700">FxTwitter</text>
+  </g>
+
+  <path d="M362 325H402" fill="none" stroke="#8bb6ff" stroke-width="3" stroke-linecap="round"/>
+  <path d="M394 318L402 325L394 332" fill="none" stroke="#8bb6ff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <g id="tweet-processing" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+    <text x="423" y="260" fill="#91a6c3" font-size="18" font-weight="650">推文处理</text>
+    <rect x="420" y="278" width="340" height="94" rx="16" fill="#edf3ff"/>
+    <circle cx="451" cy="311" r="15" fill="#2865db"/>
+    <text x="451" y="318" text-anchor="middle" fill="#fff" font-size="21" font-weight="700">X</text>
+    <text x="477" y="318" fill="#17243b" font-size="22" font-weight="700">新推文</text>
+    <rect x="626" y="297" width="111" height="29" rx="14.5" fill="#d5e4ff"/>
+    <text x="681" y="317" text-anchor="middle" fill="#1b50b9" font-size="18" font-weight="650">旧 → 新</text>
+    <path d="M439 345H649" stroke="#b7c6db" stroke-width="5" stroke-linecap="round"/>
+    <path d="M439 357H580" stroke="#c9d5e5" stroke-width="5" stroke-linecap="round"/>
+  </g>
+
+  <path d="M777 325H817" fill="none" stroke="#8bb6ff" stroke-width="3" stroke-linecap="round"/>
+  <path d="M809 318L817 325L809 332" fill="none" stroke="#8bb6ff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <g id="sessions" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif">
+    <text x="839" y="260" fill="#91a6c3" font-size="18" font-weight="650">独立会话订阅</text>
+    <rect x="837" y="278" width="303" height="94" rx="16" fill="#151f30" stroke="#3d5574" stroke-width="2"/>
+    <rect x="855" y="294" width="266" height="28" rx="9" fill="#213654"/>
+    <circle cx="872" cy="308" r="5" fill="#6ed4aa"/>
+    <text x="890" y="315" fill="#e4ecf7" font-size="19" font-weight="650">群聊 A</text>
+    <path d="M1000 308H1090" stroke="#4a6384" stroke-width="4" stroke-linecap="round"/>
+    <rect x="855" y="329" width="266" height="28" rx="9" fill="#213654"/>
+    <circle cx="872" cy="343" r="5" fill="#6ed4aa"/>
+    <text x="890" y="350" fill="#e4ecf7" font-size="19" font-weight="650">会话 B</text>
+    <path d="M1000 343H1090" stroke="#4a6384" stroke-width="4" stroke-linecap="round"/>
+  </g>
+</svg>
