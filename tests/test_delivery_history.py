@@ -176,3 +176,17 @@ async def test_unsubscribe_discards_pending_deliveries_and_ignores_late_results(
     assert data["twitter_subs"]["tester"]["subscribers"]["group-b"]["pending_delivery_ids"] == ["1000"]
     await service.add("group-a", "tester")
     assert "pending_delivery_ids" not in data["twitter_subs"]["tester"]["subscribers"]["group-a"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current_cursor,next_cursor", [("999", "1020"), ("1020", "1000")])
+async def test_cursor_commit_cleans_receipts_for_missing_timeline_items(store, current_cursor, next_cursor):
+    data, _get, _put, service = store
+    author = data["twitter_subs"]["tester"]
+    author["since_id"] = current_cursor
+    author["subscribers"]["group-a"]["pending_delivery_ids"] = ["1001", "1020", "1021"]
+    await service.commit_processed_tweets("tester", [next_cursor], next_cursor)
+    author = data["twitter_subs"]["tester"]
+    assert author["since_id"] == "1020"
+    assert author["subscribers"]["group-a"]["pending_delivery_ids"] == ["1021"]
+    assert "pending_delivery_ids" not in author["subscribers"]["group-b"]

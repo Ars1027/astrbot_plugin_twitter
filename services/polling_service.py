@@ -123,29 +123,26 @@ class PollingService:
             return
 
         recent_deliveries = flush_result.recent_deliveries
-        for username, tweet_id in pending_cursors.items():
-            if username in flush_result.failed_authors:
-                logger.warning(
-                    f"@{username} 集体转发未全部成功，保留当前游标"
+        try:
+            for username, tweet_id in pending_cursors.items():
+                if username in flush_result.failed_authors:
+                    logger.warning(
+                        f"@{username} 集体转发未全部成功，保留当前游标"
+                    )
+                    continue
+                await self.subscriptions.commit_processed_tweets(
+                    username,
+                    pending_tweet_ids.get(username, []),
+                    tweet_id,
+                    **({"recent_deliveries": tuple(
+                        item for item in recent_deliveries if item.username == username
+                    )} if recent_deliveries else {}),
                 )
-                continue
-            await self.subscriptions.commit_processed_tweets(
-                username,
-                pending_tweet_ids.get(username, []),
-                tweet_id,
-                **({"recent_deliveries": tuple(
-                    item for item in recent_deliveries if item.username == username
-                )} if recent_deliveries else {}),
+        finally:
+            # 已提交条目由订阅服务排除；提交异常也保留尚未提交作者的回执。
+            await self._save_partial_deliveries(
+                flush_result.delivered_tweets, recent_deliveries,
             )
-        # Never put a separate history write ahead of successful authors' cursors.
-        partial_authors = flush_result.failed_authors | {
-            item.username for item in flush_result.delivered_tweets
-            if item.username not in pending_cursors
-        }
-        await self._save_partial_deliveries(
-            tuple(item for item in flush_result.delivered_tweets if item.username in partial_authors),
-            tuple(item for item in recent_deliveries if item.username in partial_authors),
-        )
 
     @staticmethod
     def attach_timeline_item_metadata(tweet_info: dict, item: dict) -> None:
@@ -307,7 +304,13 @@ class PollingService:
                     )
                     break
 
-                await self._record_processed_cursor(username, tweet_id, delivery_result.recent_deliveries)
+                try:
+                    await self._record_processed_cursor(username, tweet_id, delivery_result.recent_deliveries)
+                except (Exception, asyncio.CancelledError):
+                    await self._save_partial_deliveries(
+                        delivery_result.delivered_tweets, delivery_result.recent_deliveries
+                    )
+                    raise
                 processed_tweet_ids.add(tweet_id)
                 if delivery_result.counts_toward_limit:
                     pushed_count += 1

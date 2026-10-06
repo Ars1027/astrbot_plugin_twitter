@@ -291,11 +291,21 @@ class SubscriptionService:
             return
         async with self._lock:
             subs = copy.deepcopy(await self.get_all())
+
+            def is_uncommitted(username: str, tweet_id: str) -> bool:
+                key = self.find_key(subs, username)
+                if key is None or not tweet_id.isdigit():
+                    return False
+                cursor = str(subs[key].get("since_id") or "")
+                return not cursor.isdigit() or int(tweet_id) > int(cursor)
+
             changed = False
             for delivery in delivered_tweets:
+                if not is_uncommitted(delivery.username, delivery.tweet_id):
+                    continue
                 key = self.find_key(subs, delivery.username)
                 subscriber = subs.get(key, {}).get("subscribers", {}).get(delivery.umo)
-                if not isinstance(subscriber, dict) or not delivery.tweet_id.isdigit():
+                if not isinstance(subscriber, dict):
                     continue
                 pending_ids = subscriber.get("pending_delivery_ids", [])
                 if not isinstance(pending_ids, list):
@@ -303,7 +313,10 @@ class SubscriptionService:
                 if delivery.tweet_id not in pending_ids:
                     subscriber["pending_delivery_ids"] = [*pending_ids, delivery.tweet_id]
                     changed = True
-            history_changed = self._apply_recent_deliveries(subs, recent_deliveries)
+            history_changed = self._apply_recent_deliveries(subs, tuple(
+                delivery for delivery in recent_deliveries
+                if is_uncommitted(delivery.username, str(delivery.record.get("tweet_id") or ""))
+            ))
             if changed or history_changed:
                 await self.save_all(subs)
 
@@ -462,11 +475,20 @@ class SubscriptionService:
 
             history_changed = self._apply_recent_deliveries(subs, recent_deliveries)
             committed_ids = set(normalized_ids)
+            effective_cursor = str(author_info.get("since_id") or "")
+            cursor_value = int(effective_cursor) if effective_cursor.isdigit() else None
             for subscriber in author_info.get("subscribers", {}).values():
                 pending_ids = subscriber.get("pending_delivery_ids", [])
                 if not isinstance(pending_ids, list):
                     continue
-                remaining_ids = [item for item in pending_ids if item not in committed_ids]
+                remaining_ids = [
+                    item for item in pending_ids
+                    if item not in committed_ids and not (
+                        cursor_value is not None
+                        and str(item).isdigit()
+                        and int(item) <= cursor_value
+                    )
+                ]
                 if remaining_ids != pending_ids:
                     if remaining_ids:
                         subscriber["pending_delivery_ids"] = remaining_ids
