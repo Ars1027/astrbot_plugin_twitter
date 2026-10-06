@@ -190,3 +190,55 @@ async def test_cursor_commit_cleans_receipts_for_missing_timeline_items(store, c
     assert author["since_id"] == "1020"
     assert author["subscribers"]["group-a"]["pending_delivery_ids"] == ["1021"]
     assert "pending_delivery_ids" not in author["subscribers"]["group-b"]
+
+
+@pytest.mark.asyncio
+async def test_pending_window_preserves_retweet_metadata_and_shares_cursor_cleanup(store):
+    data, _get, _put, service = store
+    items = [{"tweet_id": tweet_id, "username": "original", "is_retweet": True,
+              "retweeter_username": "tester", "retweeter_screen_name": "Tester",
+              "unused_full_text": "large payload"} for tweet_id in ("1000", "1001")]
+    receipts = tuple(module.DeliveredTweet("group-a", "tester", tweet_id)
+                     for tweet_id in ("1000", "1001"))
+    await service.save_pending_deliveries(receipts, pending_tweet_items={"TESTER": items})
+    author = data["twitter_subs"]["tester"]
+    assert len(author["pending_tweet_items"]) == 2
+    assert "unused_full_text" not in author["pending_tweet_items"][0]
+    snapshot = service.pending_tweet_items(author)
+    snapshot.clear()
+    assert len(author["pending_tweet_items"]) == 2
+    await service.add("group-a", "tester", r18=True)
+    await service.commit_processed_tweets("tester", ["1000"], "1000")
+    author = data["twitter_subs"]["tester"]
+    assert [item["tweet_id"] for item in author["pending_tweet_items"]] == ["1001"]
+    assert author["subscribers"]["group-a"]["pending_delivery_ids"] == ["1001"]
+    assert author["pending_tweet_items"][0]["username"] == "original"
+    await service.commit_processed_tweets("tester", ["1001"], "1001")
+    await service.save_pending_deliveries(receipts, pending_tweet_items={"tester": items})
+    author = data["twitter_subs"]["tester"]
+    assert "pending_tweet_items" not in author
+    assert "pending_delivery_ids" not in author["subscribers"]["group-a"]
+
+
+@pytest.mark.asyncio
+async def test_failed_window_write_does_not_mutate_live_snapshot(store):
+    data, get, _put, _service = store
+    before = copy.deepcopy(data)
+    writes = []
+
+    async def fail(key, value):
+        writes.append((key, copy.deepcopy(value)))
+        raise OSError("KV unavailable")
+
+    service = module.SubscriptionService(get, fail, None, lambda: True)
+    with pytest.raises(OSError):
+        await service.save_pending_deliveries(
+            (module.DeliveredTweet("group-a", "tester", "1000"),),
+            pending_tweet_items={"tester": [{"tweet_id": "1000", "username": "original", "is_retweet": True}]},
+        )
+    assert data == before
+    assert len(writes) == 1
+    candidate = writes[0][1]["tester"]
+    assert candidate["since_id"] == "999"
+    assert candidate["pending_tweet_items"][0]["username"] == "original"
+    assert candidate["subscribers"]["group-a"]["pending_delivery_ids"] == ["1000"]

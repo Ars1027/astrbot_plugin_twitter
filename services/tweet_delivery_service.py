@@ -397,11 +397,14 @@ class TweetDeliveryService:
         tweet_id = str(tweet_info.get("tweet_id") or "")
 
         first_umo = next(iter(subscribers), "")
-        translated_text, translate_model = await self.messages.maybe_translate(
-            tweet_info,
-            first_umo,
-            cycle=cycle,
-        )
+        details_available = bool(tweet_info.get("status", True))
+        translated_text, translate_model = None, None
+        if details_available:
+            translated_text, translate_model = await self.messages.maybe_translate(
+                tweet_info,
+                first_umo,
+                cycle=cycle,
+            )
         if translate_model:
             original_text = str(tweet_info.get("text") or "")
             quote_text = str((tweet_info.get("quote") or {}).get("text") or "")
@@ -425,6 +428,10 @@ class TweetDeliveryService:
                 continue
 
             if not sub_config.get("status", True):
+                continue
+
+            if not details_available:
+                delivery_failed = True
                 continue
 
             is_r18 = tweet_info.get("is_r18", False)

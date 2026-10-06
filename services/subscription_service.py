@@ -12,6 +12,7 @@ KV_SUBS_KEY = "twitter_subs"
 KV_RETWEET_DEDUP_KEY = "twitter_retweet_dedup_seen"
 RETWEET_DEDUP_MAX_ITEMS = 500
 PROCESSED_TWEET_MAX_ITEMS = 500
+PENDING_TWEET_MAX_ITEMS = 500
 RECENT_DELIVERY_MAX_ITEMS = 5
 RECENT_DELIVERY_TEXT_LIMIT = 500
 
@@ -281,13 +282,15 @@ class SubscriptionService:
         delivered_tweets: tuple[DeliveredTweet, ...],
         *,
         recent_deliveries: tuple[RecentDelivery, ...] = (),
+        pending_tweet_items: dict[str, list[dict]] | None = None,
     ) -> None:
         """部分失败时一次写入成功会话的重试凭据和历史，不推进游标。
 
         pending_delivery_ids 是订阅配置的可选字段，旧 KV 缺失时视为空；
-        仅保留尚未提交的条目，提交游标或取关后清理。
+        pending_tweet_items 保存固定重试窗口的时间线元数据；轮询层限制
+        接纳数量，窗口完成前不接纳新条目。仅保留尚未提交的条目。
         """
-        if not delivered_tweets and not recent_deliveries:
+        if not delivered_tweets and not recent_deliveries and not pending_tweet_items:
             return
         async with self._lock:
             subs = copy.deepcopy(await self.get_all())
@@ -317,8 +320,44 @@ class SubscriptionService:
                 delivery for delivery in recent_deliveries
                 if is_uncommitted(delivery.username, str(delivery.record.get("tweet_id") or ""))
             ))
+            for username, items in (pending_tweet_items or {}).items():
+                key = self.find_key(subs, username)
+                if key is None:
+                    continue
+                author_info = subs[key]
+                pending_items = self.pending_tweet_items(author_info)
+                known_ids = {item["tweet_id"] for item in pending_items}
+                for item in items:
+                    tweet_id = str(item.get("tweet_id") or "")
+                    if tweet_id in known_ids or not is_uncommitted(username, tweet_id):
+                        continue
+                    pending_items.append({
+                        "tweet_id": tweet_id,
+                        "username": str(item.get("username") or username),
+                        "is_retweet": bool(item.get("is_retweet")),
+                        "retweeter_username": str(item.get("retweeter_username") or ""),
+                        "retweeter_screen_name": str(item.get("retweeter_screen_name") or ""),
+                    })
+                    known_ids.add(tweet_id)
+                if pending_items != author_info.get("pending_tweet_items", []):
+                    if pending_items:
+                        author_info["pending_tweet_items"] = pending_items
+                    else:
+                        author_info.pop("pending_tweet_items", None)
+                    changed = True
             if changed or history_changed:
                 await self.save_all(subs)
+
+    @staticmethod
+    def pending_tweet_items(author_info: dict) -> list[dict]:
+        """读取尚未完成的固定窗口；旧 KV 缺少字段时没有窗口。"""
+        raw_items = author_info.get("pending_tweet_items") or []
+        if not isinstance(raw_items, list):
+            return []
+        return copy.deepcopy([
+            item for item in raw_items
+            if isinstance(item, dict) and str(item.get("tweet_id") or "").isdigit()
+        ])
 
     async def record_delivery(self, umo: str, username: str, tweet_info: dict) -> None:
         """直接调用时持久化有界摘要，不更改轮询游标。"""
@@ -495,6 +534,19 @@ class SubscriptionService:
                     else:
                         subscriber.pop("pending_delivery_ids", None)
                     changed = True
+            pending_items = self.pending_tweet_items(author_info)
+            remaining_items = [
+                item for item in pending_items
+                if str(item["tweet_id"]) not in committed_ids and not (
+                    cursor_value is not None and int(item["tweet_id"]) <= cursor_value
+                )
+            ]
+            if remaining_items != pending_items:
+                if remaining_items:
+                    author_info["pending_tweet_items"] = remaining_items
+                else:
+                    author_info.pop("pending_tweet_items", None)
+                changed = True
             if changed or history_changed:
                 await self.save_all(subs)
             return True

@@ -2017,7 +2017,8 @@ async def test_delivery_history_and_cursor_share_one_write(plugin_module, use_no
 
 @pytest.fixture
 def review_retry_plugin_factory(plugin_module):
-    def make(store, send_message, *, transport="collective", put_kv=None, dedup=False):
+    def make(store, send_message, *, transport="collective", put_kv=None, dedup=False,
+             provider="nitter", max_tweets=5):
         async def get_kv(key, default):
             return copy.deepcopy(store.get(key, default))
 
@@ -2032,6 +2033,8 @@ def review_retry_plugin_factory(plugin_module):
             return {"status": True, "tweet_id": tweet_id, "username": username, "text": "body"}
 
         plugin = plugin_module.TwitterPlugin(types.SimpleNamespace(send_message=send_message), {
+            "twitter_data_provider": provider,
+            "twitter_poll_max_tweets_per_user": max_tweets,
             "twitter_use_node": transport != "plain",
             "twitter_collective_forward": transport == "collective",
             "twitter_deduplicate_retweets": dedup,
@@ -2041,6 +2044,251 @@ def review_retry_plugin_factory(plugin_module):
         plugin.twitter_api.get_tweet = get_tweet
         return plugin
     return make
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["plain", "node", "collective"])
+@pytest.mark.parametrize("is_retweet", [False, True])
+async def test_failed_window_survives_sliding_timeline_and_provider_failure(
+    review_retry_plugin_factory, transport, is_retweet
+):
+    store = {"twitter_subs": {"tester": {
+        "since_id": "100", "subscribers": {umo: {"status": True} for umo in ("good", "bad")},
+    }}}
+    current_ids = ["101", "102"]
+    timeline_calls = []
+    detail_calls = []
+    contexts = []
+    recovered = False
+    timeline_unavailable = False
+    detail_unavailable = False
+    delivered = {"good": [], "bad": []}
+    original_author = "original" if is_retweet else "tester"
+
+    def texts(chain):
+        for part in chain:
+            if isinstance(part, Nodes):
+                for node in part.nodes:
+                    yield from texts(node.content)
+            elif isinstance(part, Plain):
+                yield part.text
+
+    async def send_message(umo, message):
+        if umo == "bad" and not recovered:
+            return False
+        delivered[umo].extend(texts(message.chain))
+        return True
+
+    async def timeline(username, since_id):
+        timeline_calls.append(since_id)
+        if timeline_unavailable:
+            raise RuntimeError("timeline boundary unavailable")
+        return [{"tweet_id": tweet_id, "username": original_author,
+                 "is_retweet": is_retweet, "retweeter_username": username,
+                 "retweeter_screen_name": "Tester"}
+                for tweet_id in current_ids if int(tweet_id) > int(since_id)]
+
+    async def get_tweet(username, tweet_id):
+        detail_calls.append((username, tweet_id))
+        return {"status": not detail_unavailable, "tweet_id": tweet_id,
+                "username": username, "text": "body"}
+
+    async def build_chain(_username, tweet_info, *_args, **_kwargs):
+        contexts.append((tweet_info["username"], tweet_info.get("retweet")))
+        return [Plain(tweet_info["tweet_id"])]
+
+    async def poll(provider="nitter"):
+        plugin = review_retry_plugin_factory(store, send_message, transport=transport, provider=provider)
+        plugin.twitter_api.get_user_timeline_items = timeline
+        plugin.twitter_api.get_tweet = get_tweet
+        plugin.message_service.build_message_chain = build_chain
+        result = await plugin.polling_service.check_user("tester", copy.deepcopy(store["twitter_subs"]["tester"]))
+        await plugin.polling_service.flush_pending_collective()
+        return result
+
+    assert await poll()
+    first_delivered = list(delivered["good"])
+    current_ids = ["201", "202"]  # The failed batch has fallen off the Nitter homepage.
+    for _ in range(3):
+        assert await poll()
+        assert delivered["good"] == first_delivered
+        assert store["twitter_subs"]["tester"]["since_id"] == "100"
+    author = store["twitter_subs"]["tester"]
+    assert [item["tweet_id"] for item in author["pending_tweet_items"]] == ["101", "102"]
+    timeline_unavailable = True
+    assert await poll("fxtwitter")  # A failed timeline request must not gate the known retry window.
+    assert timeline_calls == ["100"]
+    detail_unavailable = True
+    assert not await poll("fxtwitter")
+    assert store["twitter_subs"]["tester"]["since_id"] == "100"
+    detail_unavailable = False
+    recovered = True
+    assert await poll("fxtwitter")
+    assert delivered == {"good": ["101", "102"], "bad": ["101", "102"]}
+    assert all(username == original_author for username, _tweet_id in detail_calls)
+    assert all(username == original_author for username, _retweet in contexts)
+    expected_retweet = {"retweeter_username": "tester", "retweeter_screen_name": "Tester"} if is_retweet else None
+    assert all(retweet == expected_retweet for _username, retweet in contexts)
+    author = store["twitter_subs"]["tester"]
+    assert author["since_id"] == "102"
+    assert "pending_tweet_items" not in author
+    assert all("pending_delivery_ids" not in config for config in author["subscribers"].values())
+    assert not await poll("fxtwitter")  # No window remains, so a new timeline failure stays a failure.
+    timeline_unavailable = False
+    assert await poll("fxtwitter")
+    assert delivered == {"good": ["101", "102", "201", "202"], "bad": ["101", "102", "201", "202"]}
+
+
+@pytest.mark.asyncio
+async def test_collective_retry_window_has_a_fixed_admission_limit(
+    review_retry_plugin_factory
+):
+    limit = 500
+    store = {"twitter_subs": {"tester": {
+        "since_id": "100", "subscribers": {umo: {"status": True} for umo in ("good", "bad")},
+    }}}
+    delivered = []
+
+    async def send_message(umo, _message):
+        if umo == "bad":
+            return False
+        delivered.append(umo)
+        return True
+
+    async def timeline(username, since_id):
+        return [{"tweet_id": str(tweet_id), "username": username}
+                for tweet_id in range(101, 101 + limit + 1) if tweet_id > int(since_id)]
+
+    plugin = review_retry_plugin_factory(store, send_message, max_tweets=limit + 1)
+    plugin.twitter_api.get_user_timeline_items = timeline
+    for _ in range(2):
+        await plugin.polling_service.check_user("tester", copy.deepcopy(store["twitter_subs"]["tester"]))
+        await plugin.polling_service.flush_pending_collective()
+        author = store["twitter_subs"]["tester"]
+        assert author["since_id"] == "100"
+        assert len(author["subscribers"]["good"]["pending_delivery_ids"]) == limit
+        assert len(author["pending_tweet_items"]) == limit
+    assert delivered == ["good"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_receipts_are_retained_without_expanding_to_new_items(review_retry_plugin_factory):
+    old_ids = [str(tweet_id) for tweet_id in range(101, 602)]
+    store = {"twitter_subs": {"tester": {
+        "since_id": "100", "subscribers": {
+            "good": {"status": True, "pending_delivery_ids": old_ids}, "bad": {"status": True},
+        },
+    }}}
+    sent = []
+    current_ids = ["701"]
+
+    async def send_message(umo, _message):
+        sent.append(umo)
+        return True
+
+    async def timeline(username, _since_id):
+        return [{"tweet_id": tweet_id, "username": username} for tweet_id in current_ids]
+
+    async def poll():
+        plugin = review_retry_plugin_factory(store, send_message)
+        plugin.twitter_api.get_user_timeline_items = timeline
+        await plugin.polling_service.check_user("tester", copy.deepcopy(store["twitter_subs"]["tester"]))
+        await plugin.polling_service.flush_pending_collective()
+
+    await poll()
+    assert sent == []
+    assert store["twitter_subs"]["tester"]["subscribers"]["good"]["pending_delivery_ids"] == old_ids
+    current_ids = ["601"]  # Existing data is recovered only when its timeline metadata is available.
+    await poll()
+    assert sent == ["bad"]
+    assert store["twitter_subs"]["tester"]["since_id"] == "601"
+    assert "pending_delivery_ids" not in store["twitter_subs"]["tester"]["subscribers"]["good"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["plain", "node", "collective"])
+async def test_retry_window_orders_original_ids_before_cursor_cleanup(review_retry_plugin_factory, transport):
+    # A later repost can have an older original ID than another timeline entry.
+    items = [{"tweet_id": "102", "username": "tester", "is_retweet": False},
+             {"tweet_id": "101", "username": "original", "is_retweet": True,
+              "retweeter_username": "tester"}]
+    store = {"twitter_subs": {"tester": {
+        "since_id": "100", "pending_tweet_items": items,
+        "subscribers": {"good": {"status": True, "pending_delivery_ids": ["101", "102"]},
+                        "bad": {"status": True}},
+    }}}
+    sent = []
+
+    async def send_message(umo, _message):
+        sent.append(umo)
+        return True
+
+    async def get_tweet(username, tweet_id):
+        return {"status": tweet_id != "101", "tweet_id": tweet_id, "username": username, "text": "body"}
+
+    plugin = review_retry_plugin_factory(store, send_message, transport=transport)
+    plugin.twitter_api.get_tweet = get_tweet
+    assert not await plugin.polling_service.check_user("tester", copy.deepcopy(store["twitter_subs"]["tester"]))
+    await plugin.polling_service.flush_pending_collective()
+    assert sent == []
+    author = store["twitter_subs"]["tester"]
+    assert author["since_id"] == "100"
+    assert {item["tweet_id"] for item in author["pending_tweet_items"]} == {"101", "102"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["plain", "node", "collective"])
+@pytest.mark.parametrize("remove_failed_session", [False, True])
+async def test_config_skip_completes_acknowledged_window_without_tweet_details(
+    review_retry_plugin_factory, transport, remove_failed_session
+):
+    store = {"twitter_subs": {"tester": {
+        "since_id": "100", "subscribers": {umo: {"status": True} for umo in ("good", "bad")},
+    }}}
+    sent = []
+    detail_calls = []
+    current_id = "101"
+
+    async def send_message(umo, _message):
+        if umo == "bad":
+            return False
+        sent.append(umo)
+        return True
+
+    async def timeline(username, since_id):
+        return [{"tweet_id": current_id, "username": username}] if int(current_id) > int(since_id) else []
+
+    async def get_tweet(username, tweet_id):
+        detail_calls.append(tweet_id)
+        return {"status": tweet_id == current_id, "tweet_id": tweet_id, "username": username, "text": "body"}
+
+    def make():
+        plugin = review_retry_plugin_factory(store, send_message, transport=transport)
+        plugin.twitter_api.get_user_timeline_items = timeline
+        plugin.twitter_api.get_tweet = get_tweet
+        return plugin
+
+    async def poll(plugin):
+        await plugin.polling_service.check_user("tester", copy.deepcopy(store["twitter_subs"]["tester"]))
+        await plugin.polling_service.flush_pending_collective()
+
+    plugin = make()
+    await poll(plugin)
+    assert sent == ["good"]
+    if remove_failed_session:
+        await plugin.subscription_service.remove("bad", "tester")
+    else:
+        await plugin.subscription_service.update("bad", "tester", {"enabled": False})
+    current_id = "201"  # The old details are unavailable after the failed session is skipped.
+    await poll(make())
+    author = store["twitter_subs"]["tester"]
+    assert author["since_id"] == "101"
+    assert "pending_tweet_items" not in author
+    assert sent == ["good"]
+    assert detail_calls == ["101"]
+    await poll(make())
+    assert sent == ["good", "good"]
+    assert store["twitter_subs"]["tester"]["since_id"] == "201"
 
 
 @pytest.mark.asyncio
