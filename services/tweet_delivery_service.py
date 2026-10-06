@@ -9,7 +9,7 @@ from astrbot.api.event import MessageChain
 import astrbot.api.message_components as Comp
 from astrbot.api.message_components import Node, Nodes
 
-from .subscription_service import RecentDelivery, SubscriptionService
+from .subscription_service import DeliveredTweet, RecentDelivery, SubscriptionService
 from .tweet_message_service import TranslationCycleState, TweetMessageService
 
 
@@ -46,6 +46,7 @@ class DeliveryResult:
 
     state: DeliveryState
     recent_deliveries: tuple[RecentDelivery, ...] = ()
+    delivered_tweets: tuple[DeliveredTweet, ...] = ()
 
     @property
     def counts_toward_limit(self) -> bool:
@@ -62,6 +63,7 @@ class CollectiveFlushResult:
     successful_authors: frozenset[str]
     failed_authors: frozenset[str]
     recent_deliveries: tuple[RecentDelivery, ...] = ()
+    delivered_tweets: tuple[DeliveredTweet, ...] = ()
 
 
 @dataclass(slots=True)
@@ -349,7 +351,7 @@ class TweetDeliveryService:
         retweet_dedup_seen: dict | None = None
         if should_dedup_retweet:
             retweet_dedup_seen = await self.subscriptions.get_retweet_seen()
-        retweet_dedup_id = str(tweet_info.get("tweet_id") or "")
+        tweet_id = str(tweet_info.get("tweet_id") or "")
 
         first_umo = next(iter(subscribers), "")
         translated_text, translate_model = await self.messages.maybe_translate(
@@ -368,7 +370,9 @@ class TweetDeliveryService:
             )
 
         had_target = False
+        already_delivered = False
         recent_deliveries: list[RecentDelivery] = []
+        delivered_tweets: list[DeliveredTweet] = []
         delivery_failed = False
         retweet_dedup_dirty = False
         for umo, sub_config in subscribers.items():
@@ -385,18 +389,25 @@ class TweetDeliveryService:
             ):
                 continue
 
+            if tweet_id in (sub_config.get("pending_delivery_ids") or []):
+                already_delivered = True
+                if should_dedup_retweet and retweet_dedup_seen is not None:
+                    self.subscriptions.mark_retweet_seen(retweet_dedup_seen, umo, tweet_id)
+                    retweet_dedup_dirty = True
+                continue
+
             if should_dedup_retweet and retweet_dedup_seen is not None:
                 already_seen = self.subscriptions.retweet_seen_by_umo(
                     retweet_dedup_seen,
                     umo,
-                    retweet_dedup_id,
+                    tweet_id,
                 )
-                pending_seen = retweet_dedup_id in (
+                pending_seen = tweet_id in (
                     self._pending_retweet_seen.get(umo) or set()
                 )
                 if already_seen or pending_seen:
                     logger.debug(
-                        f"跳过重复转帖 {umo}: @{username} -> {retweet_dedup_id}"
+                        f"跳过重复转帖 {umo}: @{username} -> {tweet_id}"
                     )
                     continue
 
@@ -411,13 +422,13 @@ class TweetDeliveryService:
                         translated_text=translated_text,
                         translate_model=translate_model,
                         retweet_dedup_id=(
-                            retweet_dedup_id if should_dedup_retweet else ""
+                            tweet_id if should_dedup_retweet else ""
                         ),
                     )
                 )
                 if should_dedup_retweet:
                     self._pending_retweet_seen.setdefault(umo, set()).add(
-                        retweet_dedup_id
+                        tweet_id
                     )
                 continue
 
@@ -434,24 +445,36 @@ class TweetDeliveryService:
             if not sent:
                 delivery_failed = True
                 continue
+            delivered_tweets.append(DeliveredTweet(umo, username, tweet_id))
             if should_dedup_retweet and retweet_dedup_seen is not None:
                 self.subscriptions.mark_retweet_seen(
                     retweet_dedup_seen,
                     umo,
-                    retweet_dedup_id,
+                    tweet_id,
                 )
                 retweet_dedup_dirty = True
 
         if retweet_dedup_dirty and retweet_dedup_seen is not None:
-            await self.subscriptions.save_retweet_seen(retweet_dedup_seen)
+            try:
+                await self.subscriptions.save_retweet_seen(retweet_dedup_seen)
+            except Exception as exc:
+                logger.error(f"保存转帖去重记录失败，保留推送结果等待重试: {exc}")
+                delivery_failed = True
 
         if delivery_failed:
-            return DeliveryResult(DeliveryState.FAILED, tuple(recent_deliveries))
+            return DeliveryResult(
+                DeliveryState.FAILED, tuple(recent_deliveries), tuple(delivered_tweets)
+            )
         if not had_target:
+            if already_delivered:
+                # 已送达的重试条目仍计入本轮限额，避免失败窗口不断扩大。
+                return DeliveryResult(DeliveryState.DELIVERED)
             return DeliveryResult(DeliveryState.SKIPPED)
         if self.collective_enabled:
             return DeliveryResult(DeliveryState.QUEUED)
-        return DeliveryResult(DeliveryState.DELIVERED, tuple(recent_deliveries))
+        return DeliveryResult(
+            DeliveryState.DELIVERED, tuple(recent_deliveries), tuple(delivered_tweets)
+        )
 
     async def send_to_subscriber(
         self,
@@ -549,6 +572,7 @@ class TweetDeliveryService:
         retweet_seen_dirty = False
         retweet_seen_authors: set[str] = set()
         recent_deliveries: list[RecentDelivery] = []
+        delivered_tweets: list[DeliveredTweet] = []
 
         def record_result(
             umo: str,
@@ -559,6 +583,9 @@ class TweetDeliveryService:
             if not succeeded:
                 author_success[cached_tweet.username] = False
                 return
+            delivered_tweets.append(DeliveredTweet(
+                umo, cached_tweet.username, str(cached_tweet.tweet_info.get("tweet_id") or "")
+            ))
             if cached_tweet.retweet_dedup_id:
                 self.subscriptions.mark_retweet_seen(
                     retweet_seen,
@@ -725,4 +752,6 @@ class TweetDeliveryService:
             for username, succeeded in author_success.items()
             if not succeeded
         )
-        return CollectiveFlushResult(successful_authors, failed_authors, tuple(recent_deliveries))
+        return CollectiveFlushResult(
+            successful_authors, failed_authors, tuple(recent_deliveries), tuple(delivered_tweets)
+        )

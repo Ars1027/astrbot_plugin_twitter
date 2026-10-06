@@ -29,6 +29,15 @@ class RecentDelivery:
     record: dict
 
 
+@dataclass(frozen=True, slots=True)
+class DeliveredTweet:
+    """某会话已成功处理的推文，与可选的展示历史分开记录。"""
+
+    umo: str
+    username: str
+    tweet_id: str
+
+
 class SubscriptionService:
     """集中管理插件的订阅持久化和并发写入。"""
 
@@ -103,6 +112,9 @@ class SubscriptionService:
                     session_config["recent_deliveries"] = copy.deepcopy(
                         history[:RECENT_DELIVERY_MAX_ITEMS]
                     )
+                pending_ids = subscribers.get(umo, {}).get("pending_delivery_ids")
+                if isinstance(pending_ids, list):
+                    session_config["pending_delivery_ids"] = list(pending_ids)
                 subscribers[umo] = session_config
                 await self.save_all(subs)
                 return {
@@ -146,6 +158,9 @@ class SubscriptionService:
                     session_config["recent_deliveries"] = copy.deepcopy(
                         history[:RECENT_DELIVERY_MAX_ITEMS]
                     )
+                pending_ids = subscribers.get(umo, {}).get("pending_delivery_ids")
+                if isinstance(pending_ids, list):
+                    session_config["pending_delivery_ids"] = list(pending_ids)
                 subscribers[umo] = session_config
                 await self.save_all(subs)
                 return {
@@ -259,6 +274,37 @@ class SubscriptionService:
         async with self._lock:
             subs = copy.deepcopy(await self.get_all())
             if self._apply_recent_deliveries(subs, deliveries):
+                await self.save_all(subs)
+
+    async def save_pending_deliveries(
+        self,
+        delivered_tweets: tuple[DeliveredTweet, ...],
+        *,
+        recent_deliveries: tuple[RecentDelivery, ...] = (),
+    ) -> None:
+        """部分失败时一次写入成功会话的重试凭据和历史，不推进游标。
+
+        pending_delivery_ids 是订阅配置的可选字段，旧 KV 缺失时视为空；
+        仅保留尚未提交的条目，提交游标或取关后清理。
+        """
+        if not delivered_tweets and not recent_deliveries:
+            return
+        async with self._lock:
+            subs = copy.deepcopy(await self.get_all())
+            changed = False
+            for delivery in delivered_tweets:
+                key = self.find_key(subs, delivery.username)
+                subscriber = subs.get(key, {}).get("subscribers", {}).get(delivery.umo)
+                if not isinstance(subscriber, dict) or not delivery.tweet_id.isdigit():
+                    continue
+                pending_ids = subscriber.get("pending_delivery_ids", [])
+                if not isinstance(pending_ids, list):
+                    pending_ids = []
+                if delivery.tweet_id not in pending_ids:
+                    subscriber["pending_delivery_ids"] = [*pending_ids, delivery.tweet_id]
+                    changed = True
+            history_changed = self._apply_recent_deliveries(subs, recent_deliveries)
+            if changed or history_changed:
                 await self.save_all(subs)
 
     async def record_delivery(self, umo: str, username: str, tweet_info: dict) -> None:
@@ -415,6 +461,18 @@ class SubscriptionService:
                 changed = True
 
             history_changed = self._apply_recent_deliveries(subs, recent_deliveries)
+            committed_ids = set(normalized_ids)
+            for subscriber in author_info.get("subscribers", {}).values():
+                pending_ids = subscriber.get("pending_delivery_ids", [])
+                if not isinstance(pending_ids, list):
+                    continue
+                remaining_ids = [item for item in pending_ids if item not in committed_ids]
+                if remaining_ids != pending_ids:
+                    if remaining_ids:
+                        subscriber["pending_delivery_ids"] = remaining_ids
+                    else:
+                        subscriber.pop("pending_delivery_ids", None)
+                    changed = True
             if changed or history_changed:
                 await self.save_all(subs)
             return True

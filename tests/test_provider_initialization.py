@@ -399,6 +399,164 @@ async def test_false_send_retains_cursor_and_recovers(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("transport,fail_all", [
+    ("plain", True), ("node", True), ("collective", True), ("collective", False),
+])
+@pytest.mark.parametrize("data_provider", ["nitter", "fxtwitter"])
+@pytest.mark.parametrize("history_available", [True, False])
+async def test_partial_delivery_retries_only_failed_sessions_after_reload(
+    plugin_module, monkeypatch, transport, fail_all, data_provider, history_available
+):
+    # Legacy subscriptions have neither delivery history nor retry receipts.
+    store = {"twitter_subs": {"tester": {
+        "since_id": "100",
+        "subscribers": {umo: {"status": True} for umo in ("good", "bad")},
+    }}}
+    tweet_ids = [str(i) for i in range(101, 108)]
+    timeline_ids = list(tweet_ids)
+    recovered = False
+    delivered = {"good": [], "bad": []}
+    attempted = {"good": 0, "bad": 0}
+
+    def texts(chain):
+        for part in chain:
+            if isinstance(part, Nodes):
+                for node in part.nodes:
+                    yield from texts(node.content)
+            elif isinstance(part, Plain):
+                yield part.text
+
+    async def send_message(umo, message):
+        attempted[umo] += 1
+        content = "\n".join(texts(message.chain))
+        ids = [tweet_id for tweet_id in timeline_ids if f"status/{tweet_id}" in content]
+        if umo == "bad" and not recovered and (fail_all or "101" in ids):
+            return False
+        delivered[umo].extend(ids)
+        return True
+
+    async def get_kv(key, default):
+        return store.get(key, default)
+
+    async def put_kv(key, value):
+        store[key] = copy.deepcopy(value)
+
+    async def timeline(_username, since_id):
+        return [{"tweet_id": tweet_id, "username": "tester"}
+                for tweet_id in timeline_ids if int(tweet_id) > int(since_id)]
+
+    async def get_tweet(_username, tweet_id):
+        return {"status": True, "tweet_id": tweet_id, "text": "body"}
+
+    if not history_available:
+        def unavailable_history(*_args):
+            raise RuntimeError("history unavailable")
+
+        monkeypatch.setattr(
+            plugin_module.SubscriptionService, "prepare_delivery", unavailable_history
+        )
+
+    def reload_plugin(provider):
+        plugin = plugin_module.TwitterPlugin(
+            types.SimpleNamespace(send_message=send_message), {
+                "twitter_data_provider": provider,
+                "twitter_use_node": transport != "plain",
+                "twitter_collective_forward": transport == "collective",
+                "twitter_poll_max_tweets_per_user": 7,
+                "twitter_deduplicate_retweets": False,
+            },
+        )
+        plugin.get_kv_data, plugin.put_kv_data = get_kv, put_kv
+        plugin.twitter_api.get_user_timeline_items = timeline
+        plugin.twitter_api.get_tweet = get_tweet
+        return plugin
+
+    async def poll(plugin):
+        author = copy.deepcopy(store["twitter_subs"]["tester"])
+        assert await plugin.polling_service.check_user("tester", author)
+        await plugin.polling_service.flush_pending_collective()
+
+    await poll(reload_plugin(data_provider))
+    first_delivered = list(delivered["good"])
+    first_attempted = dict(attempted)
+    assert first_delivered == (tweet_ids if transport == "collective" else ["101"])
+    assert delivered["bad"] == ([] if fail_all else tweet_ids[1:])
+    assert store["twitter_subs"]["tester"]["since_id"] == "100"
+
+    # Repeated failures and a source switch must preserve successful sessions.
+    other_provider = "nitter" if data_provider == "fxtwitter" else "fxtwitter"
+    if not fail_all:
+        # Later successes must not let one failed item grow the retry window.
+        timeline_ids.extend(str(i) for i in range(108, 115))
+    plugin = reload_plugin(other_provider)
+    for _ in range(2):
+        await poll(plugin)
+        assert delivered["good"] == first_delivered
+        assert attempted["good"] == first_attempted["good"]
+        assert store["twitter_subs"]["tester"]["since_id"] == "100"
+    assert attempted["bad"] > first_attempted["bad"]
+
+    recovered = True
+    await poll(reload_plugin(data_provider))
+    assert delivered["good"] == tweet_ids
+    assert sorted(delivered["bad"], key=int) == tweet_ids
+    assert store["twitter_subs"]["tester"]["since_id"] == "107"
+    await poll(reload_plugin(other_provider))
+    assert delivered["good"] == timeline_ids
+    assert sorted(delivered["bad"], key=int) == timeline_ids
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["plain", "node", "collective"])
+async def test_delivery_receipts_restore_retweet_dedup_after_write_failure(plugin_module, transport):
+    store = {"twitter_subs": {"tester": {
+        "since_id": "100", "subscribers": {"group": {"status": True}},
+    }}, "twitter_retweet_dedup_seen": {}}
+    sent = []
+    fail_seen_write = True
+
+    async def get_kv(key, default):
+        return store.get(key, default)
+
+    async def put_kv(key, value):
+        nonlocal fail_seen_write
+        if key == "twitter_retweet_dedup_seen" and fail_seen_write:
+            fail_seen_write = False
+            raise OSError("dedup KV unavailable")
+        store[key] = copy.deepcopy(value)
+
+    async def send_message(umo, _message):
+        sent.append(umo)
+        return True
+
+    async def timeline(_username, since_id):
+        return [{"tweet_id": "101", "username": "original", "is_retweet": True,
+                 "retweeter_username": "tester"}] if since_id == "100" else []
+
+    async def get_tweet(_username, tweet_id):
+        return {"status": True, "tweet_id": tweet_id, "text": "body"}
+
+    def reload_plugin():
+        plugin = plugin_module.TwitterPlugin(types.SimpleNamespace(send_message=send_message), {
+            "twitter_use_node": transport != "plain",
+            "twitter_collective_forward": transport == "collective",
+            "twitter_deduplicate_retweets": True,
+        })
+        plugin.get_kv_data, plugin.put_kv_data = get_kv, put_kv
+        plugin.twitter_api.get_user_timeline_items = timeline
+        plugin.twitter_api.get_tweet = get_tweet
+        return plugin
+
+    for attempt in range(2):
+        plugin = reload_plugin()
+        await plugin.polling_service.check_user("tester", copy.deepcopy(store["twitter_subs"]["tester"]))
+        await plugin.polling_service.flush_pending_collective()
+        assert sent == ["group"]
+        assert store["twitter_subs"]["tester"]["since_id"] == ("100" if attempt == 0 else "101")
+    assert store["twitter_retweet_dedup_seen"] == {"group": ["101"]}
+
+
+@pytest.mark.asyncio
 async def test_fxtwitter_initialization_skips_nitter(plugin_module):
     config = {
         "basic": {

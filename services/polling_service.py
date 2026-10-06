@@ -12,7 +12,7 @@ from ..twitter_api import (
     FxTwitterTimelineError,
     get_next_website,
 )
-from .subscription_service import RecentDelivery, SubscriptionService
+from .subscription_service import DeliveredTweet, RecentDelivery, SubscriptionService
 from .tweet_delivery_service import (
     DeliveryResult,
     DeliveryState,
@@ -89,14 +89,20 @@ class PollingService:
             **({"recent_deliveries": recent_deliveries} if recent_deliveries else {}),
         )
 
-    async def _save_partial_history(self, deliveries: tuple[RecentDelivery, ...]) -> None:
-        """部分会话成功但不能推进游标时，尽力保存实际发送记录。"""
-        if not deliveries:
+    async def _save_partial_deliveries(
+        self,
+        delivered_tweets: tuple[DeliveredTweet, ...],
+        recent_deliveries: tuple[RecentDelivery, ...],
+    ) -> None:
+        """不能推进游标时保存成功会话，下次仅重试未成功的会话。"""
+        if not delivered_tweets and not recent_deliveries:
             return
         try:
-            await self.subscriptions.save_recent_deliveries(deliveries)
+            await self.subscriptions.save_pending_deliveries(
+                delivered_tweets, recent_deliveries=recent_deliveries
+            )
         except Exception as exc:
-            logger.warning(f"保存最近推送记录失败: {exc}")
+            logger.warning(f"保存部分推送结果失败，下次可能重复推送: {exc}")
 
     async def flush_pending_collective(self) -> None:
         """发送集体转发缓存，并只提交发送成功推主的候选游标。"""
@@ -132,10 +138,14 @@ class PollingService:
                 )} if recent_deliveries else {}),
             )
         # Never put a separate history write ahead of successful authors' cursors.
-        await self._save_partial_history(tuple(
-            item for item in recent_deliveries
-            if item.username in flush_result.failed_authors or item.username not in pending_cursors
-        ))
+        partial_authors = flush_result.failed_authors | {
+            item.username for item in flush_result.delivered_tweets
+            if item.username not in pending_cursors
+        }
+        await self._save_partial_deliveries(
+            tuple(item for item in flush_result.delivered_tweets if item.username in partial_authors),
+            tuple(item for item in recent_deliveries if item.username in partial_authors),
+        )
 
     @staticmethod
     def attach_timeline_item_metadata(tweet_info: dict, item: dict) -> None:
@@ -292,7 +302,9 @@ class PollingService:
                         f"@{username} 推文发送失败，保留游标等待重试: "
                         f"{tweet_id}"
                     )
-                    await self._save_partial_history(delivery_result.recent_deliveries)
+                    await self._save_partial_deliveries(
+                        delivery_result.delivered_tweets, delivery_result.recent_deliveries
+                    )
                     break
 
                 await self._record_processed_cursor(username, tweet_id, delivery_result.recent_deliveries)
