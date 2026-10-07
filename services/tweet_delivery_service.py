@@ -1,5 +1,7 @@
 """推文消息的拆分、发送、降级和集体转发服务。"""
 
+import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -9,7 +11,7 @@ from astrbot.api.event import MessageChain
 import astrbot.api.message_components as Comp
 from astrbot.api.message_components import Node, Nodes
 
-from .subscription_service import RecentDelivery, SubscriptionService
+from .subscription_service import DeliveredTweet, RecentDelivery, SkippedTweet, SubscriptionService
 from .tweet_message_service import TranslationCycleState, TweetMessageService
 
 
@@ -46,6 +48,8 @@ class DeliveryResult:
 
     state: DeliveryState
     recent_deliveries: tuple[RecentDelivery, ...] = ()
+    delivered_tweets: tuple[DeliveredTweet, ...] = ()
+    skipped_tweets: tuple[SkippedTweet, ...] = ()
 
     @property
     def counts_toward_limit(self) -> bool:
@@ -62,6 +66,8 @@ class CollectiveFlushResult:
     successful_authors: frozenset[str]
     failed_authors: frozenset[str]
     recent_deliveries: tuple[RecentDelivery, ...] = ()
+    delivered_tweets: tuple[DeliveredTweet, ...] = ()
+    skipped_tweets: tuple[SkippedTweet, ...] = ()
 
 
 @dataclass(slots=True)
@@ -93,6 +99,7 @@ class TweetDeliveryService:
         self.settings = settings
         self._collected_tweets: dict[str, list[CachedTweet]] = {}
         self._pending_retweet_seen: dict[str, set[str]] = {}
+        self._collected_skips: list[SkippedTweet] = []
 
     @property
     def collective_enabled(self) -> bool:
@@ -105,6 +112,7 @@ class TweetDeliveryService:
     def clear_collected(self) -> None:
         self._collected_tweets.clear()
         self._pending_retweet_seen.clear()
+        self._collected_skips.clear()
 
     @staticmethod
     def split_chain_for_nodes(
@@ -213,12 +221,16 @@ class TweetDeliveryService:
             # History is observational; its failure must not trigger a resend.
             logger.warning(f"保存最近推送记录失败 {umo} -> @{username}: {exc}")
 
-    async def send_plain_chain_resilient(self, umo: str, chain: list) -> bool:
+    async def send_plain_chain_resilient(
+        self, umo: str, chain: list, *, on_primary_sent: Callable[[], None] | None = None
+    ) -> bool:
         """发送普通消息；媒体失败时优先补发文字，再逐图尝试。"""
         if not chain:
             return True
         try:
             await self._send_message_checked(umo, MessageChain(chain=chain))
+            if on_primary_sent is not None:
+                on_primary_sent()
             return True
         except Exception as exc:
             logger.warning(f"包含媒体的消息发送失败，尝试保留文字内容: {exc}")
@@ -242,6 +254,8 @@ class TweetDeliveryService:
                     MessageChain(chain=text_parts),
                 )
                 text_sent = True
+                if on_primary_sent is not None:
+                    on_primary_sent()
             except Exception as exc:
                 logger.error(f"媒体降级后的文字消息仍发送失败: {exc}")
 
@@ -253,6 +267,8 @@ class TweetDeliveryService:
                     MessageChain(chain=[image_part]),
                 )
                 image_sent = True
+                if not text_parts and on_primary_sent is not None:
+                    on_primary_sent()
             except Exception as exc:
                 image_url = getattr(image_part, "file", "") or getattr(
                     image_part,
@@ -319,8 +335,53 @@ class TweetDeliveryService:
         username: str,
         tweet_info: dict,
         cycle: TranslationCycleState | None = None,
+        *,
+        pending_tweet_items: dict[str, list[dict]] | None = None,
+        include_retweets: bool = True,
     ) -> DeliveryResult:
-        """推送或加入集体缓存；返回实际成功的摘要，不单独写历史 KV。"""
+        """正常返回成功摘要；中断时保存已完成结果，不推进游标。"""
+        recent_deliveries: list[RecentDelivery] = []
+        delivered_tweets: list[DeliveredTweet] = []
+        skipped_tweets: list[SkippedTweet] = []
+        try:
+            return await self._push_to_subscribers(
+                username, tweet_info, cycle, recent_deliveries, delivered_tweets, skipped_tweets,
+                include_retweets,
+            )
+        except (Exception, asyncio.CancelledError):
+            await self._save_interrupted_deliveries(
+                delivered_tweets, recent_deliveries, skipped_tweets, pending_tweet_items
+            )
+            raise
+
+    async def _save_interrupted_deliveries(
+        self,
+        delivered_tweets: list[DeliveredTweet],
+        recent_deliveries: list[RecentDelivery],
+        skipped_tweets: list[SkippedTweet],
+        pending_tweet_items: dict[str, list[dict]] | None,
+    ) -> None:
+        """异常或取消退出时保存已经确认成功的结果，保留原异常。"""
+        if not delivered_tweets and not recent_deliveries and not skipped_tweets and not pending_tweet_items:
+            return
+        try:
+            await self.subscriptions.save_pending_deliveries(
+                tuple(delivered_tweets), recent_deliveries=tuple(recent_deliveries),
+                skipped_tweets=tuple(skipped_tweets), pending_tweet_items=pending_tweet_items,
+            )
+        except Exception as exc:
+            logger.warning(f"保存中断前推送结果失败，下次可能重复推送: {exc}")
+
+    async def _push_to_subscribers(
+        self,
+        username: str,
+        tweet_info: dict,
+        cycle: TranslationCycleState | None,
+        recent_deliveries: list[RecentDelivery],
+        delivered_tweets: list[DeliveredTweet],
+        skipped_tweets: list[SkippedTweet],
+        include_retweets: bool,
+    ) -> DeliveryResult:
         latest_subs = await self.subscriptions.get_all()
         if username not in latest_subs:
             return DeliveryResult(DeliveryState.SKIPPED)
@@ -341,22 +402,26 @@ class TweetDeliveryService:
         else:
             nickname = self.messages.build_nickname(username, screen_name)
 
-        should_dedup_retweet = (
-            self.settings.deduplicate_retweets
-            and bool(retweet)
-            and bool(str(tweet_info.get("tweet_id") or ""))
+        tweet_id = str(tweet_info.get("tweet_id") or "")
+        is_retweet = bool(retweet) and bool(tweet_id)
+        should_dedup_retweet = self.settings.deduplicate_retweets and is_retweet and include_retweets
+        restore_retweet_receipts = is_retweet and any(
+            tweet_id in (config.get("pending_delivery_ids") or [])
+            for config in subscribers.values()
         )
         retweet_dedup_seen: dict | None = None
-        if should_dedup_retweet:
+        if should_dedup_retweet or restore_retweet_receipts:
             retweet_dedup_seen = await self.subscriptions.get_retweet_seen()
-        retweet_dedup_id = str(tweet_info.get("tweet_id") or "")
 
         first_umo = next(iter(subscribers), "")
-        translated_text, translate_model = await self.messages.maybe_translate(
-            tweet_info,
-            first_umo,
-            cycle=cycle,
-        )
+        details_available = bool(tweet_info.get("status", True))
+        translated_text, translate_model = None, None
+        if details_available:
+            translated_text, translate_model = await self.messages.maybe_translate(
+                tweet_info,
+                first_umo,
+                cycle=cycle,
+            )
         if translate_model:
             original_text = str(tweet_info.get("text") or "")
             quote_text = str((tweet_info.get("quote") or {}).get("text") or "")
@@ -368,36 +433,66 @@ class TweetDeliveryService:
             )
 
         had_target = False
-        recent_deliveries: list[RecentDelivery] = []
+        already_delivered = False
         delivery_failed = False
         retweet_dedup_dirty = False
+
+        def record_skip(umo: str) -> None:
+            confirmation = SkippedTweet(umo, username, tweet_id)
+            skipped_tweets.append(confirmation)
+            if self.collective_enabled:
+                self._collected_skips.append(confirmation)
+
         for umo, sub_config in subscribers.items():
-            if not sub_config.get("status", True):
+            if tweet_id in (sub_config.get("pending_delivery_ids") or []):
+                already_delivered = True
+                # 回执证明过去已发送；恢复事实不受当前过滤/去重开关影响。
+                if restore_retweet_receipts and retweet_dedup_seen is not None:
+                    self.subscriptions.mark_retweet_seen(retweet_dedup_seen, umo, tweet_id)
+                    retweet_dedup_dirty = True
+                continue
+
+            if tweet_id in (sub_config.get("pending_skip_ids") or []):
+                continue
+
+            if not sub_config.get("status", True) or (is_retweet and not include_retweets):
+                record_skip(umo)
+                continue
+
+            if not details_available:
+                delivery_failed = True
                 continue
 
             is_r18 = tweet_info.get("is_r18", False)
             if is_r18 and not sub_config.get("r18", False):
+                record_skip(umo)
                 continue
 
             if (
                 sub_config.get("media", False)
                 and not self.messages.tweet_has_media(tweet_info)
             ):
+                record_skip(umo)
                 continue
 
             if should_dedup_retweet and retweet_dedup_seen is not None:
                 already_seen = self.subscriptions.retweet_seen_by_umo(
                     retweet_dedup_seen,
                     umo,
-                    retweet_dedup_id,
+                    tweet_id,
                 )
-                pending_seen = retweet_dedup_id in (
+                pending_seen = tweet_id in (
                     self._pending_retweet_seen.get(umo) or set()
                 )
-                if already_seen or pending_seen:
+                if already_seen:
+                    record_skip(umo)
                     logger.debug(
-                        f"跳过重复转帖 {umo}: @{username} -> {retweet_dedup_id}"
+                        f"跳过重复转帖 {umo}: @{username} -> {tweet_id}"
                     )
+                    continue
+                if pending_seen:
+                    # 同轮排队尚未确认成功，保留当前作者游标，下一轮再判定去重。
+                    delivery_failed = True
                     continue
 
             had_target = True
@@ -411,13 +506,13 @@ class TweetDeliveryService:
                         translated_text=translated_text,
                         translate_model=translate_model,
                         retweet_dedup_id=(
-                            retweet_dedup_id if should_dedup_retweet else ""
+                            tweet_id if should_dedup_retweet else ""
                         ),
                     )
                 )
                 if should_dedup_retweet:
                     self._pending_retweet_seen.setdefault(umo, set()).add(
-                        retweet_dedup_id
+                        tweet_id
                     )
                 continue
 
@@ -430,6 +525,7 @@ class TweetDeliveryService:
                 translated_text=translated_text,
                 translate_model=translate_model,
                 recent_deliveries=recent_deliveries,
+                delivered_tweets=delivered_tweets,
             )
             if not sent:
                 delivery_failed = True
@@ -438,20 +534,31 @@ class TweetDeliveryService:
                 self.subscriptions.mark_retweet_seen(
                     retweet_dedup_seen,
                     umo,
-                    retweet_dedup_id,
+                    tweet_id,
                 )
                 retweet_dedup_dirty = True
 
         if retweet_dedup_dirty and retweet_dedup_seen is not None:
-            await self.subscriptions.save_retweet_seen(retweet_dedup_seen)
+            try:
+                await self.subscriptions.save_retweet_seen(retweet_dedup_seen)
+            except Exception as exc:
+                logger.error(f"保存转帖去重记录失败，保留推送结果等待重试: {exc}")
+                delivery_failed = True
 
         if delivery_failed:
-            return DeliveryResult(DeliveryState.FAILED, tuple(recent_deliveries))
+            return DeliveryResult(
+                DeliveryState.FAILED, tuple(recent_deliveries), tuple(delivered_tweets), tuple(skipped_tweets)
+            )
         if not had_target:
-            return DeliveryResult(DeliveryState.SKIPPED)
+            if already_delivered:
+                # 已送达的重试条目仍计入本轮限额，避免失败窗口不断扩大。
+                return DeliveryResult(DeliveryState.DELIVERED, skipped_tweets=tuple(skipped_tweets))
+            return DeliveryResult(DeliveryState.SKIPPED, skipped_tweets=tuple(skipped_tweets))
         if self.collective_enabled:
-            return DeliveryResult(DeliveryState.QUEUED)
-        return DeliveryResult(DeliveryState.DELIVERED, tuple(recent_deliveries))
+            return DeliveryResult(DeliveryState.QUEUED, skipped_tweets=tuple(skipped_tweets))
+        return DeliveryResult(
+            DeliveryState.DELIVERED, tuple(recent_deliveries), tuple(delivered_tweets), tuple(skipped_tweets)
+        )
 
     async def send_to_subscriber(
         self,
@@ -464,13 +571,25 @@ class TweetDeliveryService:
         translate_model: str | None = None,
         *,
         recent_deliveries: list[RecentDelivery] | None = None,
+        delivered_tweets: list[DeliveredTweet] | None = None,
     ) -> bool:
         """向单个订阅者发送推文，成功后尽力记录最近历史。
 
         轮询传入 recent_deliveries 时只追加内存摘要，由调用方与游标一起
         持久化；直接调用未传入时会写入 KV。历史生成或单独写入失败只记
-        告警，不改变发送结果；任务取消仍向上传播。
+        告警，不改变发送结果；任务取消仍向上传播。delivered_tweets 在
+        主要内容发送成功后追加，附加媒体中断不丢弃正文回执。
         """
+        receipt_recorded = False
+
+        def record_sent() -> None:
+            nonlocal receipt_recorded
+            if delivered_tweets is not None and not receipt_recorded:
+                delivered_tweets.append(DeliveredTweet(
+                    umo, username, str(tweet_info.get("tweet_id") or "")
+                ))
+                receipt_recorded = True
+
         try:
             chain = await self.messages.build_message_chain(
                 username,
@@ -480,6 +599,7 @@ class TweetDeliveryService:
                 translate_model=translate_model,
             )
             if not chain:
+                record_sent()
                 return True
 
             if self.settings.use_node:
@@ -493,11 +613,14 @@ class TweetDeliveryService:
                             umo,
                             MessageChain(chain=[Nodes(nodes)]),
                         )
-                    video_results = [
-                        await self.send_video_or_fallback(umo, video)
-                        for video in video_parts
-                    ]
-                    sent = bool(nodes) or any(video_results)
+                        record_sent()
+                    video_sent = False
+                    for video in video_parts:
+                        if await self.send_video_or_fallback(umo, video):
+                            video_sent = True
+                            if not nodes:
+                                record_sent()
+                    sent = bool(nodes) or video_sent
                 except Exception as exc:
                     logger.warning(
                         f"合并转发失败，回退到普通消息: {exc}"
@@ -505,7 +628,7 @@ class TweetDeliveryService:
                     fallback_chain = self.build_plain_chain(chain)
                     sent = bool(fallback_chain) and (
                         await self.send_plain_chain_resilient(
-                            umo, fallback_chain
+                            umo, fallback_chain, on_primary_sent=record_sent
                         )
                     )
             else:
@@ -513,15 +636,18 @@ class TweetDeliveryService:
                     chain
                 )
                 primary_sent = bool(plain_chain) and (
-                    await self.send_plain_chain_resilient(umo, plain_chain)
+                    await self.send_plain_chain_resilient(umo, plain_chain, on_primary_sent=record_sent)
                 )
-                video_results = [
-                    await self.send_video_or_fallback(umo, video)
-                    for video in video_parts
-                ]
-                sent = primary_sent if plain_chain else any(video_results)
+                video_sent = False
+                for video in video_parts:
+                    if await self.send_video_or_fallback(umo, video):
+                        video_sent = True
+                        if not plain_chain:
+                            record_sent()
+                sent = primary_sent if plain_chain else video_sent
 
             if sent:
+                record_sent()
                 await self._record_recent_delivery(umo, username, tweet_info, recent_deliveries)
                 logger.info(f"推文已推送至 {umo}")
             else:
@@ -531,11 +657,30 @@ class TweetDeliveryService:
             logger.error(f"推送推文至 {umo} 失败: {exc}")
             return False
 
-    async def flush_collected(self) -> CollectiveFlushResult:
+    async def flush_collected(
+        self, *, pending_tweet_items: dict[str, list[dict]] | None = None,
+    ) -> CollectiveFlushResult:
+        """中断保存完整窗口，包括尚无成功回执的较旧条目和配置跳过。"""
+        recent_deliveries: list[RecentDelivery] = []
+        delivered_tweets: list[DeliveredTweet] = []
+        skipped_tweets = self._collected_skips
+        self._collected_skips = []
+        try:
+            return await self._flush_collected(recent_deliveries, delivered_tweets, skipped_tweets)
+        except (Exception, asyncio.CancelledError):
+            await self._save_interrupted_deliveries(
+                delivered_tweets, recent_deliveries, skipped_tweets, pending_tweet_items
+            )
+            raise
+
+    async def _flush_collected(
+        self, recent_deliveries: list[RecentDelivery], delivered_tweets: list[DeliveredTweet],
+        skipped_tweets: list[SkippedTweet],
+    ) -> CollectiveFlushResult:
         """发送集体缓存，返回按推主汇总的结果和待持久化的成功摘要。"""
         if not self._collected_tweets:
             self._pending_retweet_seen.clear()
-            return CollectiveFlushResult(frozenset(), frozenset())
+            return CollectiveFlushResult(frozenset(), frozenset(), skipped_tweets=tuple(skipped_tweets))
 
         collected = self._collected_tweets
         self._collected_tweets = {}
@@ -548,7 +693,6 @@ class TweetDeliveryService:
         retweet_seen = await self.subscriptions.get_retweet_seen()
         retweet_seen_dirty = False
         retweet_seen_authors: set[str] = set()
-        recent_deliveries: list[RecentDelivery] = []
 
         def record_result(
             umo: str,
@@ -559,6 +703,11 @@ class TweetDeliveryService:
             if not succeeded:
                 author_success[cached_tweet.username] = False
                 return
+            receipt = DeliveredTweet(
+                umo, cached_tweet.username, str(cached_tweet.tweet_info.get("tweet_id") or "")
+            )
+            if receipt not in delivered_tweets:
+                delivered_tweets.append(receipt)
             if cached_tweet.retweet_dedup_id:
                 self.subscriptions.mark_retweet_seen(
                     retweet_seen,
@@ -588,6 +737,9 @@ class TweetDeliveryService:
                         cached_tweet.sub_config = sub_config
                         valid_tweets.append(cached_tweet)
                     elif sub_config is not None:
+                        skipped_tweets.append(SkippedTweet(
+                            umo, cached_tweet.username, str(cached_tweet.tweet_info.get("tweet_id") or "")
+                        ))
                         logger.debug(
                             "集体转发跳过已暂停的订阅: "
                             f"{umo} -> @{cached_tweet.username}"
@@ -688,22 +840,37 @@ class TweetDeliveryService:
                                 translated_text=cached_tweet.translated_text,
                                 translate_model=cached_tweet.translate_model,
                                 recent_deliveries=recent_deliveries,
+                                delivered_tweets=delivered_tweets,
                             )
                             record_result(umo, cached_tweet, sent)
                         continue
 
+                    # 整批节点均已发送，先保留全部正文回执再等待附加媒体。
+                    for cached_tweet, tweet_nodes, _tweet_videos in prepared:
+                        if tweet_nodes:
+                            delivered_tweets.append(DeliveredTweet(
+                                umo, cached_tweet.username,
+                                str(cached_tweet.tweet_info.get("tweet_id") or ""),
+                            ))
+
                     for cached_tweet, tweet_nodes, tweet_videos in prepared:
-                        video_results = [
-                            await self.send_video_or_fallback(umo, video)
-                            for video in tweet_videos
-                        ]
-                        succeeded = bool(tweet_nodes) or any(video_results)
+                        succeeded = bool(tweet_nodes)
                         if succeeded:
+                            record_result(umo, cached_tweet, True)
                             await self._record_recent_delivery(
                                 umo, cached_tweet.username, cached_tweet.tweet_info,
                                 recent_deliveries,
                             )
-                        record_result(umo, cached_tweet, succeeded)
+                        for video in tweet_videos:
+                            if await self.send_video_or_fallback(umo, video) and not succeeded:
+                                succeeded = True
+                                record_result(umo, cached_tweet, True)
+                                await self._record_recent_delivery(
+                                    umo, cached_tweet.username, cached_tweet.tweet_info,
+                                    recent_deliveries,
+                                )
+                        if not succeeded:
+                            record_result(umo, cached_tweet, False)
 
             if retweet_seen_dirty:
                 try:
@@ -725,4 +892,6 @@ class TweetDeliveryService:
             for username, succeeded in author_success.items()
             if not succeeded
         )
-        return CollectiveFlushResult(successful_authors, failed_authors, tuple(recent_deliveries))
+        return CollectiveFlushResult(
+            successful_authors, failed_authors, tuple(recent_deliveries), tuple(delivered_tweets), tuple(skipped_tweets)
+        )

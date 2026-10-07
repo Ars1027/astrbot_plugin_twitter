@@ -101,3 +101,163 @@ async def test_history_ignores_invalid_ids_and_keeps_quote_summary(store):
     record = (await service.get_recent_deliveries("group-a", "tester"))[0]
     assert record["text"] == "原文\n\n引用：引用正文"
     assert record["truncated"] is False
+
+
+@pytest.mark.asyncio
+async def test_pending_deliveries_are_isolated_preserved_and_cleaned(store):
+    data, _get, _put, service = store
+    data["twitter_subs"]["other"] = {
+        "since_id": "999", "subscribers": {"group-a": {"status": True}},
+    }
+    ids = [str(i) for i in range(1000, 1007)]
+    receipts = tuple(module.DeliveredTweet("group-a", "TESTER", tweet_id) for tweet_id in ids)
+    await service.save_pending_deliveries(receipts + (
+        module.DeliveredTweet("group-b", "tester", "1001"),
+        module.DeliveredTweet("group-a", "other", "1000"),
+    ))
+    author = data["twitter_subs"]["tester"]
+    assert author["since_id"] == "999"
+    assert author["processed_tweet_ids"] == ["999"]
+    assert author["subscribers"]["group-a"]["pending_delivery_ids"] == ids
+    assert author["subscribers"]["group-b"]["pending_delivery_ids"] == ["1001"]
+    assert "recent_deliveries" not in author["subscribers"]["group-a"]
+
+    await service.add("group-a", "tester", r18=True)
+    await service.update("group-a", "tester", {"enabled": False})
+    assert data["twitter_subs"]["tester"]["subscribers"]["group-a"]["pending_delivery_ids"] == ids
+
+    await service.commit_processed_tweets("tester", ["1000"], "1000")
+    author = data["twitter_subs"]["tester"]
+    assert author["subscribers"]["group-a"]["pending_delivery_ids"] == ids[1:]
+    assert author["subscribers"]["group-b"]["pending_delivery_ids"] == ["1001"]
+    assert data["twitter_subs"]["other"]["subscribers"]["group-a"]["pending_delivery_ids"] == ["1000"]
+    await service.commit_processed_tweets("tester", ids[1:], "1006")
+    assert all("pending_delivery_ids" not in sub
+               for sub in data["twitter_subs"]["tester"]["subscribers"].values())
+
+
+@pytest.mark.asyncio
+async def test_pending_delivery_write_failure_does_not_mutate_snapshot(store):
+    data, get, _put, _service = store
+    before = copy.deepcopy(data)
+    writes = []
+
+    async def fail(key, value):
+        writes.append((key, copy.deepcopy(value)))
+        raise OSError("KV unavailable")
+
+    service = module.SubscriptionService(get, fail, None, lambda: True)
+    history = module.SubscriptionService.prepare_delivery("group-a", "tester", {"tweet_id": "1000"})
+    with pytest.raises(OSError):
+        await service.save_pending_deliveries(
+            (module.DeliveredTweet("group-a", "tester", "1000"),),
+            recent_deliveries=(history,),
+        )
+    assert data == before
+    assert len(writes) == 1
+    key, candidate = writes[0]
+    assert key == "twitter_subs"
+    author = candidate["tester"]
+    assert author["since_id"] == "999"
+    subscriber = author["subscribers"]["group-a"]
+    assert subscriber["pending_delivery_ids"] == ["1000"]
+    assert subscriber["recent_deliveries"][0]["tweet_id"] == "1000"
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_discards_pending_deliveries_and_ignores_late_results(store):
+    data, _get, _put, service = store
+    receipts = tuple(module.DeliveredTweet(umo, "tester", "1000")
+                     for umo in ("group-a", "group-b"))
+    await service.save_pending_deliveries(receipts)
+    await service.remove("group-a", "tester")
+    await service.save_pending_deliveries(receipts)
+    assert "group-a" not in data["twitter_subs"]["tester"]["subscribers"]
+    assert data["twitter_subs"]["tester"]["subscribers"]["group-b"]["pending_delivery_ids"] == ["1000"]
+    await service.add("group-a", "tester")
+    assert "pending_delivery_ids" not in data["twitter_subs"]["tester"]["subscribers"]["group-a"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("current_cursor,next_cursor", [("999", "1020"), ("1020", "1000")])
+async def test_cursor_commit_cleans_receipts_for_missing_timeline_items(store, current_cursor, next_cursor):
+    data, _get, _put, service = store
+    author = data["twitter_subs"]["tester"]
+    author["since_id"] = current_cursor
+    author["subscribers"]["group-a"]["pending_delivery_ids"] = ["1001", "1020", "1021"]
+    await service.commit_processed_tweets("tester", [next_cursor], next_cursor)
+    author = data["twitter_subs"]["tester"]
+    assert author["since_id"] == "1020"
+    assert author["subscribers"]["group-a"]["pending_delivery_ids"] == ["1021"]
+    assert "pending_delivery_ids" not in author["subscribers"]["group-b"]
+
+
+@pytest.mark.asyncio
+async def test_pending_window_preserves_retweet_metadata_and_shares_cursor_cleanup(store):
+    data, _get, _put, service = store
+    items = [{"tweet_id": tweet_id, "username": "original", "is_retweet": True,
+              "retweeter_username": "tester", "retweeter_screen_name": "Tester",
+              "unused_full_text": "large payload"} for tweet_id in ("1000", "1001")]
+    receipts = tuple(module.DeliveredTweet("group-a", "tester", tweet_id)
+                     for tweet_id in ("1000", "1001"))
+    await service.save_pending_deliveries(receipts, pending_tweet_items={"TESTER": items})
+    author = data["twitter_subs"]["tester"]
+    assert len(author["pending_tweet_items"]) == 2
+    assert "unused_full_text" not in author["pending_tweet_items"][0]
+    snapshot = service.pending_tweet_items(author)
+    snapshot.clear()
+    assert len(author["pending_tweet_items"]) == 2
+    await service.add("group-a", "tester", r18=True)
+    await service.commit_processed_tweets("tester", ["1000"], "1000")
+    author = data["twitter_subs"]["tester"]
+    assert [item["tweet_id"] for item in author["pending_tweet_items"]] == ["1001"]
+    assert author["subscribers"]["group-a"]["pending_delivery_ids"] == ["1001"]
+    assert author["pending_tweet_items"][0]["username"] == "original"
+    await service.commit_processed_tweets("tester", ["1001"], "1001")
+    await service.save_pending_deliveries(receipts, pending_tweet_items={"tester": items})
+    author = data["twitter_subs"]["tester"]
+    assert "pending_tweet_items" not in author
+    assert "pending_delivery_ids" not in author["subscribers"]["group-a"]
+
+
+@pytest.mark.asyncio
+async def test_failed_window_write_does_not_mutate_live_snapshot(store):
+    data, get, _put, _service = store
+    before = copy.deepcopy(data)
+    writes = []
+
+    async def fail(key, value):
+        writes.append((key, copy.deepcopy(value)))
+        raise OSError("KV unavailable")
+
+    service = module.SubscriptionService(get, fail, None, lambda: True)
+    with pytest.raises(OSError):
+        await service.save_pending_deliveries(
+            (module.DeliveredTweet("group-a", "tester", "1000"),),
+            pending_tweet_items={"tester": [{"tweet_id": "1000", "username": "original", "is_retweet": True}]},
+        )
+    assert data == before
+    assert len(writes) == 1
+    candidate = writes[0][1]["tester"]
+    assert candidate["since_id"] == "999"
+    assert candidate["pending_tweet_items"][0]["username"] == "original"
+    assert candidate["subscribers"]["group-a"]["pending_delivery_ids"] == ["1000"]
+
+
+@pytest.mark.asyncio
+async def test_skip_confirmations_survive_reconfiguration_and_share_cursor_cleanup(store):
+    data, _get, _put, service = store
+    skipped = (module.SkippedTweet("group-a", "tester", "1000"),)
+    await service.save_pending_deliveries((), skipped_tweets=skipped,
+                                         pending_tweet_items={"tester": [{"tweet_id": "1000"}]})
+    await service.add("group-a", "tester", media_only=True)
+    subscriber = data["twitter_subs"]["tester"]["subscribers"]["group-a"]
+    assert subscriber["pending_skip_ids"] == ["1000"]
+    assert "pending_delivery_ids" not in subscriber
+    assert "recent_deliveries" not in subscriber
+    assert not data.get("twitter_retweet_dedup_seen")
+    await service.commit_processed_tweets("tester", ["1000"], "1000")
+    await service.save_pending_deliveries((), skipped_tweets=skipped)
+    author = data["twitter_subs"]["tester"]
+    assert "pending_skip_ids" not in author["subscribers"]["group-a"]
+    assert "pending_tweet_items" not in author
