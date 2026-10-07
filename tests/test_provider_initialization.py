@@ -1289,31 +1289,23 @@ async def test_polling_skips_disabled_retweets_and_advances_cursor(plugin_module
         async def get_tweet(self, *_args):
             raise AssertionError("关闭转帖后不应请求转帖详情")
 
-    class Delivery:
-        async def push_to_subscribers(self, *_args, **_kwargs):
-            raise AssertionError("关闭转帖后不应进入发送流程")
+    sent = []
 
+    async def send_message(umo, _message):
+        sent.append(umo)
+        return True
+
+    # 使用真实发送服务验证“不发送”，允许它先完成已有回执的恢复。
+    plugin = plugin_module.TwitterPlugin(types.SimpleNamespace(send_message=send_message), {
+        "twitter_include_retweets": False,
+    })
+    plugin.get_kv_data, plugin.put_kv_data = get_kv, put_kv
     api = API()
-    subscriptions = plugin_module.SubscriptionService(
-        get_kv,
-        put_kv,
-        api,
-        lambda: True,
-    )
-    polling = plugin_module.PollingService(
-        api,
-        subscriptions,
-        Delivery(),
-        plugin_module.PollingSettings(
-            include_retweets=False,
-            data_provider="fxtwitter",
-            custom_nitter_url="",
-            website_list=(),
-        ),
-    )
-
-    assert await polling.check_user("tester", store["tester"]) is True
+    plugin.twitter_api.get_user_timeline_items = api.get_user_timeline_items
+    plugin.twitter_api.get_tweet = api.get_tweet
+    assert await plugin.polling_service.check_user("tester", store["tester"]) is True
     assert store["tester"]["since_id"] == "101"
+    assert sent == []
 
 
 @pytest.mark.asyncio
@@ -2018,7 +2010,7 @@ async def test_delivery_history_and_cursor_share_one_write(plugin_module, use_no
 @pytest.fixture
 def review_retry_plugin_factory(plugin_module):
     def make(store, send_message, *, transport="collective", put_kv=None, dedup=False,
-             provider="nitter", max_tweets=5):
+             provider="nitter", max_tweets=5, include_retweets=True):
         async def get_kv(key, default):
             return copy.deepcopy(store.get(key, default))
 
@@ -2038,6 +2030,7 @@ def review_retry_plugin_factory(plugin_module):
             "twitter_use_node": transport != "plain",
             "twitter_collective_forward": transport == "collective",
             "twitter_deduplicate_retweets": dedup,
+            "twitter_include_retweets": include_retweets,
         })
         plugin.get_kv_data, plugin.put_kv_data = get_kv, put_kv or save
         plugin.twitter_api.get_user_timeline_items = timeline
@@ -2870,3 +2863,55 @@ async def test_orphan_self_retweet_uses_available_timeline_or_delivery_history(
     assert sent == ["bad"]
     assert store["twitter_subs"]["tester"]["since_id"] == "101"
     assert store["twitter_retweet_dedup_seen"] == {"good": ["101"], "bad": ["101"]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["plain", "node", "collective"])
+@pytest.mark.parametrize(("dedup", "include_retweets"), [(False, True), (True, False), (False, False)])
+@pytest.mark.parametrize("fail_restore", [False, True])
+async def test_confirmed_retweet_restores_seen_across_global_config_changes(
+    review_retry_plugin_factory, transport, dedup, include_retweets, fail_restore
+):
+    store = {"twitter_subs": {username: {
+        "since_id": "100", "subscribers": {"group": {"status": True}},
+    } for username in ("tester", "other")}, "twitter_retweet_dedup_seen": {}}
+    sent = []
+    failures = 1
+
+    async def put_kv(key, value):
+        nonlocal failures
+        if key == "twitter_retweet_dedup_seen" and failures:
+            failures -= 1
+            raise OSError("retweet state unavailable")
+        store[key] = copy.deepcopy(value)
+
+    async def send_message(umo, _message):
+        sent.append(umo)
+        return True
+
+    async def poll(username, *, dedup=True, include_retweets=True):
+        plugin = review_retry_plugin_factory(
+            store, send_message, transport=transport, put_kv=put_kv,
+            dedup=dedup, include_retweets=include_retweets,
+        )
+        await plugin.polling_service.check_user(username, copy.deepcopy(store["twitter_subs"][username]))
+        await plugin.polling_service.flush_pending_collective()
+
+    await poll("tester")
+    assert sent == ["group"]
+    assert store["twitter_retweet_dedup_seen"] == {}
+    if not include_retweets:
+        # A newly added target is explicitly skipped, never marked as actually sent.
+        store["twitter_subs"]["tester"]["subscribers"]["late"] = {"status": True}
+    if fail_restore:
+        failures = 1
+        await poll("tester", dedup=dedup, include_retweets=include_retweets)
+        author = store["twitter_subs"]["tester"]
+        assert author["since_id"] == "100"
+        assert author["subscribers"]["group"]["pending_delivery_ids"] == ["101"]
+    await poll("tester", dedup=dedup, include_retweets=include_retweets)
+    assert store["twitter_retweet_dedup_seen"] == {"group": ["101"]}
+    assert store["twitter_subs"]["tester"]["since_id"] == "101"
+    await poll("other")
+    assert store["twitter_subs"]["other"]["since_id"] == "101"
+    assert sent == ["group"]

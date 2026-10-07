@@ -337,6 +337,7 @@ class TweetDeliveryService:
         cycle: TranslationCycleState | None = None,
         *,
         pending_tweet_items: dict[str, list[dict]] | None = None,
+        include_retweets: bool = True,
     ) -> DeliveryResult:
         """正常返回成功摘要；中断时保存已完成结果，不推进游标。"""
         recent_deliveries: list[RecentDelivery] = []
@@ -344,7 +345,8 @@ class TweetDeliveryService:
         skipped_tweets: list[SkippedTweet] = []
         try:
             return await self._push_to_subscribers(
-                username, tweet_info, cycle, recent_deliveries, delivered_tweets, skipped_tweets
+                username, tweet_info, cycle, recent_deliveries, delivered_tweets, skipped_tweets,
+                include_retweets,
             )
         except (Exception, asyncio.CancelledError):
             await self._save_interrupted_deliveries(
@@ -378,6 +380,7 @@ class TweetDeliveryService:
         recent_deliveries: list[RecentDelivery],
         delivered_tweets: list[DeliveredTweet],
         skipped_tweets: list[SkippedTweet],
+        include_retweets: bool,
     ) -> DeliveryResult:
         latest_subs = await self.subscriptions.get_all()
         if username not in latest_subs:
@@ -399,15 +402,16 @@ class TweetDeliveryService:
         else:
             nickname = self.messages.build_nickname(username, screen_name)
 
-        should_dedup_retweet = (
-            self.settings.deduplicate_retweets
-            and bool(retweet)
-            and bool(str(tweet_info.get("tweet_id") or ""))
+        tweet_id = str(tweet_info.get("tweet_id") or "")
+        is_retweet = bool(retweet) and bool(tweet_id)
+        should_dedup_retweet = self.settings.deduplicate_retweets and is_retweet and include_retweets
+        restore_retweet_receipts = is_retweet and any(
+            tweet_id in (config.get("pending_delivery_ids") or [])
+            for config in subscribers.values()
         )
         retweet_dedup_seen: dict | None = None
-        if should_dedup_retweet:
+        if should_dedup_retweet or restore_retweet_receipts:
             retweet_dedup_seen = await self.subscriptions.get_retweet_seen()
-        tweet_id = str(tweet_info.get("tweet_id") or "")
 
         first_umo = next(iter(subscribers), "")
         details_available = bool(tweet_info.get("status", True))
@@ -442,7 +446,8 @@ class TweetDeliveryService:
         for umo, sub_config in subscribers.items():
             if tweet_id in (sub_config.get("pending_delivery_ids") or []):
                 already_delivered = True
-                if should_dedup_retweet and retweet_dedup_seen is not None:
+                # 回执证明过去已发送；恢复事实不受当前过滤/去重开关影响。
+                if restore_retweet_receipts and retweet_dedup_seen is not None:
                     self.subscriptions.mark_retweet_seen(retweet_dedup_seen, umo, tweet_id)
                     retweet_dedup_dirty = True
                 continue
@@ -450,7 +455,7 @@ class TweetDeliveryService:
             if tweet_id in (sub_config.get("pending_skip_ids") or []):
                 continue
 
-            if not sub_config.get("status", True):
+            if not sub_config.get("status", True) or (is_retweet and not include_retweets):
                 record_skip(umo)
                 continue
 

@@ -351,12 +351,10 @@ class PollingService:
                         "retweeter_screen_name": str(info.get("screen_name") or ""),
                     })
                     item.pop("metadata_missing")
-                if item.get("is_retweet") and not self.settings.include_retweets:
+                skip_retweet = item.get("is_retweet") and not self.settings.include_retweets
+                if skip_retweet:
                     logger.debug(f"跳过 @{username} 转帖: {tweet_id}")
-                    await self._record_processed_cursor(username, tweet_id)
-                    processed_tweet_ids.add(tweet_id)
-                    continue
-                if not tweet_info.get("status", True):
+                if not tweet_info.get("status", True) and not skip_retweet:
                     if not already_handled:
                         logger.warning(
                             f"获取 @{username} 推文详情失败，保留游标等待下次重试: "
@@ -375,6 +373,7 @@ class PollingService:
                         tweet_info,
                         cycle=cycle,
                         pending_tweet_items=retry_window,
+                        include_retweets=self.settings.include_retweets,
                     )
                 except (Exception, asyncio.CancelledError):
                     await self._save_partial_deliveries((), (), retry_window)
