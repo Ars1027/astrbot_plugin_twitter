@@ -39,6 +39,15 @@ class DeliveredTweet:
     tweet_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class SkippedTweet:
+    """会话按配置或已确认的转帖去重跳过，不代表实际发送。"""
+
+    umo: str
+    username: str
+    tweet_id: str
+
+
 class SubscriptionService:
     """集中管理插件的订阅持久化和并发写入。"""
 
@@ -113,9 +122,10 @@ class SubscriptionService:
                     session_config["recent_deliveries"] = copy.deepcopy(
                         history[:RECENT_DELIVERY_MAX_ITEMS]
                     )
-                pending_ids = subscribers.get(umo, {}).get("pending_delivery_ids")
-                if isinstance(pending_ids, list):
-                    session_config["pending_delivery_ids"] = list(pending_ids)
+                for field in ("pending_delivery_ids", "pending_skip_ids"):
+                    pending_ids = subscribers.get(umo, {}).get(field)
+                    if isinstance(pending_ids, list):
+                        session_config[field] = list(pending_ids)
                 subscribers[umo] = session_config
                 await self.save_all(subs)
                 return {
@@ -159,9 +169,10 @@ class SubscriptionService:
                     session_config["recent_deliveries"] = copy.deepcopy(
                         history[:RECENT_DELIVERY_MAX_ITEMS]
                     )
-                pending_ids = subscribers.get(umo, {}).get("pending_delivery_ids")
-                if isinstance(pending_ids, list):
-                    session_config["pending_delivery_ids"] = list(pending_ids)
+                for field in ("pending_delivery_ids", "pending_skip_ids"):
+                    pending_ids = subscribers.get(umo, {}).get(field)
+                    if isinstance(pending_ids, list):
+                        session_config[field] = list(pending_ids)
                 subscribers[umo] = session_config
                 await self.save_all(subs)
                 return {
@@ -283,6 +294,7 @@ class SubscriptionService:
         *,
         recent_deliveries: tuple[RecentDelivery, ...] = (),
         pending_tweet_items: dict[str, list[dict]] | None = None,
+        skipped_tweets: tuple[SkippedTweet, ...] = (),
     ) -> None:
         """部分失败时一次写入成功会话的重试凭据和历史，不推进游标。
 
@@ -290,7 +302,7 @@ class SubscriptionService:
         pending_tweet_items 保存固定重试窗口的时间线元数据；轮询层限制
         接纳数量，窗口完成前不接纳新条目。仅保留尚未提交的条目。
         """
-        if not delivered_tweets and not recent_deliveries and not pending_tweet_items:
+        if not delivered_tweets and not recent_deliveries and not pending_tweet_items and not skipped_tweets:
             return
         async with self._lock:
             subs = copy.deepcopy(await self.get_all())
@@ -303,19 +315,21 @@ class SubscriptionService:
                 return not cursor.isdigit() or int(tweet_id) > int(cursor)
 
             changed = False
-            for delivery in delivered_tweets:
-                if not is_uncommitted(delivery.username, delivery.tweet_id):
-                    continue
-                key = self.find_key(subs, delivery.username)
-                subscriber = subs.get(key, {}).get("subscribers", {}).get(delivery.umo)
-                if not isinstance(subscriber, dict):
-                    continue
-                pending_ids = subscriber.get("pending_delivery_ids", [])
-                if not isinstance(pending_ids, list):
-                    pending_ids = []
-                if delivery.tweet_id not in pending_ids:
-                    subscriber["pending_delivery_ids"] = [*pending_ids, delivery.tweet_id]
-                    changed = True
+            for confirmations, field in ((delivered_tweets, "pending_delivery_ids"),
+                                         (skipped_tweets, "pending_skip_ids")):
+                for confirmation in confirmations:
+                    if not is_uncommitted(confirmation.username, confirmation.tweet_id):
+                        continue
+                    key = self.find_key(subs, confirmation.username)
+                    subscriber = subs.get(key, {}).get("subscribers", {}).get(confirmation.umo)
+                    if not isinstance(subscriber, dict):
+                        continue
+                    pending_ids = subscriber.get(field, [])
+                    if not isinstance(pending_ids, list):
+                        pending_ids = []
+                    if confirmation.tweet_id not in pending_ids:
+                        subscriber[field] = [*pending_ids, confirmation.tweet_id]
+                        changed = True
             history_changed = self._apply_recent_deliveries(subs, tuple(
                 delivery for delivery in recent_deliveries
                 if is_uncommitted(delivery.username, str(delivery.record.get("tweet_id") or ""))
@@ -328,6 +342,9 @@ class SubscriptionService:
                 pending_items = self.pending_tweet_items(author_info)
                 known_ids = {item["tweet_id"] for item in pending_items}
                 for item in items:
+                    # 旧孤立回执的元数据尚未恢复，保留原回执作为重试入口。
+                    if item.get("metadata_missing"):
+                        continue
                     tweet_id = str(item.get("tweet_id") or "")
                     if tweet_id in known_ids or not is_uncommitted(username, tweet_id):
                         continue
@@ -517,23 +534,24 @@ class SubscriptionService:
             effective_cursor = str(author_info.get("since_id") or "")
             cursor_value = int(effective_cursor) if effective_cursor.isdigit() else None
             for subscriber in author_info.get("subscribers", {}).values():
-                pending_ids = subscriber.get("pending_delivery_ids", [])
-                if not isinstance(pending_ids, list):
-                    continue
-                remaining_ids = [
-                    item for item in pending_ids
-                    if item not in committed_ids and not (
-                        cursor_value is not None
-                        and str(item).isdigit()
-                        and int(item) <= cursor_value
-                    )
-                ]
-                if remaining_ids != pending_ids:
-                    if remaining_ids:
-                        subscriber["pending_delivery_ids"] = remaining_ids
-                    else:
-                        subscriber.pop("pending_delivery_ids", None)
-                    changed = True
+                for field in ("pending_delivery_ids", "pending_skip_ids"):
+                    pending_ids = subscriber.get(field, [])
+                    if not isinstance(pending_ids, list):
+                        continue
+                    remaining_ids = [
+                        item for item in pending_ids
+                        if item not in committed_ids and not (
+                            cursor_value is not None
+                            and str(item).isdigit()
+                            and int(item) <= cursor_value
+                        )
+                    ]
+                    if remaining_ids != pending_ids:
+                        if remaining_ids:
+                            subscriber[field] = remaining_ids
+                        else:
+                            subscriber.pop(field, None)
+                        changed = True
             pending_items = self.pending_tweet_items(author_info)
             remaining_items = [
                 item for item in pending_items

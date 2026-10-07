@@ -16,6 +16,7 @@ from .subscription_service import (
     PENDING_TWEET_MAX_ITEMS,
     DeliveredTweet,
     RecentDelivery,
+    SkippedTweet,
     SubscriptionService,
 )
 from .tweet_delivery_service import (
@@ -101,14 +102,16 @@ class PollingService:
         delivered_tweets: tuple[DeliveredTweet, ...],
         recent_deliveries: tuple[RecentDelivery, ...],
         pending_tweet_items: dict[str, list[dict]] | None = None,
+        skipped_tweets: tuple[SkippedTweet, ...] = (),
     ) -> None:
         """不能推进游标时保存成功会话，下次仅重试未成功的会话。"""
-        if not delivered_tweets and not recent_deliveries and not pending_tweet_items:
+        if not delivered_tweets and not recent_deliveries and not pending_tweet_items and not skipped_tweets:
             return
         try:
             await self.subscriptions.save_pending_deliveries(
                 delivered_tweets, recent_deliveries=recent_deliveries,
                 pending_tweet_items=pending_tweet_items,
+                skipped_tweets=skipped_tweets,
             )
         except Exception as exc:
             logger.warning(f"保存部分推送结果失败，下次可能重复推送: {exc}")
@@ -127,7 +130,7 @@ class PollingService:
         self._pending_collective_tweet_ids = {}
         self._pending_collective_tweet_items = {}
         try:
-            flush_result = await self.delivery.flush_collected()
+            flush_result = await self.delivery.flush_collected(pending_tweet_items=pending_tweet_items)
         except (Exception, asyncio.CancelledError) as exc:
             await self._save_partial_deliveries((), (), pending_tweet_items)
             self.delivery.clear_collected()
@@ -160,6 +163,7 @@ class PollingService:
                 flush_result.delivered_tweets, recent_deliveries,
                 {username: items for username, items in pending_tweet_items.items()
                  if username in uncommitted_authors},
+                flush_result.skipped_tweets,
             )
 
     @staticmethod
@@ -243,22 +247,37 @@ class PollingService:
             since_id = info.get("since_id", "")
             processed_tweet_ids = self.subscriptions.processed_tweet_ids(info)
             new_tweet_items = SubscriptionService.pending_tweet_items(info)
+            known_ids = {str(item["tweet_id"]) for item in new_tweet_items}
+            pending_ids = {
+                str(tweet_id)
+                for subscriber in info.get("subscribers", {}).values()
+                for field in ("pending_delivery_ids", "pending_skip_ids")
+                for tweet_id in (subscriber.get(field) or [])
+            }
+            missing_ids = pending_ids - known_ids
+            if missing_ids:
+                # 可用的时间线保留自转帖等上下文；查询失败也不能阻断按 ID 恢复。
+                try:
+                    timeline_items = await self.twitter_api.get_user_timeline_items(username, since_id)
+                except Exception as exc:
+                    logger.warning(f"恢复 @{username} 旧回执时无法读取时间线，改为获取详情: {exc}")
+                    timeline_items = []
+                for item in timeline_items:
+                    tweet_id = str(item.get("tweet_id") or "")
+                    if tweet_id in missing_ids:
+                        new_tweet_items.append(item)
+                        missing_ids.remove(tweet_id)
+            # 元数据缺失的旧回执仍是重试入口；不能等待它重新出现在时间线上。
+            new_tweet_items.extend(
+                {"tweet_id": tweet_id, "metadata_missing": True}
+                for tweet_id in missing_ids
+            )
             retrying = bool(new_tweet_items)
             if not new_tweet_items:
                 new_tweet_items = await self.twitter_api.get_user_timeline_items(
                     username,
                     since_id,
                 )
-                # 旧回执没有转帖元数据，只接纳数据源能够重新识别的已有条目。
-                legacy_pending_ids = {
-                    str(tweet_id)
-                    for subscriber in info.get("subscribers", {}).values()
-                    for tweet_id in (subscriber.get("pending_delivery_ids") or [])
-                }
-                if legacy_pending_ids:
-                    retrying = True
-                    new_tweet_items = [item for item in new_tweet_items
-                                       if str(item.get("tweet_id") or "") in legacy_pending_ids]
             # 按原帖 ID 顺序处理，避免较新的游标越过窗口中的旧转帖。
             # 固定失败窗口限制接纳数量，不丢弃已经成功会话的去重凭据。
             new_tweet_items = sorted(
@@ -298,21 +317,13 @@ class PollingService:
                     await self._record_processed_cursor(username, tweet_id)
                     continue
 
-                if (
-                    item.get("is_retweet")
-                    and not self.settings.include_retweets
-                ):
-                    logger.debug(f"跳过 @{username} 转帖: {tweet_id}")
-                    await self._record_processed_cursor(username, tweet_id)
-                    processed_tweet_ids.add(tweet_id)
-                    continue
-
                 already_handled = retrying and all(
                     not config.get("status", True)
                     or tweet_id in (config.get("pending_delivery_ids") or [])
+                    or tweet_id in (config.get("pending_skip_ids") or [])
                     for config in latest_subs[latest_key].get("subscribers", {}).values()
                 )
-                if already_handled:
+                if already_handled or (item.get("is_retweet") and not self.settings.include_retweets):
                     # 仅恢复回执/配置跳过；发送服务禁止缺少详情时发送新正文。
                     tweet_info = {"status": False, "tweet_id": tweet_id, "username": tweet_username}
                 else:
@@ -324,6 +335,27 @@ class PollingService:
                     except (Exception, asyncio.CancelledError):
                         await self._save_partial_deliveries((), (), retry_window)
                         raise
+                if item.get("metadata_missing") and (tweet_info.get("status", True) or already_handled):
+                    # 老数据缺少时间线上下文；优先保留历史中的自转帖标记。
+                    original_author = str(tweet_info.get("username") or username)
+                    was_retweet = any(
+                        str(record.get("tweet_id") or "") == tweet_id and record.get("is_retweet")
+                        for config in latest_subs[latest_key].get("subscribers", {}).values()
+                        for record in (config.get("recent_deliveries") or [])
+                    )
+                    item.update({
+                        "username": original_author,
+                        "is_retweet": bool(was_retweet or tweet_info.get("retweet")
+                                           or original_author.casefold() != username.casefold()),
+                        "retweeter_username": username,
+                        "retweeter_screen_name": str(info.get("screen_name") or ""),
+                    })
+                    item.pop("metadata_missing")
+                if item.get("is_retweet") and not self.settings.include_retweets:
+                    logger.debug(f"跳过 @{username} 转帖: {tweet_id}")
+                    await self._record_processed_cursor(username, tweet_id)
+                    processed_tweet_ids.add(tweet_id)
+                    continue
                 if not tweet_info.get("status", True):
                     if not already_handled:
                         logger.warning(
@@ -342,6 +374,7 @@ class PollingService:
                         username,
                         tweet_info,
                         cycle=cycle,
+                        pending_tweet_items=retry_window,
                     )
                 except (Exception, asyncio.CancelledError):
                     await self._save_partial_deliveries((), (), retry_window)
@@ -361,6 +394,7 @@ class PollingService:
                     await self._save_partial_deliveries(
                         delivery_result.delivered_tweets, delivery_result.recent_deliveries,
                         retry_window,
+                        delivery_result.skipped_tweets,
                     )
                     break
 
@@ -370,6 +404,7 @@ class PollingService:
                     await self._save_partial_deliveries(
                         delivery_result.delivered_tweets, delivery_result.recent_deliveries,
                         retry_window,
+                        delivery_result.skipped_tweets,
                     )
                     raise
                 processed_tweet_ids.add(tweet_id)

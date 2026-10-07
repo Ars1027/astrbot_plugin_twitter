@@ -242,3 +242,22 @@ async def test_failed_window_write_does_not_mutate_live_snapshot(store):
     assert candidate["since_id"] == "999"
     assert candidate["pending_tweet_items"][0]["username"] == "original"
     assert candidate["subscribers"]["group-a"]["pending_delivery_ids"] == ["1000"]
+
+
+@pytest.mark.asyncio
+async def test_skip_confirmations_survive_reconfiguration_and_share_cursor_cleanup(store):
+    data, _get, _put, service = store
+    skipped = (module.SkippedTweet("group-a", "tester", "1000"),)
+    await service.save_pending_deliveries((), skipped_tweets=skipped,
+                                         pending_tweet_items={"tester": [{"tweet_id": "1000"}]})
+    await service.add("group-a", "tester", media_only=True)
+    subscriber = data["twitter_subs"]["tester"]["subscribers"]["group-a"]
+    assert subscriber["pending_skip_ids"] == ["1000"]
+    assert "pending_delivery_ids" not in subscriber
+    assert "recent_deliveries" not in subscriber
+    assert not data.get("twitter_retweet_dedup_seen")
+    await service.commit_processed_tweets("tester", ["1000"], "1000")
+    await service.save_pending_deliveries((), skipped_tweets=skipped)
+    author = data["twitter_subs"]["tester"]
+    assert "pending_skip_ids" not in author["subscribers"]["group-a"]
+    assert "pending_tweet_items" not in author
