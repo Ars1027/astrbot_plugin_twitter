@@ -15,6 +15,7 @@ PROCESSED_TWEET_MAX_ITEMS = 500
 PENDING_TWEET_MAX_ITEMS = 500
 RECENT_DELIVERY_MAX_ITEMS = 5
 RECENT_DELIVERY_TEXT_LIMIT = 500
+AGENT_RECENT_DELIVERY_MAX_LIMIT = 20
 
 KVGetter = Callable[[str, Any], Awaitable[Any]]
 KVSetter = Callable[[str, Any], Awaitable[None]]
@@ -242,22 +243,116 @@ class SubscriptionService:
                 [:RECENT_DELIVERY_MAX_ITEMS]
             )
 
+    @classmethod
+    def _normalize_delivery_record(cls, record: dict, author_key: str) -> dict:
+        """补全旧摘要缺失的 username/url，供 Agent 查询使用。"""
+        item = copy.deepcopy(record)
+        username = str(item.get("username") or author_key or "").strip().lstrip("@")
+        tweet_id = str(item.get("tweet_id") or "")
+        if username:
+            item["username"] = username
+        if tweet_id and username and not item.get("url"):
+            item["url"] = f"https://x.com/{username}/status/{tweet_id}"
+        if "has_media" not in item:
+            item["has_media"] = False
+        return item
+
+    @staticmethod
+    def _delivery_sort_key(record: dict) -> tuple[int, str]:
+        delivered_at = str(record.get("delivered_at") or "")
+        try:
+            datetime.fromisoformat(delivered_at)
+            # 可解析时间优先（1），再按 ISO 字符串降序。
+            return (1, delivered_at)
+        except ValueError:
+            return (0, "")
+
+    async def list_session_recent_deliveries(
+        self,
+        umo: str,
+        *,
+        username: str | None = None,
+        limit: int = 5,
+    ) -> list[dict]:
+        """按会话聚合最近成功推送摘要，供 Agent 按需查询。"""
+        capped = max(1, min(int(limit or 5), AGENT_RECENT_DELIVERY_MAX_LIMIT))
+        filter_name = str(username or "").strip().lstrip("@")
+        async with self._lock:
+            subs = await self.get_all()
+            if filter_name:
+                key = self.find_key(subs, filter_name)
+                authors = [(key, subs[key])] if key is not None else []
+            else:
+                authors = list(subs.items())
+
+            items: list[dict] = []
+            for author_key, author in authors:
+                if not isinstance(author, dict):
+                    continue
+                subscriber = author.get("subscribers", {}).get(umo)
+                if not isinstance(subscriber, dict):
+                    continue
+                records = subscriber.get("recent_deliveries", [])
+                if not isinstance(records, list):
+                    continue
+                for record in records:
+                    if isinstance(record, dict):
+                        items.append(self._normalize_delivery_record(record, author_key))
+
+            items.sort(key=self._delivery_sort_key, reverse=True)
+            return items[:capped]
+
+    @staticmethod
+    def format_recent_deliveries_for_agent(items: list[dict]) -> str:
+        """将推送摘要格式化为供 LLM 阅读的纯文本。"""
+        if not items:
+            return "本会话暂无成功推送摘要。"
+        lines: list[str] = []
+        for index, item in enumerate(items, start=1):
+            username = str(item.get("username") or "unknown")
+            delivered_at = str(item.get("delivered_at") or "未知时间")
+            flags: list[str] = []
+            if item.get("is_retweet"):
+                flags.append("转帖")
+            if item.get("has_media"):
+                flags.append("含媒体")
+            flag_text = f"（{'/'.join(flags)}）" if flags else ""
+            text = str(item.get("text") or "").strip() or "（无正文）"
+            if item.get("truncated") and not text.endswith("…"):
+                text = f"{text}…"
+            url = str(item.get("url") or "").strip()
+            block = (
+                f"{index}. @{username}{flag_text} · {delivered_at}\n"
+                f"{text}"
+            )
+            if url:
+                block += f"\n{url}"
+            lines.append(block)
+        return "\n\n".join(lines)
+
     @staticmethod
     def prepare_delivery(umo: str, username: str, tweet_info: dict) -> RecentDelivery | None:
         """在发送完成时生成摘要和时间，不执行 KV 读取或写入。"""
         tweet_id = str(tweet_info.get("tweet_id") or "")
         if not tweet_id.isascii() or not tweet_id.isdigit() or len(tweet_id) > 40:
             return
+        username = str(username or "").strip().lstrip("@")
+        if not username:
+            return
         text = str(tweet_info.get("text") or "")
         quote_text = str((tweet_info.get("quote") or {}).get("text") or "")
         if quote_text:
             text += f"\n\n引用：{quote_text}"
+        has_media = bool(tweet_info.get("images") or tweet_info.get("videos"))
         record = {
             "tweet_id": tweet_id,
+            "username": username,
+            "url": f"https://x.com/{username}/status/{tweet_id}",
             "text": text[:RECENT_DELIVERY_TEXT_LIMIT],
             "truncated": len(text) > RECENT_DELIVERY_TEXT_LIMIT,
             "delivered_at": datetime.now(timezone.utc).isoformat(),
             "is_retweet": bool(tweet_info.get("retweet")),
+            "has_media": has_media,
         }
         return RecentDelivery(umo, username, record)
 

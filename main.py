@@ -85,6 +85,17 @@ def _normalize_link_recognition_mode(value: Any) -> str:
     return LINK_RECOGNITION_MODE_AUTO
 
 
+def _llm_tool(**kwargs):
+    """注册 LLM Tool；旧版 AstrBot 缺少 filter.llm_tool 时退化为空操作。"""
+    factory = getattr(filter, "llm_tool", None)
+    if not callable(factory):
+        def passthrough(func):
+            return func
+
+        return passthrough
+    return factory(**kwargs)
+
+
 class TwitterPlugin(Star):
     """Twitter 推文转发插件主类。"""
 
@@ -202,6 +213,13 @@ class TwitterPlugin(Star):
             self._cfg(
                 "content_filter",
                 "twitter_deduplicate_retweets",
+                False,
+            )
+        )
+        self.agent_query_enabled = bool(
+            self._cfg(
+                "content_filter",
+                "twitter_agent_query_enabled",
                 False,
             )
         )
@@ -1096,6 +1114,36 @@ class TwitterPlugin(Star):
             report_errors=True,
         ):
             yield result
+
+    @_llm_tool(name="twitter_recent_pushes")
+    async def twitter_recent_pushes(
+        self,
+        event: AstrMessageEvent,
+        username: str = "",
+        limit: int = 5,
+    ):
+        """查询当前会话最近成功推送的推文摘要，便于回答「刚才推了什么」。
+
+        Args:
+            username(string): 可选，只查该推主；留空表示本会话全部推主
+            limit(number): 可选，返回条数，默认 5，最大 20
+        """
+        if not self.agent_query_enabled:
+            return (
+                "Twitter 推送摘要查询未开启。"
+                "请在插件配置中打开 twitter_agent_query_enabled。"
+            )
+        try:
+            capped = int(limit)
+        except (TypeError, ValueError):
+            capped = 5
+        filter_name = str(username or "").strip().lstrip("@") or None
+        items = await self.subscription_service.list_session_recent_deliveries(
+            event.unified_msg_origin,
+            username=filter_name,
+            limit=capped,
+        )
+        return self.subscription_service.format_recent_deliveries_for_agent(items)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):

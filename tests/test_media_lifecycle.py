@@ -86,6 +86,7 @@ def _load_main_module():
         command=_decorator,
         event_message_type=_decorator,
         permission_type=_decorator,
+        llm_tool=_decorator,
         EventMessageType=types.SimpleNamespace(ALL="all"),
         PermissionType=types.SimpleNamespace(ADMIN="admin"),
     )

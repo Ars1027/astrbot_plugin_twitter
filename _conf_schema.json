@@ -141,6 +141,12 @@
         "options": ["auto", "off", "command"],
         "labels": ["开启（自动解析）", "关闭", "开启但仅指令触发"],
         "hint": "自动解析会识别聊天中的 twitter.com / x.com 链接；仅指令触发时需使用 /推特解析 <推文链接>；关闭后两种方式均不解析"
+      },
+      "twitter_agent_query_enabled": {
+        "description": "允许 Agent 查询推送摘要",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后 Agent 可通过 twitter_recent_pushes 工具按需读取本会话最近成功推送的文字摘要（不写入对话上下文）"
       }
     }
   },
