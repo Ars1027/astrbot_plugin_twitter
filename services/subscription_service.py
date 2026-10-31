@@ -251,8 +251,12 @@ class SubscriptionService:
         tweet_id = str(item.get("tweet_id") or "")
         if username:
             item["username"] = username
-        if tweet_id and username and not item.get("url"):
-            item["url"] = f"https://x.com/{username}/status/{tweet_id}"
+        author_username = str(item.get("author_username") or "").strip().lstrip("@")
+        if not author_username and not item.get("is_retweet"):
+            author_username = username
+        item["author_username"] = author_username
+        if tweet_id:
+            item["url"] = f"https://x.com/{author_username or 'i'}/status/{tweet_id}"
         if "has_media" not in item:
             item["has_media"] = False
         return item
@@ -312,7 +316,11 @@ class SubscriptionService:
             username = str(item.get("username") or "unknown")
             delivered_at = str(item.get("delivered_at") or "未知时间")
             flags: list[str] = []
-            if item.get("is_retweet"):
+            author_username = str(item.get("author_username") or "")
+            heading = f"@{username}"
+            if item.get("is_retweet") and author_username:
+                heading = f"@{username} 转发了 @{author_username} 的帖子"
+            elif item.get("is_retweet"):
                 flags.append("转帖")
             if item.get("has_media"):
                 flags.append("含媒体")
@@ -322,7 +330,7 @@ class SubscriptionService:
                 text = f"{text}…"
             url = str(item.get("url") or "").strip()
             block = (
-                f"{index}. @{username}{flag_text} · {delivered_at}\n"
+                f"{index}. {heading}{flag_text} · {delivered_at}\n"
                 f"{text}"
             )
             if url:
@@ -343,11 +351,19 @@ class SubscriptionService:
         quote_text = str((tweet_info.get("quote") or {}).get("text") or "")
         if quote_text:
             text += f"\n\n引用：{quote_text}"
-        has_media = bool(tweet_info.get("images") or tweet_info.get("videos"))
+        quote = tweet_info.get("quote") or {}
+        has_media = bool(
+            tweet_info.get("images") or tweet_info.get("videos")
+            or quote.get("images") or quote.get("videos")
+        )
+        author_username = str(tweet_info.get("username") or "").strip().lstrip("@")
+        if not author_username and not tweet_info.get("retweet"):
+            author_username = username
         record = {
             "tweet_id": tweet_id,
             "username": username,
-            "url": f"https://x.com/{username}/status/{tweet_id}",
+            "author_username": author_username,
+            "url": f"https://x.com/{author_username or 'i'}/status/{tweet_id}",
             "text": text[:RECENT_DELIVERY_TEXT_LIMIT],
             "truncated": len(text) > RECENT_DELIVERY_TEXT_LIMIT,
             "delivered_at": datetime.now(timezone.utc).isoformat(),

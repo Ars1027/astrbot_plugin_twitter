@@ -1,3 +1,11 @@
+## v1.13.0 - ✨ Agent 推送摘要查询 2026/10/31
+
+### 新增功能
+
+- **Agent 推送摘要查询** — 新增默认关闭的 `twitter_agent_query_enabled`，允许模型通过 `twitter_recent_pushes` 按需查询当前群聊或私聊最近成功推送的文字摘要，可按订阅推主筛选；默认返回 5 条，最多 20 条。复用每推主、每会话最近 5 条、每条最多 500 字符的记录，支持文字、截图和合并转发模式。感谢 @Jinvic 的贡献。([Issue #31](https://github.com/Ars1027/astrbot_plugin_twitter/issues/31)、[PR #32](https://github.com/Ars1027/astrbot_plugin_twitter/pull/32))
+
+---
+
 ## v1.12.1 - 🔧 修复部分推送失败后的重复推送 2026/10/7
 
 ### 修复

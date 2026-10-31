@@ -146,7 +146,7 @@
         "description": "允许 Agent 查询推送摘要",
         "type": "bool",
         "default": false,
-        "hint": "开启后 Agent 可通过 twitter_recent_pushes 工具按需读取本会话最近成功推送的文字摘要（不写入对话上下文）"
+        "hint": "开启后 Agent 可按需读取本会话最近成功推送的文字摘要"
       }
     }
   },
