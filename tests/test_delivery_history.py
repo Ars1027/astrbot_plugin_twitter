@@ -96,11 +96,49 @@ async def test_history_ignores_invalid_ids_and_keeps_quote_summary(store):
         await service.record_delivery("group-a", "tester", {"tweet_id": tweet_id})
     assert await service.get_recent_deliveries("group-a", "tester") == []
     await service.record_delivery("group-a", "tester", {
-        "tweet_id": "123", "text": "原文", "quote": {"text": "引用正文"}
+        "tweet_id": "123", "text": "原文", "quote": {"text": "引用正文"},
+        "images": ["https://example.com/a.jpg"],
     })
     record = (await service.get_recent_deliveries("group-a", "tester"))[0]
     assert record["text"] == "原文\n\n引用：引用正文"
     assert record["truncated"] is False
+    assert record["username"] == "tester"
+    assert record["url"] == "https://x.com/tester/status/123"
+    assert record["has_media"] is True
+
+
+@pytest.mark.asyncio
+async def test_list_session_recent_deliveries_sorts_filters_and_backfills(store):
+    data, _get, _put, service = store
+    data["twitter_subs"]["other"] = {
+        "since_id": "1",
+        "subscribers": {"group-a": {"status": True, "recent_deliveries": [
+            {"tweet_id": "200", "text": "旧摘要", "delivered_at": "2026-10-30T10:00:00+00:00",
+             "is_retweet": False},
+        ]}},
+    }
+    await service.record_delivery("group-a", "tester", {
+        "tweet_id": "100", "text": "较新", "delivered_at": "ignored-by-prepare",
+    })
+    # prepare_delivery 会写入当前时间；手工覆盖以便稳定排序断言。
+    tester_history = data["twitter_subs"]["tester"]["subscribers"]["group-a"]["recent_deliveries"]
+    tester_history[0]["delivered_at"] = "2026-10-30T12:00:00+00:00"
+
+    items = await service.list_session_recent_deliveries("group-a", limit=10)
+    assert [item["tweet_id"] for item in items] == ["100", "200"]
+    assert items[0]["username"] == "tester"
+    assert items[0]["url"] == "https://x.com/tester/status/100"
+    assert items[1]["username"] == "other"
+    assert items[1]["url"] == "https://x.com/other/status/200"
+    assert items[1]["has_media"] is False
+
+    filtered = await service.list_session_recent_deliveries(
+        "group-a", username="@OTHER", limit=5,
+    )
+    assert [item["tweet_id"] for item in filtered] == ["200"]
+    assert await service.list_session_recent_deliveries("group-b") == []
+    limited = await service.list_session_recent_deliveries("group-a", limit=1)
+    assert limited[0]["tweet_id"] == "100"
 
 
 @pytest.mark.asyncio
@@ -134,6 +172,19 @@ async def test_pending_deliveries_are_isolated_preserved_and_cleaned(store):
     await service.commit_processed_tweets("tester", ids[1:], "1006")
     assert all("pending_delivery_ids" not in sub
                for sub in data["twitter_subs"]["tester"]["subscribers"].values())
+
+
+def test_prepare_delivery_rejects_empty_username():
+    for username in ("@", "  ", "@@@", "", None, "  @  "):
+        assert module.SubscriptionService.prepare_delivery(
+            "group-a", username, {"tweet_id": "1000"}
+        ) is None
+    record = module.SubscriptionService.prepare_delivery(
+        "group-a", "@tester", {"tweet_id": "1000"}
+    )
+    assert record is not None
+    assert record.username == "tester"
+    assert record.record["url"] == "https://x.com/tester/status/1000"
 
 
 @pytest.mark.asyncio
