@@ -2,7 +2,7 @@
 
 ### 新增功能
 
-- **Article 类型推文推送** — Nitter 与 FxTwitter 支持文章标题、正文、列表、封面及引用文章；文字、普通推送和合并转发复用相同正文，截图模式保留文章结构并按内容块分页。
+- **Article 类型推文推送** — Nitter 与 FxTwitter 支持文章标题、正文、列表、封面及引用文章；文字、普通推送和合并转发复用相同正文，截图模式保留文章结构并按内容块分页。([Issue #33](https://github.com/Ars1027/astrbot_plugin_twitter/issues/33))
 
 ### 改进
 
