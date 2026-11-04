@@ -49,7 +49,7 @@
    pip install -r requirements.txt
    ```
 
-2. 在 AstrBot 中加载插件。默认数据源是 Nitter；请配置可用的 `twitter_nitter_url`，或将 `twitter_data_provider` 改为 `fxtwitter`，保存后重载插件。FxTwitter 使用第三方公开 API，不需要 Nitter 镜像。
+2. 在 AstrBot 中加载插件。默认数据源是 Nitter；也可将 `twitter_data_provider` 改为 `fxtwitter`，请配置可用的 `twitter_nitter_url`或`twitter_fxtwitter_api_base`，保存后重载插件。
 3. 在要接收推送的会话中发送 `/推特关注 <用户名>`，然后用 `/推特测试 <用户名>` 检查消息效果；发送 `/推特列表` 可查看当前会话的订阅。
 
 首次将新推主加入插件时，会以当前最新推文建立增量游标，之后的自动轮询推送新内容；需要立即查看一条推文时可使用 `/推特测试`。
