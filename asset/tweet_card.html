@@ -44,7 +44,7 @@
       zoom: {{ render_scale }};
       background: var(--bg);
       border: 1px solid var(--border);
-      padding: 10px 10px 8px;
+      padding: 20px 20px 16px;
       overflow: hidden;
     }
     .retweet-line {
@@ -112,6 +112,7 @@
     }
     .author-line {
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
       min-width: 0;
       font-size: 18px;
@@ -145,6 +146,9 @@
       font-weight: 400;
     }
     .handle {
+      flex-basis: 100%;
+      font-size: 15px;
+      line-height: 20px;
       overflow: hidden;
       text-overflow: ellipsis;
       max-width: 190px;
@@ -152,7 +156,7 @@
     .tools {
       color: var(--muted);
       font-size: 22px;
-      letter-spacing: 2px;
+      letter-spacing: 0;
       flex: 0 0 auto;
       line-height: 24px;
     }
@@ -311,6 +315,29 @@
       font-weight: 700;
       margin-right: 4px;
     }
+    .action svg { width: 20px; height: 20px; margin-right: 9px; fill: none; stroke: currentColor; stroke-width: 1.7; }
+    .actions { padding-top: 12px; border-top: 1px solid var(--border); font-size: 14px; }
+    .article-content { margin-top: 20px; overflow-wrap: anywhere; }
+    .article-cover { width: 100%; height: auto; display: block; border-radius: 16px; margin-bottom: 24px; }
+    .article-title { font-size: 32px; line-height: 1.2; font-weight: 800; letter-spacing: -.5px; margin: 0 0 22px; }
+    .article-block { margin: 0 0 18px; font-size: 19px; line-height: 1.65; }
+    .article-block > span { white-space: pre-wrap; }
+    .article-header-one, .article-header-two, .article-header-three { font-weight: 800; font-size: 24px; margin-top: 26px; line-height: 1.35; }
+    .article-list { display: flex; gap: 12px; padding-left: 8px; }
+    .article-list-marker { color: var(--muted); flex: 0 0 22px; }
+    .article-blockquote { border-left: 3px solid var(--brand); padding-left: 18px; color: var(--muted); }
+    .article-code-block { background: var(--surface); border: 1px solid var(--border); padding: 16px; border-radius: 12px; font-family: monospace; font-size: 16px; }
+    .article-image { width: 100%; height: auto; display: block; border-radius: 12px; }
+    .article-video { min-height: 220px; border-radius: 12px; margin-bottom: 18px; }
+    .article-caption, .article-summary-note { font-size: 14px; line-height: 1.5; color: var(--muted); margin: 8px 0 18px; }
+    .article-link { color: var(--brand); font-size: 14px; margin: 22px 0; overflow-wrap: anywhere; }
+    .article-content code { background: var(--surface); border-radius: 4px; padding: 0 3px; }
+    .article-content a { color: var(--brand); text-decoration: none; }
+    .article-block-links { font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; margin: -10px 0 18px; }
+    .quote-card .article-content { padding: 0 14px; }
+    .quote-card .article-title { font-size: 26px; }
+    .quote-card .article-block { font-size: 17px; }
+    .post-date { color: var(--muted); font-size: 15px; line-height: 22px; margin-top: 18px; }
     .action-count {
       color: var(--muted);
       overflow: hidden;
@@ -320,6 +347,32 @@
   </style>
 </head>
 <body>
+  {% macro article_card(article) %}
+    {% if article %}
+    <section class="article-content">
+      {% if article.cover %}<img class="article-cover" src="{{ article.cover|e }}" alt="" onerror="this.hidden=true">{% endif %}
+      <h1 class="article-title">{{ article.title|e }}</h1>
+      {% if not article.blocks %}<div class="article-summary-note">文章摘要 · 未获取到全文</div><p class="article-block">{{ article.preview_text|e }}</p>{% endif %}
+      {% set counter = namespace(number=0) %}
+      {% for block in article.blocks %}
+        {% if block.type == 'ordered-list-item' %}{% set counter.number = counter.number + 1 %}{% else %}{% set counter.number = 0 %}{% endif %}
+        {% if block.type == 'image' %}
+          <img class="article-image" src="{{ block.url|e }}" alt="" onerror="this.hidden=true">
+          {% if block.text %}<div class="article-caption">{{ block.text|e }}</div>{% endif %}
+        {% elif block.type == 'video' %}
+          <div class="media article-video">{% if block.poster %}<img class="article-image" src="{{ block.poster|e }}" alt="" onerror="this.hidden=true">{% endif %}<div class="video-overlay"><div class="play">&#x25b6;</div></div></div>
+        {% else %}
+          <div class="article-block article-{{ block.type|e }}{% if block.type in ['ordered-list-item', 'unordered-list-item'] %} article-list{% endif %}">
+            {%- if block.type in ['ordered-list-item', 'unordered-list-item'] -%}<span class="article-list-marker">{{ (block.number|default(counter.number)|string + '.') if block.type == 'ordered-list-item' else '•' }}</span>{%- endif -%}
+            <span>{%- for span in block.spans -%}<span style="{% if span.bold %}font-weight:750;{% endif %}{% if span.italic %}font-style:italic;{% endif %}{% if span.underline %}text-decoration:underline;{% elif span.strikethrough %}text-decoration:line-through;{% endif %}">{% if span.href %}<a href="{{ span.href|e }}">{% endif %}{% if span.code %}<code>{% endif %}{{ span.text|e }}{% if span.code %}</code>{% endif %}{% if span.href %}</a>{% endif %}</span>{%- endfor -%}</span>
+          </div>
+          {% if block.links %}<div class="article-block-links">{% for url in block.links %}<div><a href="{{ url|e }}">{{ url|e }}</a></div>{% endfor %}</div>{% endif %}
+        {% endif %}
+      {% endfor %}
+      {% if article.url %}<div class="article-link">{{ article.url|e }}</div>{% endif %}
+    </section>
+    {% endif %}
+  {% endmacro %}
   <div class="shot">
     {% if tweet.retweet_label %}
       <div class="retweet-line"><span class="retweet-mark">&#x21bb;</span>{{ tweet.retweet_label|e }}</div>
@@ -339,9 +392,8 @@
             <span class="name">{{ tweet.name|e }}</span>
             {% if tweet.verified %}<span class="verified">&#x2713;</span>{% endif %}
             <span class="handle">@{{ tweet.username|e }}</span>
-            {% if tweet.date %}<span class="dot"> &middot; </span><span class="date">{{ tweet.date|e }}</span>{% endif %}
           </div>
-          <div class="tools">&#x25cc; &middot;&middot;&middot;</div>
+          <div class="tools">&#x2026;</div>
         </div>
 
         {% if tweet.text %}
@@ -350,6 +402,7 @@
         {% if tweet.translation_note %}
           <div class="translation-note">({{ tweet.translation_note|e }})</div>
         {% endif %}
+        {{ article_card(tweet.article) }}
 
         {% if tweet.quote %}
           <section class="quote-card">
@@ -366,6 +419,7 @@
               </div>
               {% if tweet.quote.text %}<div class="quote-text">{{ tweet.quote.text|e }}</div>{% endif %}
             </div>
+            {{ article_card(tweet.quote.article) }}
             {% if tweet.quote.media %}
               <div class="media-grid {{ tweet.quote.media_class }}">
                 {% for item in tweet.quote.media %}
@@ -402,9 +456,15 @@
           </div>
         {% endif %}
 
+        {% if tweet.date %}<div class="post-date">{{ tweet.date|e }}</div>{% endif %}
         <div class="actions">
           {% for action in tweet.actions %}
-            <div class="action"><span class="action-label">{{ action.label|e }}</span><span class="action-count">{{ action.count|e }}</span></div>
+            <div class="action" aria-label="{{ action.label|e }}"><svg viewBox="0 0 24 24">
+              {% if action.icon == 'reply' %}<path d="M21 11.5a9 9 0 0 1-9 9H4l-2 2V12a9 9 0 1 1 19-.5Z"/>
+              {% elif action.icon == 'repost' %}<path d="m3 8 4-4 4 4M7 4v12a3 3 0 0 0 3 3h3m8-3-4 4-4-4m4 4V8a3 3 0 0 0-3-3h-3"/>
+              {% elif action.icon == 'like' %}<path d="M12 21 3 12C-3 5 6-1 12 6 18-1 27 5 21 12Z"/>
+              {% else %}<path d="M4 21V12m5 9V3m6 18V8m5 13V5"/>{% endif %}
+            </svg><span class="action-count">{{ action.count|e }}</span></div>
           {% endfor %}
         </div>
       </main>

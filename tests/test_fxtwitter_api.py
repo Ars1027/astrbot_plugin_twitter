@@ -34,7 +34,11 @@ def _load_twitter_api_module():
     sys.modules["astrbot"] = astrbot
     sys.modules["astrbot.api"] = api
 
-    spec = importlib.util.spec_from_file_location(module_name, ROOT / "twitter_api.py")
+    package_name = f"{module_name}_package"
+    package = types.ModuleType(package_name)
+    package.__path__ = [str(ROOT)]
+    sys.modules[package_name] = package
+    spec = importlib.util.spec_from_file_location(f"{package_name}.twitter_api", ROOT / "twitter_api.py")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
@@ -131,6 +135,8 @@ async def test_timeline_cursor_since_id_order_dedup_and_cache(api_module):
     )
     page1 = _fixture("fxtwitter_timeline_page1.json")
     page2 = _fixture("fxtwitter_timeline_page2.json")
+    # page1 已包含页内重复；这里同时覆盖跨页重复，不再单独构造同一流程。
+    page2["results"].insert(0, copy.deepcopy(page1["results"][0]))
     calls = []
 
     async def request(_path, params=None, retries=2):
@@ -152,30 +158,6 @@ async def test_timeline_cursor_since_id_order_dedup_and_cache(api_module):
     assert cached["status"] is True
     assert cached["retweet"] is None
     assert "reposted_by" not in api._status_cache["104"]
-
-
-@pytest.mark.asyncio
-async def test_retweet_cache_does_not_pollute_direct_status_lookup(api_module):
-    api = api_module.TwitterAPI(provider="fxtwitter")
-    retweet_status = _fixture("fxtwitter_retweet_status.json")
-    timeline = {
-        "code": 200,
-        "results": [retweet_status],
-        "cursor": {"top": None, "bottom": None},
-    }
-
-    async def request(_path, params=None, retries=2):
-        return timeline
-
-    api._request_fxtwitter_json = request
-    items = await api.get_user_timeline_items("retweeter")
-    direct_status = await api.get_tweet("original", "1008")
-
-    assert items[0]["is_retweet"] is True
-    assert items[0]["retweeter_username"] == "retweeter"
-    assert direct_status["status"] is True
-    assert direct_status["retweet"] is None
-    assert "reposted_by" not in api._status_cache["1008"]
 
 
 @pytest.mark.asyncio
@@ -220,22 +202,6 @@ async def test_timeline_page_limit_before_since_id_is_incomplete(api_module):
     with pytest.raises(api_module.FxTwitterTimelineError, match="尚未找到上次游标"):
         await api.get_user_timeline_items("tester", since_id="101")
     assert api._status_cache == {}
-
-
-@pytest.mark.asyncio
-async def test_timeline_deduplicates_ids_across_pages(api_module):
-    api = api_module.TwitterAPI(provider="fxtwitter")
-    page1 = _fixture("fxtwitter_timeline_page1.json")
-    page2 = copy.deepcopy(_fixture("fxtwitter_timeline_page2.json"))
-    page2["results"].insert(0, copy.deepcopy(page1["results"][0]))
-
-    async def request(_path, params=None, retries=2):
-        return page2 if params and params.get("cursor") == "page-2" else page1
-
-    api._request_fxtwitter_json = request
-    items = await api.get_user_timeline_items("tester", since_id="101")
-
-    assert [item["tweet_id"] for item in items] == ["102", "103", "104", "105"]
 
 
 @pytest.mark.asyncio

@@ -12,7 +12,7 @@ import astrbot.api.message_components as Comp
 from astrbot.api.message_components import Node, Nodes
 
 from .subscription_service import DeliveredTweet, RecentDelivery, SkippedTweet, SubscriptionService
-from .tweet_message_service import TranslationCycleState, TweetMessageService
+from .tweet_message_service import TranslationCycleState, TweetMessageChain, TweetMessageService
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,7 +147,7 @@ class TweetDeliveryService:
     @staticmethod
     def build_plain_chain(chain: list) -> list:
         """保留图片，并把视频转换为链接文本。"""
-        plain_chain = []
+        plain_chain = TweetMessageChain(required_images=getattr(chain, "required_images", ()))
         for component in chain:
             if isinstance(component, Comp.Video):
                 video_url = getattr(component, "file", "") or getattr(
@@ -168,7 +168,7 @@ class TweetDeliveryService:
         chain: list,
     ) -> tuple[list, list[Comp.Video]]:
         """构建普通消息链，并分离需要独立发送的视频组件。"""
-        plain_chain = []
+        plain_chain = TweetMessageChain(required_images=getattr(chain, "required_images", ()))
         video_parts: list[Comp.Video] = []
         for component in chain:
             if isinstance(component, Comp.Video):
@@ -234,6 +234,24 @@ class TweetDeliveryService:
             return True
         except Exception as exc:
             logger.warning(f"包含媒体的消息发送失败，尝试保留文字内容: {exc}")
+
+        required_images = getattr(chain, "required_images", ())
+        if required_images:
+            all_pages_sent = True
+            for image in required_images:
+                try:
+                    await self._send_message_checked(umo, MessageChain(chain=[image]))
+                except Exception as exc:
+                    all_pages_sent = False
+                    logger.error(f"正文截图分页发送失败，保留整条推文重试: {exc}")
+            if all_pages_sent and on_primary_sent is not None:
+                on_primary_sent()
+            required_ids = {id(image) for image in required_images}
+            extras = [part for part in chain if id(part) not in required_ids]
+            if extras:
+                # 原帖链接及附加媒体不能代替正文回执；仍尽力发送。
+                await self.send_plain_chain_resilient(umo, extras)
+            return all_pages_sent
 
         text_parts = [
             component

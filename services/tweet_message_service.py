@@ -2,6 +2,8 @@
 
 import asyncio
 import copy
+import json
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -13,11 +15,21 @@ from ..twitter_renderer import (
     build_tweet_card_context,
     load_tweet_card_template,
     tweet_card_render_options,
+    tweet_card_page_contexts,
 )
 from .avatar_cache_service import AvatarCacheService
+from ..twitter_article import article_text
 
 
 HtmlRender = Callable[..., Awaitable[str]]
+
+
+class TweetMessageChain(list):
+    """保留正文截图身份；其中全部图片送达才可确认整条推文。"""
+
+    def __init__(self, components=(), *, required_images=()):
+        super().__init__(components)
+        self.required_images = tuple(required_images)
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,6 +230,9 @@ class TweetMessageService:
         """正文、引用和重试共用总时限，保留超时前已完成的译文。"""
         quote = tweet_info.get("quote") or {}
         quote.pop("translated_text", None)
+        for part in (tweet_info, quote):
+            part.pop("translated_article", None)
+            part.pop("translated_article_lead", None)
         if not self.settings.translate_enabled:
             return None, None
 
@@ -241,18 +256,14 @@ class TweetMessageService:
             if cycle is not None and cycle.should_skip(provider_id):
                 skipped = True
                 return
-            if original_text.strip():
-                main_translated, main_model = await self._translate_with_provider(
-                    original_text, provider_id
-                )
+            if self._has_translatable_text(original_text):
+                main_translated, main_model = await self._translate_tweet_part(tweet_info, provider_id)
                 if main_model:
                     translated_text, translate_model = main_translated, main_model
                 else:
                     failed = True
-            if quote_text.strip():
-                quote_translated, quote_model = await self._translate_with_provider(
-                    quote_text, provider_id
-                )
+            if self._has_translatable_text(quote_text):
+                quote_translated, quote_model = await self._translate_tweet_part(quote, provider_id)
                 if quote_model:
                     quote["translated_text"] = quote_translated
                     translate_model = translate_model or quote_model
@@ -281,6 +292,48 @@ class TweetMessageService:
             f"失败回退: {failed}，本轮跳过: {skipped}"
         )
         return translated_text, translate_model
+
+    @staticmethod
+    def _has_translatable_text(text: str) -> bool:
+        return bool(re.sub(r"https?://\S+", "", text).strip())
+
+    async def _translate_tweet_part(self, tweet: dict, provider_id: str) -> tuple[str, str | None]:
+        article = tweet.get("article")
+        if not article:
+            return await self._translate_with_provider(str(tweet.get("text") or ""), provider_id)
+        blocks = article.get("blocks") or []
+        units = [tweet.get("article_lead") or "", article.get("title") or "",
+                 article.get("preview_text") or ""] + [b.get("text") or "" for b in blocks]
+        indexes = [i for i, text in enumerate(units) if self._has_translatable_text(text)]
+        if not indexes:
+            return tweet["text"], None
+        translated, model = await self._translate_with_provider(
+            json.dumps([units[i] for i in indexes], ensure_ascii=False), provider_id,
+            structured=True,
+        )
+        if not model:
+            return tweet["text"], None
+        try:
+            result = json.loads(translated)
+            if (not isinstance(result, list) or len(result) != len(indexes)
+                    or any(not isinstance(s, str) or not s.strip() for s in result)):
+                raise ValueError("article translation shape mismatch")
+        except (ValueError, TypeError):
+            logger.warning("文章翻译未保持段落结构，使用原文")
+            return tweet["text"], None
+        for index, text in zip(indexes, result):
+            units[index] = text
+        translated_article = copy.deepcopy(article)
+        translated_article["title"], translated_article["preview_text"] = units[1:3]
+        for block, text in zip(translated_article["blocks"], units[3:]):
+            block["text"] = text
+            # 翻译后字符偏移不再有效；保留整段样式与列表层级。
+            old_spans = block.get("spans") or []
+            attrs = {k: v for k, v in old_spans[0].items() if k != "text"} if len(old_spans) == 1 else {}
+            block["spans"] = [{"text": text, **attrs}]
+        tweet["translated_article"] = translated_article
+        tweet["translated_article_lead"] = units[0]
+        return article_text(translated_article, units[0]), model
 
     async def get_translate_provider_id(self, umo: str) -> str | None:
         """按配置、当前会话、首个可用项的顺序选择翻译 Provider。"""
@@ -324,7 +377,7 @@ class TweetMessageService:
         return translated if translated is not None else text, model
 
     async def _translate_with_provider(
-        self, text: str, provider_id: str
+        self, text: str, provider_id: str, structured: bool = False,
     ) -> tuple[str, str | None]:
         """在调用方的总时限内翻译一段文本，不拦截任务取消。"""
         if (
@@ -343,6 +396,12 @@ class TweetMessageService:
                 "保持原文的语气和格式（如换行、表情符号等）。"
             )
 
+        if structured:
+            system_prompt += (
+                "\n输入是 JSON 字符串数组。逐项翻译，保持数组长度与顺序，空字符串保持为空。"
+                "只输出合法 JSON 字符串数组，不使用 Markdown 代码块，不合并、删减或添加段落。"
+                "保留链接，不访问外部网页。"
+            )
         max_retries = 2
         for attempt in range(max_retries):
             try:
@@ -554,6 +613,7 @@ class TweetMessageService:
             sub_config = {"r18": True, "media": False, "status": True}
 
         chain: list = []
+        required_images: list = []
         has_media = self.tweet_has_media(tweet_info)
         render_text_card = not (self.settings.no_text and has_media)
 
@@ -567,15 +627,16 @@ class TweetMessageService:
                 translate_model=translate_model,
                 theme=self.settings.screenshot_theme,
             )
-            rendered_url = await self.html_render(
-                load_tweet_card_template(),
-                context,
-                options=tweet_card_render_options(context),
-            )
-            image_comp = self.rendered_image_component(rendered_url)
-            if image_comp is None:
-                raise RuntimeError("html_render returned an empty image result")
-            chain.append(image_comp)
+            for page_context in tweet_card_page_contexts(context):
+                rendered_url = await self.html_render(
+                    load_tweet_card_template(), page_context,
+                    options=tweet_card_render_options(page_context),
+                )
+                image_comp = self.rendered_image_component(rendered_url)
+                if image_comp is None:
+                    raise RuntimeError("html_render returned an empty image result")
+                chain.append(image_comp)
+                required_images.append(image_comp)
 
         link_comp = self.tweet_link_component(tweet_info, username)
         if link_comp is not None:
@@ -599,7 +660,10 @@ class TweetMessageService:
             context_label="推文",
         )
 
-        return [component for component in chain if component is not None]
+        return TweetMessageChain(
+            [component for component in chain if component is not None],
+            required_images=required_images,
+        )
 
     async def prepare_screenshot_media(self, tweet_info: dict) -> dict:
         """头像始终走缓存，其他截图媒体仍按原代理预下载开关处理。"""
@@ -642,6 +706,19 @@ class TweetMessageService:
                         data_uri = await self.download_to_data_uri_safe(poster)
                         if data_uri:
                             preview["poster"] = data_uri
+
+        for part in (result, quote or {}):
+            for key in ("article", "translated_article"):
+                article = part.get(key)
+                if not article:
+                    continue
+                for item, media_field in [(article, "cover")] + [
+                    (b, key) for b in article.get("blocks") or []
+                    for key in (("url",) if b.get("type") == "image" else ("poster",))
+                ]:
+                    url = item.get(media_field)
+                    if url:
+                        item[media_field] = await self.download_to_data_uri_safe(url) or url
 
         return result
 

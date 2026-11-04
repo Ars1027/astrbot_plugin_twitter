@@ -102,10 +102,73 @@ def test_avatar_rendering_has_no_broken_images_or_layout_changes(
         output.mkdir(parents=True, exist_ok=True)
         (output / f"{theme}-{avatar_state}.png").write_bytes(image_bytes)
         height = page.locator(".shot").bounding_box()["height"]
+        options = renderer.tweet_card_render_options(context)
+        assert options["clip"]["height"] >= height
         # 用同一模板、同一文本对比缓存头像和占位，尺寸不能因加载结果变化。
         context["tweet"]["avatar"] = uri if avatar_state != "cached" else None
         context["tweet"]["quote"]["avatar"] = context["tweet"]["avatar"]
         page.set_content(template.render(**context))
         assert page.locator(".shot").bounding_box()["height"] == height
+    finally:
+        page.close()
+
+
+@pytest.mark.parametrize("theme", ["dark", "light"])
+def test_article_layout_retains_lists_escapes_html_and_fits_image(plugin_module, browser, theme):
+    jinja = pytest.importorskip("jinja2")
+    renderer = sys.modules[f"{plugin_module.__package__}.twitter_renderer"]
+    article = {
+        "title": "标题 <script>bad()</script>", "cover": "", "preview_text": "", "url": "",
+        "blocks": [
+            {"type": "paragraph", "text": "正文", "spans": [{"text": "正文", "bold": True}]},
+            {"type": "ordered-list-item", "text": "一", "spans": [{"text": "一"}]},
+            {"type": "ordered-list-item", "text": "二", "spans": [{"text": "二"}]},
+        ],
+    }
+    context = renderer.build_tweet_card_context("author", {"article": article, "article_lead": "附言"}, theme=theme)
+    page = browser.new_page(viewport={"width": 1140, "height": 400})
+    try:
+        page.set_content(jinja.Template(renderer.load_tweet_card_template()).render(**context))
+        assert page.locator("script").count() == 0
+        assert page.locator(".article-title").inner_text() == article["title"]
+        assert page.locator(".article-list-marker").all_inner_texts() == ["1.", "2."]
+        assert page.locator(".tweet-text").inner_text() == "附言"
+        assert page.locator(".article-block span span").first.evaluate("e=>getComputedStyle(e).fontWeight") == "750"
+        assert page.evaluate("""() => {
+          const outer=document.querySelector('.shot').getBoundingClientRect();
+          return [...document.querySelectorAll('.article-title,.article-block')].every(e=>{
+            const r=e.getBoundingClientRect(); return r.right<=outer.right && r.bottom<=outer.bottom;
+          });
+        }""")
+    finally:
+        page.close()
+
+
+@pytest.mark.parametrize("theme", ["dark", "light"])
+@pytest.mark.parametrize("quoted", [False, True])
+def test_article_pages_keep_numbers_and_visible_link_targets(plugin_module, browser, theme, quoted):
+    jinja = pytest.importorskip("jinja2")
+    renderer = sys.modules[f"{plugin_module.__package__}.twitter_renderer"]
+    url = "https://example.com/report.pdf?from=article&lang=zh"
+    article = {"title": "列表", "cover": "", "url": "", "blocks": [
+        {"type": "ordered-list-item", "text": "正文" * 180, "spans": [{"text": "正文" * 180}], "links": [url] if i == 6 else []}
+        for i in range(8)
+    ]}
+    tweet = {"article": article} if not quoted else {"quote": {"article": article, "username": "quoted"}}
+    context = renderer.build_tweet_card_context("author", tweet, theme=theme)
+    template = jinja.Template(renderer.load_tweet_card_template())
+    page = browser.new_page(viewport={"width": 1140, "height": 600})
+    numbers, links = [], []
+    try:
+        contexts = renderer.tweet_card_page_contexts(context)
+        assert len(contexts) > 1
+        for item in contexts:
+            page.set_content(template.render(**item))
+            numbers.extend(page.locator(".article-list-marker").all_inner_texts())
+            links.extend(page.locator(".article-block-links a").all_inner_texts())
+            if page.locator(".article-block-links a").count():
+                assert page.locator(".article-block-links a").get_attribute("href") == url
+        assert numbers == [f"{i}." for i in range(1, 9)]
+        assert links == [url]
     finally:
         page.close()

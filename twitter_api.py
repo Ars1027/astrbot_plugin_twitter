@@ -15,6 +15,8 @@ import httpx
 from bs4 import BeautifulSoup, Tag
 from astrbot.api import logger
 
+from .twitter_article import attach_article, parse_fxtwitter_article, parse_nitter_article
+
 # 内置 Nitter 镜像站列表
 WEBSITE_LIST = [
     "https://nitter.net",
@@ -1151,7 +1153,7 @@ class TwitterAPI:
         if not isinstance(author, dict):
             author = {}
         images, videos, previews = self._extract_fxtwitter_media(status)
-        return {
+        result = {
             "author": str(author.get("name") or author.get("screen_name") or ""),
             "username": str(author.get("screen_name") or "").lstrip("@"),
             "avatar": str(author.get("avatar_url") or ""),
@@ -1163,6 +1165,11 @@ class TwitterAPI:
             "videos": videos,
             "video_previews": previews,
         }
+        attach_article(result, parse_fxtwitter_article(
+            status.get("article"), self._apply_fxtwitter_image_quality,
+            self._select_fxtwitter_video_url,
+        ))
+        return result
 
     def _adapt_fxtwitter_status(
         self, status: dict, fallback_username: str = "", fallback_id: str = ""
@@ -1223,6 +1230,10 @@ class TwitterAPI:
                 ),
             }
         )
+        attach_article(result, parse_fxtwitter_article(
+            status.get("article"), self._apply_fxtwitter_image_quality,
+            self._select_fxtwitter_video_url,
+        ))
         return result
 
     async def _get_fxtwitter_tweet(self, username: str, tweet_id: str) -> dict:
@@ -1233,9 +1244,17 @@ class TwitterAPI:
             return result
 
         status = self._status_cache.get(tweet_id)
-        if status is None:
+        article = status.get("article") if isinstance(status, dict) else None
+        quote_article = (status.get("quote") or {}).get("article") if isinstance(status, dict) else None
+        needs_article_detail = any(
+            isinstance(a, dict) and not (a.get("content") or {}).get("blocks")
+            for a in (article, quote_article)
+        )
+        if status is None or needs_article_detail:
             payload = await self._request_fxtwitter_json(f"2/status/{tweet_id}")
-            status = payload.get("status") if payload else None
+            detail = payload.get("status") if payload else None
+            if isinstance(detail, dict) and detail.get("type") == "status":
+                status = detail
         if not isinstance(status, dict) or status.get("type") != "status":
             return result
 
@@ -1385,6 +1404,14 @@ class TwitterAPI:
                     ),
                 }
 
+            # 主贴与引用帖分别跟进文章页，禁止使用页面中其他推文的卡片。
+            await self._attach_nitter_article(result, main_tweet, tweet_id)
+            if quote_elem and result.get("quote"):
+                await self._attach_nitter_article(
+                    result["quote"], quote_elem, result["quote"]["tweet_id"],
+                    include_nested_quotes=True,
+                )
+
             # 检测 R18 标记（仅主贴）
             r18_elem = main_tweet.select_one(".nsfw")
             result["is_r18"] = r18_elem is not None
@@ -1393,6 +1420,47 @@ class TwitterAPI:
             logger.error(f"获取推文详情失败 {username}/{tweet_id}: {e}")
 
         return result
+
+    async def _attach_nitter_article(
+        self, tweet: dict, container: Tag, tweet_id: str,
+        include_nested_quotes: bool = False,
+    ) -> None:
+        card = next((c for c in container.select(".article-card")
+                     if include_nested_quotes or not self._is_nested_quote_element(c, container)), None)
+        if not card:
+            return
+        title = card.select_one(".card-title")
+        preview = card.select_one(".card-description")
+        cover = card.select_one("img")
+
+        def resolve_image(img: Tag) -> str:
+            parent = img.find_parent("a")
+            href = str(parent.get("href", "")) if parent else ""
+            parts = urlsplit(href)
+            is_image_link = parts.path.startswith("/pic/") or bool(
+                re.search(r"\.(?:jpe?g|png|gif|webp)(?::orig)?$", parts.path, re.I)
+            )
+            src = str(img.get("src", ""))
+            return self._absolute_url(self._build_image_url(
+                href if is_image_link else src, src,
+            ))
+
+        article = {
+            "title": title.get_text(strip=True) if title else "",
+            "preview_text": preview.get_text(" ", strip=True) if preview else "",
+            "cover": resolve_image(cover) if cover else "", "blocks": [],
+            "url": f"https://x.com/{tweet.get('username')}/status/{tweet_id}",
+        }
+        # Nitter 的文章入口使用推文 ID，而非 X article ID；请求固定为当前实例。
+        if str(tweet_id).isdigit():
+            try:
+                client = await self._get_client()
+                response = await client.get(f"{self.nitter_url}/i/article/{tweet_id}", timeout=20.0)
+                if response.status_code == 200:
+                    article = parse_nitter_article(response.text, article, resolve_image, self._absolute_url)
+            except Exception as exc:
+                logger.warning(f"获取 Nitter 文章正文失败，使用摘要: {type(exc).__name__}")
+        attach_article(tweet, article)
 
 def get_next_website(website_list: list[str], current: str) -> Optional[str]:
     """获取列表中当前镜像站的下一个（循环）"""
