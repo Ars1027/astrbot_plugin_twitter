@@ -324,6 +324,7 @@ async def test_article_translation_keeps_block_structure(
     assert len(calls) == 1 and all("https://x.com/i/article" not in t for t in calls[0])
     if valid:
         assert model == "model" and "• 译文列表内容" in translated
+        assert "https://x.com/i/article/200" not in translated
         assert tweet["translated_article"]["blocks"][1]["type"] == "unordered-list-item"
     else:
         assert (
@@ -380,6 +381,48 @@ def test_article_context_no_duplicate_cover_and_lossless_paging(
     )
     assert all(not p["tweet"]["article"]["cover"] for p in pages[1:])
     assert original["tweet"]["article"]["cover"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_link", [False, True])
+@pytest.mark.parametrize("mode", ["text", "screenshot", "fallback"])
+@pytest.mark.parametrize("quoted", [False, True])
+@pytest.mark.parametrize("translated", [False, True])
+async def test_article_footer_obeys_link_setting_without_removing_body_links(
+    plugin_module, api_module, include_link, mode, quoted, translated,
+):
+    jinja = pytest.importorskip("jinja2")
+    raw = status()
+    raw["text"] = "附言 https://x.com/i/article/201 https://x.com/i/article/200"
+    raw["article"]["content"]["blocks"].append({"type": "unstyled", "text": "正文 https://example.com/body"})
+    target = api_module.TwitterAPI(provider="fxtwitter")._adapt_fxtwitter_status(raw)
+    if translated:
+        target["translated_article"] = copy.deepcopy(target["article"])
+        target["translated_article"]["title"] = "译文标题"
+        target["translated_article_lead"] = "译文 " + target["article_lead"]
+        target["translated_text"] = "译文"
+    tweet = {"username": "poster", "tweet_id": "300", "text": "引用附言", "quote": target} if quoted else target
+    service = make_service(
+        plugin_module, include_tweet_link=include_link, send_media_separately=False,
+        text_render_mode="text" if mode == "text" else "screenshot",
+    )
+    rendered = []
+
+    async def render(template, context, options):
+        if mode == "fallback":
+            raise RuntimeError("render unavailable")
+        rendered.append(jinja.Template(template).render(**context))
+        return "https://example.com/screenshot.png"
+
+    service.html_render = render
+    chain = await service.build_message_chain(
+        "author", tweet, translated_text=target.get("translated_text") if not quoted else None,
+    )
+    content = "\n".join(rendered) if mode == "screenshot" else chain[0].text
+    assert ("https://x.com/i/article/200" in content) is include_link
+    assert "https://x.com/i/article/201" in content
+    assert "https://example.com/body" in content
+    assert "译文标题" in content if translated else "文章标题" in content
 
 
 @pytest.mark.asyncio

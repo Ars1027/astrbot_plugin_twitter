@@ -333,7 +333,9 @@ class TweetMessageService:
             block["spans"] = [{"text": text, **attrs}]
         tweet["translated_article"] = translated_article
         tweet["translated_article_lead"] = units[0]
-        return article_text(translated_article, units[0]), model
+        return article_text(
+            translated_article, units[0], include_link=self.settings.include_tweet_link,
+        ), model
 
     async def get_translate_provider_id(self, umo: str) -> str | None:
         """按配置、当前会话、首个可用项的顺序选择翻译 Provider。"""
@@ -437,6 +439,17 @@ class TweetMessageService:
         logger.warning("翻译全部重试失败，使用原文")
         return text, None
 
+    def _display_text(self, tweet: dict, translated_text: str | None = None) -> str:
+        article = tweet.get("article")
+        if article and (translated_text is None or tweet.get("translated_article")):
+            if translated_text is not None:
+                article = tweet["translated_article"]
+                lead = tweet.get("translated_article_lead") or ""
+            else:
+                lead = tweet.get("article_lead") or ""
+            return article_text(article, lead, include_link=self.settings.include_tweet_link)
+        return str(translated_text or tweet.get("text") or "")
+
     async def build_tweet_chain(
         self,
         username: str,
@@ -449,7 +462,7 @@ class TweetMessageService:
         if sub_config is None:
             sub_config = {"r18": True, "media": False, "status": True}
 
-        text = str(translated_text or tweet_info.get("text") or "")
+        text = self._display_text(tweet_info, translated_text)
         quote = tweet_info.get("quote")
         tweet_id = str(tweet_info.get("tweet_id") or "")
         author_username = str(tweet_info.get("username") or username)
@@ -487,9 +500,7 @@ class TweetMessageService:
         if quote:
             quote_author_username = str(quote.get("username") or "")
             quote_author = str(quote.get("author") or quote_author_username)
-            quote_text = str(
-                quote.get("translated_text") or quote.get("text") or ""
-            )
+            quote_text = self._display_text(quote, quote.get("translated_text"))
             quote_display = self.build_author_display(
                 quote_author_username,
                 quote_author,
@@ -612,6 +623,7 @@ class TweetMessageService:
                 translated_text=translated_text,
                 translate_model=translate_model,
                 theme=self.settings.screenshot_theme,
+                include_tweet_link=self.settings.include_tweet_link,
             )
             for page_context in tweet_card_page_contexts(context):
                 rendered_url = await self.html_render(

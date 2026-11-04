@@ -165,7 +165,7 @@
 ## 使用前了解
 
 - **Nitter 镜像**：nitter镜像站目前已不可用 2026/8/27；需要自行部署时可参考 [Nitter 项目](https://github.com/zedeus/nitter)及[本地部署教程](https://mib7kzqsrf5.feishu.cn/wiki/O1ztwWl3GiBc4AknKvIcyaKsnFb?from=from_copylink)。
-- **FxTwitter 数据**：FxTwitter 是第三方公开 JSON API，并非 X/Twitter 官方 API；接口、限流和可用性由其服务决定。
+- **FxTwitter 数据**：FxTwitter 是第三方公开 JSON API，并非 X/Twitter 官方 API；接口、限流和可用性由其服务决定。也可参考 [FxTwitter 官方仓库（FxEmbed）](https://github.com/FxEmbed/FxEmbed) 自行部署，并将 `twitter_fxtwitter_api_base` 设置为自建实例的 API 地址。
 - **历史补发范围**：已进入重试窗口的推文按保存的条目继续尝试；尚未接纳、且数据源已删除或不再返回的推文，无法保证补齐。停机时间过长或数据源分页不足也会影响历史补发范围。
 - **重复发送边界**：群消息发送与本地状态保存无法原子提交。发送成功后进程被强制终止，或本地 KV 持续写入失败时，下次轮询可能再次发送。
 - **会话隔离**：私聊和群聊分别保存订阅；在一处取关或关闭推送，不影响其他会话。

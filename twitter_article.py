@@ -17,7 +17,7 @@ def text_block(text: str, kind: str = "paragraph", spans: list | None = None) ->
     return {"type": kind, "text": text, "spans": spans, "links": links}
 
 
-def article_text(article: dict, lead: str = "") -> str:
+def article_text(article: dict, lead: str = "", *, include_link: bool = True) -> str:
     sections = [lead, f"【文章】{article.get('title') or ''}"]
     blocks = article.get("blocks") or []
     if not blocks:
@@ -42,7 +42,7 @@ def article_text(article: dict, lead: str = "") -> str:
             text = text or "[视频]"
         if text:
             sections.append(text)
-    if article.get("url"):
+    if include_link and article.get("url"):
         sections.append(article["url"])
     return "\n\n".join(str(part).strip() for part in sections if part)
 

@@ -260,6 +260,7 @@ def build_tweet_card_context(
     translated_text: str | None = None,
     translate_model: str | None = None,
     theme: str = "dark",
+    include_tweet_link: bool = True,
 ) -> dict:
     """构建 html_render 使用的 Jinja 上下文。"""
     theme = _text(theme).lower()
@@ -327,6 +328,7 @@ def build_tweet_card_context(
 
     return {
         "theme": theme,
+        "include_tweet_link": include_tweet_link,
         "render_scale": TWEET_CARD_RENDER_SCALE,
         "tweet": {
             "name": screen_name or author_username,

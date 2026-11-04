@@ -369,7 +369,7 @@
           {% if block.links %}<div class="article-block-links">{% for url in block.links %}<div><a href="{{ url|e }}">{{ url|e }}</a></div>{% endfor %}</div>{% endif %}
         {% endif %}
       {% endfor %}
-      {% if article.url %}<div class="article-link">{{ article.url|e }}</div>{% endif %}
+      {% if include_tweet_link|default(true) and article.url %}<div class="article-link">{{ article.url|e }}</div>{% endif %}
     </section>
     {% endif %}
   {% endmacro %}
