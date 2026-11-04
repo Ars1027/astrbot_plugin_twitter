@@ -450,7 +450,6 @@ class TweetMessageService:
             sub_config = {"r18": True, "media": False, "status": True}
 
         text = str(translated_text or tweet_info.get("text") or "")
-        images = tweet_info.get("images") or []
         quote = tweet_info.get("quote")
         tweet_id = str(tweet_info.get("tweet_id") or "")
         author_username = str(tweet_info.get("username") or username)
@@ -511,20 +510,7 @@ class TweetMessageService:
         if text_sections:
             self.append_to_last_plain(chain, "\n\n".join(text_sections))
 
-        if quote:
-            await self.append_media_components(
-                chain,
-                quote.get("images") or [],
-                quote.get("videos") or [],
-                context_label="引用推文",
-            )
-
-        await self.append_media_components(
-            chain,
-            images,
-            tweet_info.get("videos") or [],
-            context_label="推文",
-        )
+        await self.append_tweet_media(chain, tweet_info)
 
         return [component for component in chain if component is not None]
 
@@ -644,26 +630,21 @@ class TweetMessageService:
                 chain.append(Comp.Plain("\n"))
             chain.append(link_comp)
 
-        quote = tweet_info.get("quote") or None
-        if quote:
-            await self.append_media_components(
-                chain,
-                quote.get("images") or [],
-                quote.get("videos") or [],
-                context_label="引用推文",
-            )
-
-        await self.append_media_components(
-            chain,
-            tweet_info.get("images") or [],
-            tweet_info.get("videos") or [],
-            context_label="推文",
-        )
+        await self.append_tweet_media(chain, tweet_info)
 
         return TweetMessageChain(
             [component for component in chain if component is not None],
             required_images=required_images,
         )
+
+    async def append_tweet_media(self, chain: list, tweet_info: dict) -> None:
+        """两种消息模式均先追加引用帖媒体，再追加主贴媒体。"""
+        for part, label in ((tweet_info.get("quote"), "引用推文"), (tweet_info, "推文")):
+            if part:
+                await self.append_media_components(
+                    chain, part.get("images") or [], part.get("videos") or [],
+                    context_label=label,
+                )
 
     async def prepare_screenshot_media(self, tweet_info: dict) -> dict:
         """头像始终走缓存，其他截图媒体仍按原代理预下载开关处理。"""
@@ -677,29 +658,13 @@ class TweetMessageService:
         if not (self.settings.pre_download_media and self.settings.proxy):
             return result
 
-        result["images"] = [
-            await self.download_to_data_uri_safe(str(url)) or str(url)
-            for url in (result.get("images") or [])
-        ]
-
-        previews = result.get("video_previews") or []
-        for preview in previews:
-            if isinstance(preview, dict):
-                poster = str(preview.get("poster") or "").strip()
-                if poster:
-                    data_uri = await self.download_to_data_uri_safe(poster)
-                    if data_uri:
-                        preview["poster"] = data_uri
-
-        quote = result.get("quote") or None
-        if quote:
-            quote["images"] = [
+        for part in (result, result.get("quote") or {}):
+            part["images"] = [
                 await self.download_to_data_uri_safe(str(url)) or str(url)
-                for url in (quote.get("images") or [])
+                for url in (part.get("images") or [])
             ]
 
-            quote_previews = quote.get("video_previews") or []
-            for preview in quote_previews:
+            for preview in part.get("video_previews") or []:
                 if isinstance(preview, dict):
                     poster = str(preview.get("poster") or "").strip()
                     if poster:
@@ -707,7 +672,6 @@ class TweetMessageService:
                         if data_uri:
                             preview["poster"] = data_uri
 
-        for part in (result, quote or {}):
             for key in ("article", "translated_article"):
                 article = part.get(key)
                 if not article:

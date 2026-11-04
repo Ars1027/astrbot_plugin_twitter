@@ -181,6 +181,70 @@ def _delivery_settings(plugin_module, **overrides):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["text", "screenshot"])
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_both_message_modes_keep_quote_media_before_main(plugin_module, mode, enabled):
+    async def render(*_args, **_kwargs):
+        return "https://example.com/card.png"
+
+    class API:
+        async def get_remote_file_size(self, _url):
+            return 1
+
+    service = plugin_module.TweetMessageService(
+        object(), API(), render, _message_settings(
+            plugin_module, text_render_mode=mode, send_media_separately=enabled,
+            pre_download_media=False,
+        ),
+    )
+    chain = await service.build_message_chain("tester", {
+        "text": "正文", "images": ["https://example.com/main.jpg"],
+        "videos": ["https://example.com/main.mp4"],
+        "quote": {"text": "引用", "images": ["https://example.com/quote.jpg"],
+                  "videos": ["https://example.com/quote.mp4"]},
+    })
+    media = [component.file for component in chain if isinstance(component, (Image, Video))]
+    expected = ["https://example.com/card.png"] if mode == "screenshot" else []
+    if enabled:
+        expected += ["https://example.com/quote.jpg", "https://example.com/quote.mp4",
+                     "https://example.com/main.jpg", "https://example.com/main.mp4"]
+    assert media == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pre_download, proxy", [(False, "http://proxy"), (True, ""), (True, "http://proxy")])
+async def test_screenshot_pre_download_handles_both_parts_without_mutating_source(plugin_module, pre_download, proxy):
+    import copy
+
+    calls = []
+
+    class API:
+        async def download_media_to_data_uri(self, url):
+            calls.append(url)
+            if "failed" in url:
+                raise RuntimeError("download failed")
+            return "data:" + url
+
+    service = plugin_module.TweetMessageService(
+        object(), API(), None, _message_settings(plugin_module, pre_download_media=pre_download, proxy=proxy),
+    )
+    part = {"images": ["https://example.com/image", "https://example.com/failed"],
+            "video_previews": [{"poster": "https://example.com/poster"}, {"poster": "https://example.com/failed"}],
+            "article": {"cover": "https://example.com/cover", "blocks": []}}
+    source = {**copy.deepcopy(part), "quote": copy.deepcopy(part)}
+    original = copy.deepcopy(source)
+    result = await service.prepare_screenshot_media(source)
+    assert source == original
+    for prepared in (result, result["quote"]):
+        prefix = "data:" if pre_download and proxy else ""
+        assert prepared["images"] == [prefix + "https://example.com/image", "https://example.com/failed"]
+        assert prepared["video_previews"][0]["poster"] == prefix + "https://example.com/poster"
+        assert prepared["video_previews"][1]["poster"] == "https://example.com/failed"
+        assert prepared["article"]["cover"] == prefix + "https://example.com/cover"
+    assert bool(calls) == bool(pre_download and proxy)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["plain", "node", "collective"])
 @pytest.mark.parametrize("mode", ["success", "failure", "fallback", "empty", "history_error"])
 async def test_recent_history_records_only_actual_session_success(

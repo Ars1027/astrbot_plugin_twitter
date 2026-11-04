@@ -58,8 +58,12 @@ FXTWITTER_REQUEST_HEADERS = {
 BROADCAST_LINK_PATTERN = re.compile(r'/i/broadcasts/', re.IGNORECASE)
 
 
-class FxTwitterTimelineError(RuntimeError):
-    """FxTwitter 时间线请求失败或分页结果不完整。"""
+class TwitterTimelineError(RuntimeError):
+    """时间线请求失败、解析失败或分页结果不完整。"""
+
+
+# 保留旧异常入口，既有调用方仍能捕获两个数据源的时间线失败。
+FxTwitterTimelineError = TwitterTimelineError
 
 
 class TwitterAPI:
@@ -763,12 +767,14 @@ class TwitterAPI:
         if not self.nitter_url:
             return []
 
-        client = await self._get_client()
         url = f"{self.nitter_url}/{username}"
         try:
+            client = await self._get_client()
             resp = await client.get(url, timeout=15.0)
             if resp.status_code != 200:
-                return []
+                raise TwitterTimelineError(
+                    f"获取 @{username} 的 Nitter 时间线失败：HTTP {resp.status_code}"
+                )
 
             soup = BeautifulSoup(resp.text, "html.parser")
             return self._parse_timeline_items(
@@ -777,9 +783,12 @@ class TwitterAPI:
                 since_id=since_id,
                 limit=limit,
             )
+        except TwitterTimelineError:
+            raise
         except Exception as e:
-            logger.error(f"获取用户时间线失败 {username}: {e}")
-            return []
+            raise TwitterTimelineError(
+                f"获取 @{username} 的 Nitter 时间线失败：{type(e).__name__}"
+            ) from e
 
     def _build_image_url(self, a_href: str, img_src: str) -> str:
         """根据图片质量配置构建图片 URL
@@ -900,6 +909,22 @@ class TwitterAPI:
         if not avatar_img:
             return ""
         return self._absolute_url(avatar_img.get("src", ""))
+
+    def _extract_nitter_media(
+        self, container: Tag, include_nested_quotes: bool = False
+    ) -> dict:
+        """附加媒体分别降级，单项解析失败不丢弃正文或其他媒体。"""
+        media = {"images": [], "videos": [], "video_previews": []}
+        for key, extract in (
+            ("images", self._extract_images),
+            ("videos", self._extract_videos),
+            ("video_previews", self._extract_video_previews),
+        ):
+            try:
+                media[key] = extract(container, include_nested_quotes=include_nested_quotes)
+            except Exception as exc:
+                logger.warning(f"解析 Nitter {key} 失败，跳过该附加媒体: {exc}")
+        return media
 
     def _has_verified_badge(
         self, container: Tag, include_nested_quotes: bool = False
@@ -1146,20 +1171,23 @@ class TwitterAPI:
 
         return image_urls, video_urls, video_previews
 
-    def _adapt_fxtwitter_quote(self, status: Any) -> Optional[dict]:
-        if not isinstance(status, dict) or status.get("type") != "status":
-            return None
+    def _adapt_fxtwitter_content(
+        self, status: dict, fallback_username: str = "", fallback_id: str = ""
+    ) -> dict:
+        """适配主贴和引用帖共有的内容，不处理统计或转帖上下文。"""
         author = status.get("author") or {}
         if not isinstance(author, dict):
             author = {}
         images, videos, previews = self._extract_fxtwitter_media(status)
+        username = str(author.get("screen_name") or fallback_username).lstrip("@")
         result = {
             "author": str(author.get("name") or author.get("screen_name") or ""),
-            "username": str(author.get("screen_name") or "").lstrip("@"),
+            "screen_name": str(author.get("name") or username),
+            "username": username,
             "avatar": str(author.get("avatar_url") or ""),
             "verified": self._fxtwitter_verified(author),
             "date": self._format_fxtwitter_date(status.get("created_at")),
-            "tweet_id": str(status.get("id") or ""),
+            "tweet_id": str(status.get("id") or fallback_id),
             "text": str(status.get("text") or ""),
             "images": images,
             "videos": videos,
@@ -1171,16 +1199,22 @@ class TwitterAPI:
         ))
         return result
 
+    def _adapt_fxtwitter_quote(self, status: Any) -> Optional[dict]:
+        if not isinstance(status, dict) or status.get("type") != "status":
+            return None
+        result = self._adapt_fxtwitter_content(status)
+        result.pop("screen_name")
+        return result
+
     def _adapt_fxtwitter_status(
         self, status: dict, fallback_username: str = "", fallback_id: str = ""
     ) -> dict:
-        author = status.get("author") or {}
-        if not isinstance(author, dict):
-            author = {}
-        username = str(author.get("screen_name") or fallback_username).lstrip("@")
-        tweet_id = str(status.get("id") or fallback_id)
+        content = self._adapt_fxtwitter_content(status, fallback_username, fallback_id)
+        username = content["username"]
+        tweet_id = content["tweet_id"]
         result = self._empty_tweet_result(username, tweet_id)
-        images, videos, previews = self._extract_fxtwitter_media(status)
+        result.update(content)
+        result.pop("author")
         reposted_by = status.get("reposted_by") or {}
         retweet = None
         if isinstance(reposted_by, dict) and (
@@ -1205,20 +1239,12 @@ class TwitterAPI:
             {
                 "status": status.get("type") == "status" and bool(tweet_id),
                 "username": username,
-                "screen_name": str(author.get("name") or username),
-                "avatar": str(author.get("avatar_url") or ""),
-                "verified": self._fxtwitter_verified(author),
-                "date": self._format_fxtwitter_date(status.get("created_at")),
                 "stats": {
                     "comments": stat_value("replies"),
                     "retweets": stat_value("reposts"),
                     "likes": stat_value("likes"),
                     "views": stat_value("views"),
                 },
-                "text": str(status.get("text") or ""),
-                "images": images,
-                "videos": videos,
-                "video_previews": previews,
                 "quote": self._adapt_fxtwitter_quote(status.get("quote")),
                 "retweet": retweet,
                 "is_r18": bool(status.get("possibly_sensitive")),
@@ -1230,10 +1256,6 @@ class TwitterAPI:
                 ),
             }
         )
-        attach_article(result, parse_fxtwitter_article(
-            status.get("article"), self._apply_fxtwitter_image_quality,
-            self._select_fxtwitter_video_url,
-        ))
         return result
 
     async def _get_fxtwitter_tweet(self, username: str, tweet_id: str) -> dict:
@@ -1294,8 +1316,6 @@ class TwitterAPI:
                 logger.warning(f"未找到 div.main-tweet 容器: {nitter_url}")
                 return result
 
-            result["status"] = True
-
             # 获取显示名称
             fullname_elem = main_tweet.select_one("a.fullname")
             if fullname_elem:
@@ -1315,16 +1335,8 @@ class TwitterAPI:
             if content_elem:
                 result["text"] = content_elem.get_text(strip=True)
 
-            # 获取图片（仅主贴，排除视频/GIF缩略图）
-            result["images"] = self._extract_images(main_tweet)
-
-            # 获取视频/GIF（仅主贴）
-            # Nitter 视频有三种HTML形态：
-            #   1) mp4播放启用: <video><source src=""></video>
-            #   2) m3u8/vmap格式: <video data-url=""> (无src/source)
-            #   3) 播放被禁用: 仅有 <img> 缩略图 + <div class="video-overlay">
-            result["videos"] = self._extract_videos(main_tweet)
-            result["video_previews"] = self._extract_video_previews(main_tweet)
+            # 获取主贴附加媒体，排除嵌套引用帖；各类媒体独立降级。
+            result.update(self._extract_nitter_media(main_tweet))
 
             # 检测直播推文并过滤
             is_live_stream = self._contains_live_stream(main_tweet)
@@ -1378,43 +1390,28 @@ class TwitterAPI:
                     "date": self._extract_date(quote_elem),
                     "tweet_id": quote_id_match.group(1) if quote_id_match else "",
                     "text": quote_text_elem.get_text(strip=True) if quote_text_elem else "",
-                    "images": (
-                        []
-                        if quote_live_stream
-                        else self._extract_images(
-                            quote_elem,
-                            include_nested_quotes=True,
-                        )
-                    ),
-                    "videos": (
-                        []
-                        if quote_live_stream
-                        else self._extract_videos(
-                            quote_elem,
-                            include_nested_quotes=True,
-                        )
-                    ),
-                    "video_previews": (
-                        []
-                        if quote_live_stream
-                        else self._extract_video_previews(
-                            quote_elem,
-                            include_nested_quotes=True,
-                        )
-                    ),
+                    **({"images": [], "videos": [], "video_previews": []}
+                       if quote_live_stream else self._extract_nitter_media(
+                           quote_elem, include_nested_quotes=True,
+                       )),
                 }
 
             # 主贴与引用帖分别跟进文章页，禁止使用页面中其他推文的卡片。
-            await self._attach_nitter_article(result, main_tweet, tweet_id)
-            if quote_elem and result.get("quote"):
-                await self._attach_nitter_article(
-                    result["quote"], quote_elem, result["quote"]["tweet_id"],
-                    include_nested_quotes=True,
-                )
+            for part, container, nested in (
+                (result, main_tweet, False), (result.get("quote"), quote_elem, True),
+            ):
+                if part is not None and container is not None:
+                    try:
+                        await self._attach_nitter_article(
+                            part, container, part["tweet_id"], include_nested_quotes=nested,
+                        )
+                    except Exception as exc:
+                        logger.warning(f"解析 Nitter 文章失败，保留已有正文: {exc}")
 
             # 检测 R18 标记（仅主贴）
             r18_elem = main_tweet.select_one(".nsfw")
             result["is_r18"] = r18_elem is not None
+            result["status"] = True
 
         except Exception as e:
             logger.error(f"获取推文详情失败 {username}/{tweet_id}: {e}")
