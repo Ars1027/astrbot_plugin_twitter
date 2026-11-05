@@ -41,12 +41,18 @@ const state = {
   leaving: false,
   historyTarget: null,
   historyRequest: 0,
+  addingGroup: false,
 };
 
 const batch = Object.fromEntries([
   "dialog", "target", "form", "input", "r18", "media", "summary", "progress",
   "entries", "error", "start", "stop", "retry", "reset", "close",
 ].map((key) => [key, document.getElementById(`batch-${key}`)]));
+
+const telegramGroup = Object.fromEntries([
+  "dialog", "form", "platform", "id", "error", "submit", "cancel", "close",
+].map((key) => [key, document.getElementById(`telegram-group-${key}`)]));
+const openTelegramGroup = document.getElementById("open-telegram-group");
 
 function busy() {
   return state.saving || state.loading || state.batchPreparing || state.batch?.running;
@@ -115,6 +121,7 @@ function selectedSession() {
 function renderRuntime() {
   if (!state.overview) return;
   const { provider, polling, totals } = state.overview;
+  openTelegramGroup.hidden = !(state.overview.telegram_platforms || []).length;
   elements.runtimeStatus.classList.toggle("is-ready", provider.ready && polling.running);
   elements.runtimeStatus.classList.toggle("is-error", !provider.ready);
   const providerLabel = provider.name === "fxtwitter" ? "FxTwitter" : "Nitter";
@@ -132,7 +139,7 @@ function renderRuntime() {
   const failedSources = state.overview.group_sources.filter((source) => !source.available);
   if (failedSources.length) {
     setError(
-      `${failedSources.length} 个 QQ 实例暂时无法读取群列表；已有订阅仍可管理。`,
+      `${failedSources.length} 个平台实例暂时无法读取部分群聊；已有订阅仍可管理。`,
     );
   } else {
     setError("");
@@ -306,6 +313,82 @@ async function saveAndReload(endpoint, payload, successMessage) {
 
 elements.refreshButton.addEventListener("click", () => {
   if (!busy()) loadOverview({ announce: true });
+});
+
+function setGroupError(message = "") {
+  telegramGroup.error.textContent = message;
+  telegramGroup.error.classList.toggle("is-hidden", !message);
+}
+
+openTelegramGroup.addEventListener("click", () => {
+  if (busy()) return;
+  const platforms = state.overview?.telegram_platforms || [];
+  if (!platforms.length) return;
+  telegramGroup.platform.replaceChildren(...platforms.map((platform) =>
+    el("option", { value: platform.id }, platform.label || platform.id)));
+  telegramGroup.id.value = "";
+  setGroupError();
+  telegramGroup.dialog.showModal();
+  telegramGroup.id.focus();
+});
+
+for (const button of [telegramGroup.cancel, telegramGroup.close]) {
+  button.addEventListener("click", () => {
+    if (!state.addingGroup) telegramGroup.dialog.close();
+  });
+}
+telegramGroup.dialog.addEventListener("cancel", (event) => {
+  if (state.addingGroup) event.preventDefault();
+});
+telegramGroup.dialog.addEventListener("close", () => openTelegramGroup.focus());
+telegramGroup.form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (busy()) return;
+  const payload = {
+    platform_id: telegramGroup.platform.value,
+    group_id: telegramGroup.id.value.trim(),
+  };
+  if (!/^-[1-9]\d*$/.test(payload.group_id)) {
+    setGroupError("请输入以负号开头的完整群 ID，例如 -1001234567890。");
+    telegramGroup.id.focus();
+    return;
+  }
+  state.addingGroup = true;
+  setSaving(true);
+  setGroupError();
+  telegramGroup.form.setAttribute("aria-busy", "true");
+  for (const control of Object.values(telegramGroup)) {
+    if (control.matches("button, input, select")) control.disabled = true;
+  }
+  telegramGroup.submit.textContent = "正在验证…";
+  try {
+    const result = await bridge.apiPost("groups/telegram/add", payload);
+    if (result.saved !== true) throw new Error("未收到群组保存确认，请重试。");
+    state.view = "groups";
+    state.selectedUmo = result.umo;
+    state.search = state.authorSearch = "";
+    elements.sessionSearch.value = "";
+    document.querySelectorAll("[data-view]").forEach((button) => {
+      const active = button.dataset.view === "groups";
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-selected", String(active));
+    });
+    const refreshed = await loadOverview();
+    telegramGroup.dialog.close();
+    showToast(refreshed
+      ? (result.created ? "群组已添加，可以开始订阅推主" : "群组已在列表中，信息已更新")
+      : "群组已保存，但列表刷新失败，请点击刷新");
+  } catch (error) {
+    setGroupError(error?.message || "验证或添加群组失败，请重试。");
+  } finally {
+    state.addingGroup = false;
+    for (const control of Object.values(telegramGroup)) {
+      if (control.matches("button, input, select")) control.disabled = false;
+    }
+    telegramGroup.submit.textContent = "验证并添加";
+    telegramGroup.form.setAttribute("aria-busy", "false");
+    setSaving(false);
+  }
 });
 
 elements.sessionSearch.addEventListener("input", (event) => {

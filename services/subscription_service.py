@@ -10,6 +10,7 @@ from typing import Any
 
 KV_SUBS_KEY = "twitter_subs"
 KV_RETWEET_DEDUP_KEY = "twitter_retweet_dedup_seen"
+KV_TELEGRAM_GROUPS_KEY = "twitter_telegram_groups"
 RETWEET_DEDUP_MAX_ITEMS = 500
 PROCESSED_TWEET_MAX_ITEMS = 500
 PENDING_TWEET_MAX_ITEMS = 500
@@ -78,6 +79,25 @@ class SubscriptionService:
         """获取不会被并发写入影响的订阅快照。"""
         async with self._lock:
             return copy.deepcopy(await self.get_all())
+
+    async def get_telegram_groups(self) -> dict:
+        """独立保存手动添加的群，即使还没有推主订阅也能在列表中显示。"""
+        async with self._lock:
+            data = await self._get_kv_data(KV_TELEGRAM_GROUPS_KEY, {})
+            return copy.deepcopy(data) if isinstance(data, dict) else {}
+
+    async def register_telegram_group(self, platform_id: str, group: dict) -> bool:
+        """保存已验证的群信息，返回是否首次添加；不更改订阅或轮询游标。"""
+        umo = f"{platform_id}:GroupMessage:{group['group_id']}"
+        async with self._lock:
+            data = await self._get_kv_data(KV_TELEGRAM_GROUPS_KEY, {})
+            groups = copy.deepcopy(data) if isinstance(data, dict) else {}
+            created = umo not in groups
+            groups[umo] = {
+                "group_id": group["group_id"], "group_name": group["group_name"],
+            }
+            await self._put_kv_data(KV_TELEGRAM_GROUPS_KEY, groups)
+            return created
 
     @staticmethod
     def session_target(event: Any) -> str:

@@ -5,4 +5,5 @@ version: v1.15.0
 author: Ars1027
 support_platforms: 
   - aiocqhttp
+  - telegram
 repo: https://github.com/Ars1027/astrbot_plugin_twitter

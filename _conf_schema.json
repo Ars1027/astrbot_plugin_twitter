@@ -57,7 +57,8 @@
       "twitter_use_node": {
         "description": "单条推文使用合并转发消息发送",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "QQ 使用合并转发；Telegram 自动使用普通消息，保留文字、截图、图片与视频。"
       },
       "twitter_no_text": {
         "description": "推文含媒体时不输出文字内容",
@@ -101,7 +102,7 @@
         "description": "轮询时汇总多条新推文为一条合并转发消息",
         "type": "bool",
         "default": false,
-        "hint": "仅影响轮询推送。开启后会缓存本轮轮询期间获取到的新推文，轮询结束后统一打包发送；需同时开启“单条推文使用合并转发消息发送”，否则不会生效"
+        "hint": "仅影响轮询推送。开启后会缓存本轮轮询期间获取到的新推文，轮询结束后统一打包发送；需同时开启“单条推文使用合并转发消息发送”，否则不会生效。Telegram 在轮询结束后逐条发送。"
       },
       "twitter_collective_max_authors": {
         "description": "集体转发时单条消息包含的最大推主数",

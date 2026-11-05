@@ -25,6 +25,7 @@ from .services import (
     TweetMessageSettings,
 )
 from .services.avatar_cache_service import AvatarCacheService
+from .services.platform_support import is_telegram_event
 from .twitter_api import (
     DATA_PROVIDER_FXTWITTER,
     DATA_PROVIDER_NITTER,
@@ -931,9 +932,15 @@ class TwitterPlugin(Star):
             yield event.plain_result("当前没有订阅任何推主")
             return
 
+        chunks = self._subscription_list_chunks(lines)
+        if is_telegram_event(event):
+            for text in chunks:
+                yield event.plain_result(text)
+            return
+
         nodes = [
             Node(content=[Plain(text)], name="推特订阅列表", uin=event.get_self_id())
-            for text in self._subscription_list_chunks(lines)
+            for text in chunks
         ]
         yield event.chain_result([Nodes(nodes)])
 
@@ -1046,6 +1053,7 @@ class TwitterPlugin(Star):
         prepared = self.delivery_service.prepare_event_delivery(
             chain,
             nickname,
+            **({"use_node": False} if is_telegram_event(event) else {}),
         )
         if prepared.primary_chain:
             yield event.chain_result(prepared.primary_chain)
@@ -1104,6 +1112,7 @@ class TwitterPlugin(Star):
             prepared = self.delivery_service.prepare_event_delivery(
                 chain,
                 nickname,
+                **({"use_node": False} if is_telegram_event(event) else {}),
             )
             if prepared.primary_chain:
                 yield event.chain_result(prepared.primary_chain)

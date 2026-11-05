@@ -20,12 +20,20 @@
     apiGet: async () => {
       await delay();
       const subs = [...groups, ...other_sessions].flatMap((g) => g.subscriptions);
-      return structuredClone({groups, other_sessions, group_sources: [], provider: {name: "fxtwitter", ready: true}, polling: {running: true, interval_minutes: interval},
+      return structuredClone({groups, other_sessions, group_sources: [], telegram_platforms: [{id: "telegram-demo", label: "Telegram · 演示机器人"}], provider: {name: "fxtwitter", ready: true}, polling: {running: true, interval_minutes: interval},
         totals: {groups: groups.length, authors: new Set(subs.map((s) => s.username)).size, subscriptions: subs.length, active: subs.filter((s) => s.enabled).length}});
     },
     apiPost: async (endpoint, payload) => {
       await delay();
       if (endpoint === "settings/poll-interval") { interval = payload.minutes; return {saved: true}; }
+      if (endpoint === "groups/telegram/add") {
+        if (payload.group_id === "-404") throw new Error("机器人当前不在这个 Telegram 群聊中");
+        const umo = `${payload.platform_id}:GroupMessage:${payload.group_id}`;
+        const created = !groups.some((group) => group.umo === umo);
+        if (created) groups.push({umo, group_id: payload.group_id, group_name: "Telegram 演示群组",
+          platform_id: payload.platform_id, available: true, subscriptions: []});
+        return {saved: true, created, umo};
+      }
       const group = [...groups, ...other_sessions].find((g) => g.umo === payload.umo);
       if (!group) throw new Error("会话不存在");
       const existing = group.subscriptions.find((s) => s.username.toLowerCase() === payload.username?.toLowerCase());

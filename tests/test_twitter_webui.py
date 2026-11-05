@@ -98,6 +98,11 @@ class FakeContext:
 class FakePlugin:
     def __init__(self, subs=None):
         self.subs = subs or {}
+        self.telegram_groups = {}
+        self.subscription_service = types.SimpleNamespace(
+            get_telegram_groups=self.get_telegram_groups,
+            register_telegram_group=self.register_telegram_group,
+        )
         self.data_provider = "fxtwitter"
         self._provider_ready = True
         self._running = True
@@ -122,6 +127,15 @@ class FakePlugin:
 
     async def _get_subscriptions_snapshot(self):
         return self.subs
+
+    async def get_telegram_groups(self):
+        return self.telegram_groups
+
+    async def register_telegram_group(self, platform_id, group):
+        umo = f"{platform_id}:GroupMessage:{group['group_id']}"
+        created = umo not in self.telegram_groups
+        self.telegram_groups[umo] = dict(group)
+        return created
 
     async def _set_poll_interval(self, minutes):
         if self.interval_error:
@@ -195,9 +209,10 @@ async def test_registers_routes_and_builds_multi_bot_overview(webui_module):
     context = FakeContext([platform_a, platform_b])
     controller = webui_module.TwitterWebUIController(FakePlugin(subs), context)
 
-    assert len(context.routes) == 7
+    assert len(context.routes) == 8
     assert {route for route, *_rest in context.routes} == {
         "/astrbot_plugin_twitter/overview",
+        "/astrbot_plugin_twitter/groups/telegram/add",
         "/astrbot_plugin_twitter/subscriptions/recent",
         "/astrbot_plugin_twitter/settings/poll-interval",
         "/astrbot_plugin_twitter/subscriptions/add",

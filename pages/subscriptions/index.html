@@ -98,6 +98,7 @@
               <input id="session-search" type="search" placeholder="搜索群名或群号" />
             </label>
           </div>
+          <button class="secondary-button add-group-button" id="open-telegram-group" type="button" hidden>＋ 添加 Telegram 群组</button>
           <div class="session-list" id="session-list">
             <div class="skeleton-list" aria-hidden="true">
               <span></span><span></span><span></span><span></span>
@@ -113,6 +114,26 @@
         </section>
       </main>
     </div>
+
+    <dialog class="telegram-group-dialog" id="telegram-group-dialog" aria-labelledby="telegram-group-title">
+      <header class="dialog-header">
+        <h2 id="telegram-group-title">添加 Telegram 群组</h2>
+        <button class="icon-button dialog-close" id="telegram-group-close" type="button" aria-label="关闭添加群组">×</button>
+      </header>
+      <p class="field-hint">先将机器人加入目标群，验证通过后即可在这里添加推主。</p>
+      <form id="telegram-group-form">
+        <label class="field-label" for="telegram-group-platform">Telegram 机器人</label>
+        <select id="telegram-group-platform" required></select>
+        <label class="field-label" for="telegram-group-id">群 ID</label>
+        <input id="telegram-group-id" type="text" placeholder="例如 -1001234567890" autocomplete="off" maxlength="32" required aria-describedby="telegram-group-help" />
+        <p class="field-hint" id="telegram-group-help">填写以负号开头的完整群 ID，不填写邀请链接或群用户名。话题订阅请在对应话题中使用指令建立。</p>
+        <div class="notice error-notice is-hidden" id="telegram-group-error" role="alert"></div>
+        <footer class="dialog-actions">
+          <button class="secondary-button" id="telegram-group-cancel" type="button">取消</button>
+          <button class="primary-button" id="telegram-group-submit" type="submit">验证并添加</button>
+        </footer>
+      </form>
+    </dialog>
 
     <dialog class="confirm-dialog" id="remove-dialog">
       <form method="dialog">

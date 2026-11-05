@@ -11,6 +11,7 @@ from astrbot.api.event import MessageChain
 import astrbot.api.message_components as Comp
 from astrbot.api.message_components import Node, Nodes
 
+from .platform_support import is_telegram_target
 from .subscription_service import DeliveredTweet, RecentDelivery, SkippedTweet, SubscriptionService
 from .tweet_message_service import TranslationCycleState, TweetMessageChain, TweetMessageService
 
@@ -181,9 +182,12 @@ class TweetDeliveryService:
         self,
         chain: list,
         nickname: str,
+        *,
+        use_node: bool | None = None,
     ) -> PreparedDelivery:
         """为测试指令和链接识别准备一致的主消息与视频列表。"""
-        if self.settings.use_node:
+        use_nodes = self.settings.use_node if use_node is None else use_node
+        if use_nodes:
             try:
                 nodes, videos = self.split_chain_for_nodes(chain, nickname)
                 primary_chain = [Nodes(nodes)] if nodes else []
@@ -620,7 +624,7 @@ class TweetDeliveryService:
                 record_sent()
                 return True
 
-            if self.settings.use_node:
+            if self.settings.use_node and not is_telegram_target(self.context, umo):
                 try:
                     nodes, video_parts = self.split_chain_for_nodes(
                         chain,
@@ -769,6 +773,20 @@ class TweetDeliveryService:
                         )
 
                 if not valid_tweets:
+                    continue
+
+                if is_telegram_target(self.context, umo):
+                    # Telegram 会静默忽略 Nodes，按条发送并沿用真实回执契约。
+                    for cached_tweet in valid_tweets:
+                        sent = await self.send_to_subscriber(
+                            umo, cached_tweet.username, cached_tweet.tweet_info,
+                            cached_tweet.sub_config, cached_tweet.nickname,
+                            translated_text=cached_tweet.translated_text,
+                            translate_model=cached_tweet.translate_model,
+                            recent_deliveries=recent_deliveries,
+                            delivered_tweets=delivered_tweets,
+                        )
+                        record_result(umo, cached_tweet, sent)
                     continue
 
                 tweets_by_author: dict[str, list[CachedTweet]] = {}
