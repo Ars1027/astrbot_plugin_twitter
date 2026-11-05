@@ -381,3 +381,45 @@ async def test_blocked_translation_still_delivers_and_commits_cursors(
     context.block = False
     await polling.check_all()
     assert len(context.calls) == 8
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider, result, expected", [
+    ("fxtwitter", {"text": "正文译文", "quote": {"text": "引用译文"}}, ("正文译文", "X")),
+    ("fxtwitter", None, (None, None)),
+    ("nitter", {"text": "不可使用"}, (None, None)),
+])
+async def test_native_translation_preserves_original_and_avoids_llm(plugin_module, provider, result, expected):
+    context = Context()
+    calls = []
+
+    async def translate(*args):
+        calls.append(args)
+        return result
+
+    service = make_service(plugin_module, context, translate_method="x")
+    service.twitter_api = types.SimpleNamespace(provider=provider, get_tweet_translation=translate)
+    tweet = {"username": "tester", "tweet_id": "123", "text": "original",
+             "quote": {"text": "quote", "translated_text": "旧译文"}}
+    assert await service.maybe_translate(tweet, "session") == expected
+    assert tweet["text"] == "original"
+    assert tweet["quote"].get("translated_text") == ("引用译文" if expected[1] else None)
+    assert calls == ([("tester", "123", "zh")] if provider == "fxtwitter" else [])
+    assert context.calls == []
+
+
+@pytest.mark.asyncio
+async def test_native_translation_timeout_keeps_original(plugin_module):
+    context = Context()
+    cancelled = []
+
+    async def translate(*_args):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.append(True)
+
+    service = make_service(plugin_module, context, translate_method="x")
+    service.twitter_api = types.SimpleNamespace(provider="fxtwitter", get_tweet_translation=translate)
+    assert await service.maybe_translate({"text": "original"}, "session") == (None, None)
+    assert cancelled == [True]
+    assert context.calls == []

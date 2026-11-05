@@ -193,7 +193,8 @@ class TwitterAPI:
                 if attempt + 1 < attempts:
                     await asyncio.sleep(0.5 * (attempt + 1))
                     continue
-                self.provider_ready = False
+                # 5xx 也可能只针对某个账号或推文（如私密账号时间线），
+                # 不能据此把整个数据源标为不可用并阻断其他订阅。
                 return None
 
             if resp.status_code < 200 or resp.status_code >= 300:
@@ -1282,6 +1283,35 @@ class TwitterAPI:
 
         self._cache_fxtwitter_status(status)
         return self._adapt_fxtwitter_status(status, username, tweet_id)
+
+    async def get_tweet_translation(
+        self, username: str, tweet_id: str, lang: str
+    ) -> Optional[dict]:
+        """获取 FxTwitter 原生译文，不修改原始详情缓存。"""
+        tweet_id = str(tweet_id or "").strip()
+        lang = str(lang or "").strip()
+        if self.provider != DATA_PROVIDER_FXTWITTER or not tweet_id.isdigit() or not lang:
+            return None
+        payload = await self._request_fxtwitter_json(
+            f"2/status/{tweet_id}", params={"lang": lang}
+        )
+        status = payload.get("status") if isinstance(payload, dict) else None
+        if not isinstance(status, dict) or status.get("type") != "status":
+            return None
+
+        def translated_text(item):
+            translation = item.get("translation") if isinstance(item, dict) else None
+            text = translation.get("text") if isinstance(translation, dict) else None
+            return text if isinstance(text, str) and text.strip() else None
+
+        result = {}
+        text = translated_text(status)
+        if text:
+            result["text"] = text
+        quote_text = translated_text(status.get("quote"))
+        if quote_text:
+            result["quote"] = {"text": quote_text}
+        return result or None
 
     async def get_tweet(self, username: str, tweet_id: str) -> dict:
         """获取推文详细信息

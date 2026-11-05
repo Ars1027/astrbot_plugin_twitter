@@ -421,16 +421,18 @@ async def test_rate_limit_api_error_and_invalid_json_are_safe(api_module):
 
 
 @pytest.mark.asyncio
-async def test_exhausted_server_errors_mark_provider_unavailable(api_module):
+@pytest.mark.parametrize("status_code", [500, 502, 503, 504])
+@pytest.mark.parametrize("ready", [False, True])
+async def test_server_errors_preserve_provider_availability(api_module, status_code, ready):
     def handler(_request):
-        return httpx.Response(503, json={"code": 503})
+        return httpx.Response(status_code, json={"code": status_code})
 
     api = api_module.TwitterAPI(provider="fxtwitter")
-    api.provider_ready = True
+    api.provider_ready = ready
     api._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
     assert await api._request_fxtwitter_json("unavailable", retries=1) is None
-    assert api.is_ready is False
+    assert api.is_ready is ready
     await api.close()
 
 
@@ -464,3 +466,53 @@ async def test_exhausted_transport_errors_leave_fresh_start_for_next_poll(
     assert api._client is None
     assert first_client.is_closed
     assert retry_client.is_closed
+
+@pytest.mark.asyncio
+async def test_native_translation_preserves_original_cache(api_module):
+    api = api_module.TwitterAPI(provider="fxtwitter")
+    original = _fixture("fxtwitter_text_status.json")
+    api._cache_fxtwitter_status(original)
+    before = copy.deepcopy(api._status_cache)
+
+    def handler(request):
+        assert request.url.path == "/2/status/1005"
+        assert request.url.params["lang"] == "zh-cn"
+        return httpx.Response(200, json={"code": 200, "status": {
+            "type": "status", "text": "original",
+            "translation": {"text": "主帖译文"},
+            "quote": {"translation": {"text": "引用译文"}},
+        }})
+
+    api._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        assert await api.get_tweet_translation("tester", "1005", "zh-cn") == {
+            "text": "主帖译文", "quote": {"text": "引用译文"},
+        }
+        assert api._status_cache == before
+    finally:
+        await api._client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [None, {"code": 404}, {"status": {
+    "type": "status", "text": "原文", "translation": {"text": " "},
+}}])
+async def test_native_translation_missing_or_failed(api_module, payload):
+    api = api_module.TwitterAPI(provider="fxtwitter")
+
+    async def request(*_args, **_kwargs):
+        return payload
+
+    api._request_fxtwitter_json = request
+    assert await api.get_tweet_translation("tester", "1005", "zh") is None
+
+
+@pytest.mark.asyncio
+async def test_nitter_translation_does_not_request(api_module):
+    api = api_module.TwitterAPI(provider="nitter")
+
+    async def request(*_args, **_kwargs):
+        pytest.fail("Nitter must not request FxTwitter translation")
+
+    api._request_fxtwitter_json = request
+    assert await api.get_tweet_translation("tester", "1005", "zh") is None

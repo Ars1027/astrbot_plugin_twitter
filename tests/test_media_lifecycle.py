@@ -183,7 +183,7 @@ def _delivery_settings(plugin_module, **overrides):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["text", "screenshot"])
 @pytest.mark.parametrize("enabled", [False, True])
-async def test_both_message_modes_keep_quote_media_before_main(plugin_module, mode, enabled):
+async def test_both_message_modes_keep_main_media_before_quote(plugin_module, mode, enabled):
     async def render(*_args, **_kwargs):
         return "https://example.com/card.png"
 
@@ -206,9 +206,18 @@ async def test_both_message_modes_keep_quote_media_before_main(plugin_module, mo
     media = [component.file for component in chain if isinstance(component, (Image, Video))]
     expected = ["https://example.com/card.png"] if mode == "screenshot" else []
     if enabled:
-        expected += ["https://example.com/quote.jpg", "https://example.com/quote.mp4",
-                     "https://example.com/main.jpg", "https://example.com/main.mp4"]
+        expected += ["https://example.com/main.jpg", "https://example.com/main.mp4",
+                     "https://example.com/quote.jpg", "https://example.com/quote.mp4"]
     assert media == expected
+    if mode == "text" and enabled:
+        assert [type(component) for component in chain] == [Plain, Image, Video, Plain, Image, Video]
+        assert "正文" in chain[0].text and "引用" not in chain[0].text
+        assert "引用" in chain[3].text
+        nodes, videos = plugin_module.TweetDeliveryService.split_chain_for_nodes(chain, "Tester")
+        assert [type(node.content[0]) for node in nodes] == [Plain, Image, Plain, Image]
+        assert [video.file for video in videos] == [
+            "https://example.com/main.mp4", "https://example.com/quote.mp4",
+        ]
 
 
 @pytest.mark.asyncio

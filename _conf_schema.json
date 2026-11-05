@@ -153,7 +153,7 @@
   "translation": {
     "description": "翻译设置",
     "type": "object",
-    "hint": "配置推文内容的自动翻译行为，需至少一个可用的 LLM Provider。",
+    "hint": "选择 X 自带翻译或 LLM 翻译。X 自带翻译仅支持 FxTwitter 数据源，Nitter 下不翻译。",
     "items": {
       "twitter_translate_enabled": {
         "description": "推文内容翻译开关",
@@ -161,13 +161,31 @@
         "default": false,
         "hint": "开启后，推文正文将被翻译为目标语言"
       },
+      "twitter_translate_method": {
+        "description": "翻译方式",
+        "type": "string",
+        "default": "llm",
+        "options": ["x", "llm"],
+        "labels": ["X 自带翻译", "LLM 翻译"],
+        "hint": "X 自带翻译仅支持 FxTwitter 数据源；使用 Nitter 时不翻译。X 翻译不可用时保留原文。",
+        "obvious_hint": true
+      },
+      "twitter_translate_native_lang": {
+        "description": "X 翻译目标语言代码",
+        "type": "string",
+        "default": "zh",
+        "hint": "填写语言代码，如 zh（简体中文）、ja（日语）、en（英语）。仅 FxTwitter 生效。",
+        "condition": {"twitter_translate_method": "x"}
+      },
       "twitter_translate_target_lang": {
+        "condition": {"twitter_translate_method": "llm"},
         "description": "翻译目标语言",
         "type": "string",
         "default": "简体中文",
         "hint": "推文内容将被翻译为此语言，如：简体中文、日语、英语"
       },
       "twitter_translate_provider_id": {
+        "condition": {"twitter_translate_method": "llm"},
         "description": "翻译使用的 LLM Provider（留空则自动选择）",
         "type": "string",
         "default": "",
@@ -181,12 +199,14 @@
         "hint": "最小为 1 秒。正文、引用正文和重试共用此时限，超时未完成部分使用原文。轮询中同一 Provider 连续两条推文翻译失败后，本轮剩余内容使用原文，下轮重新尝试；手动测试和解析不参与该计数。"
       },
       "twitter_translate_custom_prompt_enabled": {
+        "condition": {"twitter_translate_method": "llm"},
         "description": "启用自定义翻译提示词",
         "type": "bool",
         "default": false,
         "hint": "开启后将使用下方自定义的翻译提示词，而非内置默认提示词"
       },
       "twitter_translate_custom_prompt": {
+        "condition": {"twitter_translate_method": "llm"},
         "description": "自定义翻译提示词",
         "type": "text",
         "editor_mode": true,

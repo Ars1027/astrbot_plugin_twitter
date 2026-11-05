@@ -60,7 +60,7 @@
 - **定时追踪**：从 Nitter 或 FxTwitter 读取增量推文，按旧到新推送；每个推主每轮可限制推送数量。
 - **失败补发**：保存各会话已发送或按配置跳过的结果，重试只向未完成的会话补发。
 - **消息呈现**：支持普通消息、单条或集体合并转发、深浅色截图、图片与视频，以及可选的转帖去重。
-- **按需解析与翻译**：手动或自动解析 `twitter.com` / `x.com` 链接；配置 LLM Provider 后可翻译推文正文。
+- **按需解析与翻译**：手动或自动解析 `twitter.com` / `x.com` 链接；可选择 X 自带翻译（仅 FxTwitter）或 LLM 翻译。
 - **Agent 推送摘要**：可选开启，供模型通过工具按需查询本会话最近成功推送的摘要，推送时不主动追加 LLM 对话历史。
 
 ### WebUI 订阅管理
@@ -153,12 +153,16 @@
 | `twitter_deduplicate_retweets` | `false` | 同一原帖被多个推主转发时按会话去重 |
 | `twitter_link_recognition_enabled` | `auto` | `auto` 自动解析、`command` 仅指令解析、`off` 关闭 |
 | `twitter_agent_query_enabled` | `false` | 允许 Agent 调用 `twitter_recent_pushes` 查询本会话推送摘要 |
-| `twitter_translate_enabled` | `false` | 自动翻译推文正文；需要可用的 LLM Provider |
-| `twitter_translate_target_lang` | `简体中文` | 翻译目标语言 |
-| `twitter_translate_provider_id` | 空 | 指定 LLM Provider；留空时依次尝试当前会话与第一个可用 Provider |
+| `twitter_translate_enabled` | `false` | 自动翻译推文正文 |
+| `twitter_translate_method` | `llm` | `x` 使用 X 自带翻译，`llm` 使用 LLM 翻译；旧配置默认使用 LLM |
+| `twitter_translate_native_lang` | `zh` | X 翻译目标语言代码，如 `zh`、`ja`、`en`；仅选择 X 翻译时显示 |
+| `twitter_translate_target_lang` | `简体中文` | LLM 翻译目标语言；仅选择 LLM 翻译时显示 |
+| `twitter_translate_provider_id` | 空 | 仅选择 LLM 翻译时显示；留空时依次尝试当前会话与第一个可用 Provider |
 | `twitter_translate_timeout_seconds` | `60` | 单条推文翻译的总时限（秒），超时回退原文 |
-| `twitter_translate_custom_prompt_enabled` | `false` | 使用自定义翻译 system prompt |
-| `twitter_translate_custom_prompt` | 内置提示词 | 自定义提示词，支持 `{target_lang}` 变量 |
+| `twitter_translate_custom_prompt_enabled` | `false` | 使用自定义翻译 system prompt；仅选择 LLM 翻译时显示 |
+| `twitter_translate_custom_prompt` | 内置提示词 | 自定义提示词，支持 `{target_lang}` 变量；仅选择 LLM 翻译时显示 |
+
+**翻译方式说明**：X 自带翻译仅支持 FxTwitter 数据源；使用 Nitter 时选择此方式不翻译。接口未返回译文或翻译失败时保留原文，不自动调用 LLM。上游不支持 **X Article 长文章正文翻译**，文章正文仍显示原文；如需翻译文章，请选择 LLM 翻译并配置可用的 Provider。
 
 </details>
 

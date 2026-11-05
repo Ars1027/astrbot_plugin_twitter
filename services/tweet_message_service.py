@@ -50,6 +50,8 @@ class TweetMessageSettings:
     pre_download_media: bool
     proxy: str | None
     translate_timeout_seconds: int = 60
+    translate_method: str = "llm"
+    translate_native_lang: str = "zh"
 
 
 @dataclass(slots=True)
@@ -236,6 +238,9 @@ class TweetMessageService:
         if not self.settings.translate_enabled:
             return None, None
 
+        if self.settings.translate_method == "x":
+            return await self._translate_native(tweet_info)
+
         original_text = str(tweet_info.get("text") or "")
         quote_text = str(quote.get("text") or "")
         if not (original_text.strip() or quote_text.strip()):
@@ -292,6 +297,34 @@ class TweetMessageService:
             f"失败回退: {failed}，本轮跳过: {skipped}"
         )
         return translated_text, translate_model
+
+    async def _translate_native(self, tweet: dict) -> tuple[str | None, str | None]:
+        """X 翻译仅用于 FxTwitter；不可用时保留原文，不调用 LLM。"""
+        if self.twitter_api.provider != "fxtwitter":
+            return None, None
+        try:
+            result = await asyncio.wait_for(
+                self.twitter_api.get_tweet_translation(
+                    tweet.get("username", ""), tweet.get("tweet_id", ""),
+                    self.settings.translate_native_lang,
+                ),
+                timeout=self.settings.translate_timeout_seconds,
+            )
+        except Exception as exc:
+            logger.warning(f"X 翻译失败，使用原文: {type(exc).__name__}")
+            return None, None
+        if not result:
+            return None, None
+        translated = result.get("text") or None
+        quote_text = (result.get("quote") or {}).get("text")
+        if quote_text and tweet.get("quote"):
+            tweet["quote"]["translated_text"] = quote_text
+        for part, text in ((tweet, translated), (tweet.get("quote") or {}, quote_text)):
+            if text and part.get("article"):
+                # 接口只翻译帖子正文，文章内容仍保留原文。
+                part["translated_article"] = copy.deepcopy(part["article"])
+                part["translated_article_lead"] = text
+        return translated, "X" if translated or quote_text else None
 
     @staticmethod
     def _has_translatable_text(text: str) -> bool:
@@ -470,12 +503,12 @@ class TweetMessageService:
         retweet = tweet_info.get("retweet") or None
 
         chain = []
-        text_sections: list[str] = []
 
         def append_text_section(value: str) -> None:
             value = str(value or "").strip()
             if value:
-                text_sections.append(value)
+                separator = "\n\n" if chain else ""
+                self.append_to_last_plain(chain, separator + value)
 
         nickname = self.build_author_display(author_username, screen_name)
         if retweet:
@@ -497,6 +530,10 @@ class TweetMessageService:
         if not (self.settings.no_text and has_media) and text:
             append_text_section(text)
 
+        await self.append_media_components(
+            chain, tweet_info.get("images") or [], tweet_info.get("videos") or [],
+        )
+
         if quote:
             quote_author_username = str(quote.get("username") or "")
             quote_author = str(quote.get("author") or quote_author_username)
@@ -508,6 +545,10 @@ class TweetMessageService:
             append_text_section(f"{nickname} 引用了 {quote_display} 的帖子")
             if quote_text:
                 append_text_section(quote_text)
+            await self.append_media_components(
+                chain, quote.get("images") or [], quote.get("videos") or [],
+                context_label="引用推文",
+            )
 
         if tweet_id and self.settings.include_tweet_link:
             append_text_section(
@@ -517,11 +558,6 @@ class TweetMessageService:
         quote_translated = bool((quote or {}).get("translated_text"))
         if translate_model and (translated_text is not None or quote_translated):
             append_text_section(f"（由 {translate_model} 翻译自原文）")
-
-        if text_sections:
-            self.append_to_last_plain(chain, "\n\n".join(text_sections))
-
-        await self.append_tweet_media(chain, tweet_info)
 
         return [component for component in chain if component is not None]
 
@@ -650,8 +686,8 @@ class TweetMessageService:
         )
 
     async def append_tweet_media(self, chain: list, tweet_info: dict) -> None:
-        """两种消息模式均先追加引用帖媒体，再追加主贴媒体。"""
-        for part, label in ((tweet_info.get("quote"), "引用推文"), (tweet_info, "推文")):
+        """按主帖、引用帖的顺序追加截图外的附加媒体。"""
+        for part, label in ((tweet_info, "推文"), (tweet_info.get("quote"), "引用推文")):
             if part:
                 await self.append_media_components(
                     chain, part.get("images") or [], part.get("videos") or [],

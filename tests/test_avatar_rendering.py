@@ -78,6 +78,10 @@ def test_avatar_rendering_has_no_broken_images_or_layout_changes(
         assert frames.nth(0).bounding_box()["width"] == 72
         assert frames.nth(1).bounding_box()["width"] == 36
         assert page.locator(".shot").bounding_box()["width"] == 1140
+        assert page.locator(".tools svg").bounding_box()["width"] == 36
+        assert page.locator(".tools").evaluate("e => getComputedStyle(e).color") == (
+            "rgb(231, 233, 234)" if theme == "dark" else "rgb(15, 20, 25)"
+        )
         visible_images = page.locator(".avatar-frame img:visible")
         assert visible_images.count() == (2 if avatar_state == "cached" else 0)
         assert all(
@@ -125,7 +129,11 @@ def test_article_layout_retains_lists_escapes_html_and_fits_image(plugin_module,
             {"type": "ordered-list-item", "text": "二", "spans": [{"text": "二"}]},
         ],
     }
-    context = renderer.build_tweet_card_context("author", {"article": article, "article_lead": "附言"}, theme=theme)
+    uri = "data:image/png;base64," + base64.b64encode((ROOT / "logo.png").read_bytes()).decode()
+    context = renderer.build_tweet_card_context("author", {
+        "article": article, "article_lead": "附言", "images": [uri],
+        "quote": {"username": "quoted", "text": "引用正文", "images": [uri]},
+    }, theme=theme)
     page = browser.new_page(viewport={"width": 1140, "height": 400})
     try:
         page.set_content(jinja.Template(renderer.load_tweet_card_template()).render(**context))
@@ -133,6 +141,14 @@ def test_article_layout_retains_lists_escapes_html_and_fits_image(plugin_module,
         assert page.locator(".article-title").inner_text() == article["title"]
         assert page.locator(".article-list-marker").all_inner_texts() == ["1.", "2."]
         assert page.locator(".tweet-text").inner_text() == "附言"
+        assert page.locator(".tweet-main > .media-grid, .quote-card").evaluate_all(
+            "els => els.map(e => e.classList.contains('quote-card') ? 'quote' : 'main-media')"
+        ) == ["main-media", "quote"]
+        assert page.evaluate("""() => {
+          const rect = selector => document.querySelector(selector).getBoundingClientRect();
+          return rect('.tweet-main > .media-grid').bottom <= rect('.quote-card').top
+            && rect('.quote-text').bottom <= rect('.quote-card .media-grid').top;
+        }""")
         assert page.locator(".article-block span span").first.evaluate("e=>getComputedStyle(e).fontWeight") == "750"
         assert page.evaluate("""() => {
           const outer=document.querySelector('.shot').getBoundingClientRect();

@@ -7,6 +7,7 @@ import sys
 import types
 from pathlib import Path
 
+import httpx
 import pytest
 
 
@@ -969,46 +970,90 @@ async def test_timeline_failure_does_not_advance_polling_cursor(plugin_module):
 
 
 @pytest.mark.asyncio
-async def test_fxtwitter_global_failure_stops_remaining_users(plugin_module):
-    calls = []
+@pytest.mark.parametrize("failure", ["server_error", "repeated_cursor", "rate_limit", "transport"])
+async def test_fxtwitter_failure_scope_and_retry(plugin_module, monkeypatch, failure):
+    spec = importlib.util.spec_from_file_location(
+        f"{plugin_module.__package__}.real_twitter_api", ROOT / "twitter_api.py"
+    )
+    api_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(api_module)
+    polling_module = sys.modules[f"{plugin_module.__package__}.services.polling_service"]
+    monkeypatch.setattr(polling_module, "FxTwitterTimelineError", api_module.FxTwitterTimelineError)
 
-    class API:
-        is_ready = True
+    async def no_sleep(_seconds):
+        pass
 
-        async def get_user_timeline_items(self, username, _since_id):
-            calls.append(username)
-            self.is_ready = False
-            raise plugin_module.FxTwitterTimelineError("代理连接失败")
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    store = {
+        username: {"since_id": "100", "subscribers": {"session": {"status": True}}}
+        for username in ("first", "second")
+    }
+    sent = []
+    failing = True
 
-    class Subscriptions:
-        @staticmethod
-        def processed_tweet_ids(_info):
-            return set()
+    def handler(request):
+        username = request.url.path.split("/")[3]
+        if username == "first" and failing:
+            if failure == "transport":
+                raise httpx.ConnectError("connection unavailable", request=request)
+            if failure == "repeated_cursor":
+                return httpx.Response(200, json={
+                    "code": 200, "results": [], "cursor": {"bottom": "same-page"},
+                })
+            status_code = 429 if failure == "rate_limit" else 500
+            return httpx.Response(status_code, json={"code": status_code})
+        return httpx.Response(200, json={"code": 200, "results": [{
+            "type": "status", "id": "101", "text": "new tweet", "author": {"screen_name": username},
+        }]})
 
-        async def get_all(self):
-            return {
-                "first": {"since_id": "100"},
-                "second": {"since_id": "200"},
-            }
+    api = api_module.TwitterAPI(provider="fxtwitter")
+    api.provider_ready = True
+    api._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    async def get_kv(_key, _default):
+        return copy.deepcopy(store)
+
+    async def put_kv(_key, data):
+        store.clear()
+        store.update(copy.deepcopy(data))
+
+    client_type = httpx.AsyncClient
+    # 传输错误会创建新客户端；所有重试仍经过同一受控响应。
+    monkeypatch.setattr(api_module.httpx, "AsyncClient", lambda **_kwargs: client_type(
+        transport=httpx.MockTransport(handler)
+    ))
+    delivery_module = sys.modules[f"{plugin_module.__package__}.services.tweet_delivery_service"]
 
     class Delivery:
         collective_enabled = False
 
+        async def push_to_subscribers(self, username, *_args, **_kwargs):
+            sent.append(username)
+            return delivery_module.DeliveryResult(delivery_module.DeliveryState.DELIVERED)
+
     polling = plugin_module.PollingService(
-        API(),
-        Subscriptions(),
+        api,
+        plugin_module.SubscriptionService(get_kv, put_kv, api, lambda: True),
         Delivery(),
         plugin_module.PollingSettings(
-            include_retweets=True,
-            data_provider="fxtwitter",
-            custom_nitter_url="",
-            website_list=(),
+            include_retweets=True, data_provider="fxtwitter", custom_nitter_url="", website_list=(),
         ),
     )
+    try:
+        await polling.check_all()
+        local_failure = failure in {"server_error", "repeated_cursor"}
+        assert sent == (["second"] if local_failure else [])
+        assert store["first"]["since_id"] == "100"
+        assert store["second"]["since_id"] == ("101" if local_failure else "100")
+        assert api.is_ready is local_failure
 
-    await polling.check_all()
-
-    assert calls == ["first"]
+        failing = False
+        if not api.is_ready:
+            assert await api.check_fxtwitter_available()
+        await polling.check_all()
+        assert sent == (["second", "first"] if local_failure else ["first", "second"])
+        assert all(info["since_id"] == "101" for info in store.values())
+    finally:
+        await api.close()
 
 
 def test_timeline_metadata_is_the_only_source_of_retweet_context(plugin_module):
@@ -2916,3 +2961,13 @@ async def test_confirmed_retweet_restores_seen_across_global_config_changes(
     await poll("other")
     assert store["twitter_subs"]["other"]["since_id"] == "101"
     assert sent == ["group"]
+
+@pytest.mark.parametrize("config, method, lang", [
+    ({"twitter_translate_enabled": True}, "llm", "zh"),
+    ({"twitter_translate_method": "x", "twitter_translate_native_lang": "ja"}, "x", "ja"),
+    ({"translation": {"twitter_translate_method": "x", "twitter_translate_native_lang": "en"}}, "x", "en"),
+])
+def test_translation_method_config_compatibility(plugin_module, config, method, lang):
+    plugin = plugin_module.TwitterPlugin(types.SimpleNamespace(), config)
+    assert plugin.message_service.settings.translate_method == method
+    assert plugin.message_service.settings.translate_native_lang == lang

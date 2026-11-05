@@ -286,6 +286,12 @@ class TwitterPlugin(Star):
                 False,
             )
         )
+        self.translate_method = str(
+            self._cfg("translation", "twitter_translate_method", "llm") or "llm"
+        )
+        self.translate_native_lang = str(
+            self._cfg("translation", "twitter_translate_native_lang", "zh") or "zh"
+        ).strip()
         self.translate_target_lang = str(
             self._cfg(
                 "translation",
@@ -374,6 +380,8 @@ class TwitterPlugin(Star):
                 screenshot_theme=self.screenshot_theme,
                 video_max_size_mb=self.video_max_size_mb,
                 translate_enabled=self.translate_enabled,
+                translate_method=self.translate_method,
+                translate_native_lang=self.translate_native_lang,
                 translate_target_lang=self.translate_target_lang,
                 translate_provider_id=self.translate_provider_id,
                 translate_timeout_seconds=self.translate_timeout_seconds,

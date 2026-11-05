@@ -154,12 +154,12 @@
       max-width: 190px;
     }
     .tools {
-      color: var(--muted);
-      font-size: 22px;
-      letter-spacing: 0;
+      color: var(--text);
       flex: 0 0 auto;
-      line-height: 24px;
+      width: 24px;
+      height: 24px;
     }
+    .tools svg { display: block; width: 24px; height: 24px; fill: currentColor; }
     .tweet-text {
       margin-top: 2px;
       white-space: pre-wrap;
@@ -393,7 +393,7 @@
             {% if tweet.verified %}<span class="verified">&#x2713;</span>{% endif %}
             <span class="handle">@{{ tweet.username|e }}</span>
           </div>
-          <div class="tools">&#x2026;</div>
+          <div class="tools"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817-5.964 6.817H1.684l7.73-8.835L1.258 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg></div>
         </div>
 
         {% if tweet.text %}
@@ -403,6 +403,23 @@
           <div class="translation-note">({{ tweet.translation_note|e }})</div>
         {% endif %}
         {{ article_card(tweet.article) }}
+
+        {% if tweet.media %}
+          <div class="media-grid {{ tweet.media_class }}">
+            {% for item in tweet.media %}
+              <div class="media">
+                {% if item.url %}
+                  <img src="{{ item.url|e }}" alt="">
+                {% else %}
+                  <div class="video-placeholder">VIDEO</div>
+                {% endif %}
+                {% if item.kind == "video" %}
+                  <div class="video-overlay"><div class="play">&#x25b6;</div>{% if item.duration %}<div class="duration">{{ item.duration|e }}</div>{% endif %}</div>
+                {% endif %}
+              </div>
+            {% endfor %}
+          </div>
+        {% endif %}
 
         {% if tweet.quote %}
           <section class="quote-card">
@@ -437,23 +454,6 @@
               </div>
             {% endif %}
           </section>
-        {% endif %}
-
-        {% if tweet.media %}
-          <div class="media-grid {{ tweet.media_class }}">
-            {% for item in tweet.media %}
-              <div class="media">
-                {% if item.url %}
-                  <img src="{{ item.url|e }}" alt="">
-                {% else %}
-                  <div class="video-placeholder">VIDEO</div>
-                {% endif %}
-                {% if item.kind == "video" %}
-                  <div class="video-overlay"><div class="play">&#x25b6;</div>{% if item.duration %}<div class="duration">{{ item.duration|e }}</div>{% endif %}</div>
-                {% endif %}
-              </div>
-            {% endfor %}
-          </div>
         {% endif %}
 
         {% if tweet.date %}<div class="post-date">{{ tweet.date|e }}</div>{% endif %}
