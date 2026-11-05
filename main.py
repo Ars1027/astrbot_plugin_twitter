@@ -457,6 +457,8 @@ class TwitterPlugin(Star):
         """初始化数据源并启动轮询任务。"""
         logger.info("Twitter 推文转发插件初始化中...")
 
+        await self._migrate_group_subscriptions()
+
         if self.collective_forward and not self.use_node:
             logger.warning(
                 "集体转发模式已开启但合并转发消息未开启，集体转发功能不会生效。"
@@ -521,6 +523,24 @@ class TwitterPlugin(Star):
         logger.info("Twitter 推文转发插件已停止")
 
     # WebUI 与现有调用方使用的兼容委托。
+    async def _migrate_group_subscriptions(self) -> None:
+        """在轮询开始前修复 QQ 成员隔离产生的旧订阅目标。"""
+        manager = getattr(self.context, "platform_manager", None)
+        instances = getattr(manager, "platform_insts", None)
+        if instances is None:
+            get_insts = getattr(manager, "get_insts", None)
+            instances = get_insts() if callable(get_insts) else []
+        platform_ids = set()
+        for platform in instances or []:
+            meta = platform.meta()
+            name = meta.get("name") if isinstance(meta, dict) else getattr(meta, "name", None)
+            platform_id = meta.get("id") if isinstance(meta, dict) else getattr(meta, "id", None)
+            if name == "aiocqhttp" and platform_id:
+                platform_ids.add(str(platform_id))
+        count = await self.subscription_service.migrate_qq_group_sessions(platform_ids)
+        if count:
+            logger.info(f"已将 {count} 个 QQ 成员会话订阅归并到真实群聊")
+
     async def _get_subs(self) -> dict:
         return await self.subscription_service.get_all()
 
@@ -692,7 +712,7 @@ class TwitterPlugin(Star):
 
         try:
             add_result = await self._add_subscription(
-                event.unified_msg_origin,
+                SubscriptionService.session_target(event),
                 username,
                 r18=r18,
                 media_only=media_only,
@@ -758,7 +778,7 @@ class TwitterPlugin(Star):
             f"正在批量订阅 {len(usernames)} 个推主，请稍候..."
         )
 
-        umo = event.unified_msg_origin
+        umo = SubscriptionService.session_target(event)
         results: list[str] = []
         success_count = 0
         for username in usernames:
@@ -809,7 +829,7 @@ class TwitterPlugin(Star):
 
         username = username.strip("@").strip()
         remove_result = await self._remove_subscription(
-            event.unified_msg_origin,
+            SubscriptionService.session_target(event),
             username,
         )
         if not remove_result["ok"]:
@@ -829,7 +849,7 @@ class TwitterPlugin(Star):
             return
 
         usernames = [token.strip("@").strip() for token in tokens]
-        umo = event.unified_msg_origin
+        umo = SubscriptionService.session_target(event)
         results: list[str] = []
         success_count = 0
         for username in usernames:
@@ -888,7 +908,7 @@ class TwitterPlugin(Star):
     @filter.command("推特列表", alias={"twitter_list"})
     async def list_follows(self, event: AstrMessageEvent):
         """以分段合并转发查看当前会话的完整订阅列表。"""
-        umo = event.unified_msg_origin
+        umo = SubscriptionService.session_target(event)
         subs = await self._get_subs()
         lines = []
         for username, info in subs.items():
@@ -930,7 +950,7 @@ class TwitterPlugin(Star):
 
         enabled = action == "开启"
         count = await self._set_session_subscriptions_status(
-            event.unified_msg_origin,
+            SubscriptionService.session_target(event),
             enabled,
         )
         if count > 0:
@@ -1147,7 +1167,7 @@ class TwitterPlugin(Star):
             capped = 5
         filter_name = str(username or "").strip().lstrip("@") or None
         items = await self.subscription_service.list_session_recent_deliveries(
-            event.unified_msg_origin,
+            SubscriptionService.session_target(event),
             username=filter_name,
             limit=capped,
         )

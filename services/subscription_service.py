@@ -80,6 +80,97 @@ class SubscriptionService:
             return copy.deepcopy(await self.get_all())
 
     @staticmethod
+    def session_target(event: Any) -> str:
+        """QQ 群订阅使用真实群号，不随成员隔离上下文变化。"""
+        umo = event.unified_msg_origin
+        platform_name = getattr(event, "get_platform_name", None)
+        if not callable(platform_name) or platform_name() != "aiocqhttp":
+            return umo
+        parts = umo.split(":", 2)
+        if len(parts) != 3 or parts[1] != "GroupMessage":
+            return umo
+        group_id = event.get_group_id()
+        return f"{parts[0]}:GroupMessage:{group_id}" if group_id else umo
+
+    @staticmethod
+    def _qq_group_target(umo: str, platform_ids: set[str]) -> str:
+        """仅迁移已确认的 QQ 平台的「成员号_群号」，不猜测其他渠道格式。"""
+        parts = umo.split(":", 2)
+        if len(parts) != 3 or parts[0] not in platform_ids or parts[1] != "GroupMessage":
+            return umo
+        member_id, separator, group_id = parts[2].partition("_")
+        if separator and member_id.isdecimal() and group_id.isdecimal():
+            return f"{parts[0]}:GroupMessage:{group_id}"
+        return umo
+
+    @classmethod
+    def _merge_group_subscriber(cls, target: dict, source: dict) -> None:
+        """保留目标配置，合并真实回执、跳过确认和最近历史。"""
+        for field in ("pending_delivery_ids", "pending_skip_ids"):
+            existing = target.get(field, [])
+            incoming = source.get(field, [])
+            if isinstance(incoming, list) and incoming:
+                target[field] = list(dict.fromkeys(
+                    str(item) for item in [
+                        *(existing if isinstance(existing, list) else []), *incoming,
+                    ]
+                ))
+        records = [
+            item for config in (target, source)
+            for item in (config.get("recent_deliveries") or [])
+            if isinstance(item, dict)
+        ]
+        if records:
+            records.sort(key=cls._delivery_sort_key, reverse=True)
+            history = {}
+            for record in records:
+                history.setdefault(str(record.get("tweet_id") or ""), record)
+            target["recent_deliveries"] = list(history.values())[:RECENT_DELIVERY_MAX_ITEMS]
+
+    async def migrate_qq_group_sessions(self, platform_ids: set[str]) -> int:
+        """将旧 QQ 成员会话归并到真实群，保持游标与重试窗口不变。"""
+        if not platform_ids:
+            return 0
+        async with self._lock:
+            subs = copy.deepcopy(await self.get_all())
+            migrated = 0
+            for author in subs.values():
+                subscribers = author.get("subscribers", {})
+                # 已有群配置优先；否则按旧 UMO 排序，确定性选择首个成员配置。
+                for umo in sorted(subscribers):
+                    target_umo = self._qq_group_target(umo, platform_ids)
+                    if target_umo == umo:
+                        continue
+                    source = subscribers.pop(umo)
+                    if target_umo in subscribers:
+                        self._merge_group_subscriber(subscribers[target_umo], source)
+                    else:
+                        subscribers[target_umo] = source
+                    migrated += 1
+
+            seen = copy.deepcopy(await self.get_retweet_seen())
+            changed = False
+            for umo, ids in list(seen.items()):
+                target_umo = self._qq_group_target(umo, platform_ids)
+                if target_umo == umo or not isinstance(ids, list):
+                    continue
+                existing = seen.get(target_umo, [])
+                merged = list(dict.fromkeys(
+                    str(item) for item in reversed([
+                        *ids, *(existing if isinstance(existing, list) else []),
+                    ])
+                ))[::-1][-RETWEET_DEDUP_MAX_ITEMS:]
+                if existing != merged:
+                    seen[target_umo] = merged
+                    changed = True
+            # 两个 KV 键不能原子写入：先补群级去重，保留旧键以便中断后重试。
+            if changed:
+                await self.save_retweet_seen(seen)
+            if migrated:
+                await self.save_all(subs)
+            return migrated
+
+    @staticmethod
     def find_key(subs: dict, username: str) -> str | None:
         """按不区分大小写的用户名查找现有推主键。"""
         expected = username.casefold()
