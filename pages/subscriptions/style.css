@@ -96,6 +96,7 @@ input::placeholder, textarea::placeholder { color: var(--text-muted); opacity: .
 .detail-heading p { color: var(--text-muted); font-size: 12px; margin-top: 7px; overflow-wrap: anywhere; }
 .type-badge { display: inline-block; border-radius: 5px; padding: 1px 6px; background: var(--surface-active); color: var(--accent); margin-right: 8px; font-size: 10px; }
 .group-switch { display: flex; align-items: center; gap: 8px; white-space: nowrap; font-size: 12px; color: var(--text-muted); }
+.delete-group-button { color: var(--danger); flex-shrink: 0; }
 .add-section { border: 1px solid var(--border); border-radius: 12px; padding: 16px; background: var(--surface-subtle); margin-bottom: 28px; }
 .section-title { display: flex; align-items: center; gap: 12px; font-weight: 650; font-size: 13px; }
 .section-title .muted { font-weight: 400; font-size: 11px; }

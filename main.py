@@ -1067,7 +1067,13 @@ class TwitterPlugin(Star):
             **({"use_node": False} if is_telegram_event(event) else {}),
         )
         if prepared.primary_chain:
-            yield event.chain_result(prepared.primary_chain)
+            if is_telegram_event(event):
+                if not await self.delivery_service.send_telegram_tweet(
+                    umo, prepared.primary_chain, username, tweet_info,
+                ):
+                    yield event.plain_result("推文主要内容发送失败，请稍后重试")
+            else:
+                yield event.chain_result(prepared.primary_chain)
         else:
             yield event.plain_result(f"未找到 @{username} 的推文内容")
         await self.delivery_service.send_prepared_videos(
@@ -1126,7 +1132,13 @@ class TwitterPlugin(Star):
                 **({"use_node": False} if is_telegram_event(event) else {}),
             )
             if prepared.primary_chain:
-                yield event.chain_result(prepared.primary_chain)
+                if is_telegram_event(event):
+                    if not await self.delivery_service.send_telegram_tweet(
+                        umo, prepared.primary_chain, username, tweet_info,
+                    ) and report_errors:
+                        yield event.plain_result("推文主要内容发送失败，请稍后重试")
+                else:
+                    yield event.chain_result(prepared.primary_chain)
             elif report_errors and not prepared.videos:
                 yield event.plain_result("未找到可发送的推文内容")
             await self.delivery_service.send_prepared_videos(

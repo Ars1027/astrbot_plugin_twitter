@@ -209,10 +209,11 @@ async def test_registers_routes_and_builds_multi_bot_overview(webui_module):
     context = FakeContext([platform_a, platform_b])
     controller = webui_module.TwitterWebUIController(FakePlugin(subs), context)
 
-    assert len(context.routes) == 8
+    assert len(context.routes) == 9
     assert {route for route, *_rest in context.routes} == {
         "/astrbot_plugin_twitter/overview",
         "/astrbot_plugin_twitter/groups/telegram/add",
+        "/astrbot_plugin_twitter/groups/telegram/remove",
         "/astrbot_plugin_twitter/subscriptions/recent",
         "/astrbot_plugin_twitter/settings/poll-interval",
         "/astrbot_plugin_twitter/subscriptions/add",

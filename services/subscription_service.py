@@ -99,6 +99,23 @@ class SubscriptionService:
             await self._put_kv_data(KV_TELEGRAM_GROUPS_KEY, groups)
             return created
 
+    async def remove_telegram_group(self, umo: str) -> dict:
+        """仅移除没有订阅的手动群记录，与订阅增删共享锁以防并发误删。"""
+        async with self._lock:
+            data = await self._get_kv_data(KV_TELEGRAM_GROUPS_KEY, {})
+            if not isinstance(data, dict) or umo not in data:
+                return {"ok": False, "reason": "not_found"}
+            subs = await self.get_all()
+            if any(
+                isinstance(author, dict) and umo in author.get("subscribers", {})
+                for author in subs.values()
+            ):
+                return {"ok": False, "reason": "has_subscriptions"}
+            groups = copy.deepcopy(data)
+            del groups[umo]
+            await self._put_kv_data(KV_TELEGRAM_GROUPS_KEY, groups)
+            return {"ok": True}
+
     @staticmethod
     def session_target(event: Any) -> str:
         """QQ 群订阅使用真实群号，不随成员隔离上下文变化。"""

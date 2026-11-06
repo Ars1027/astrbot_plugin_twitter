@@ -13,6 +13,7 @@ from astrbot.api.message_components import Node, Nodes
 
 from .platform_support import is_telegram_target
 from .subscription_service import DeliveredTweet, RecentDelivery, SkippedTweet, SubscriptionService
+from .telegram_album_service import TelegramAlbumService
 from .tweet_message_service import TranslationCycleState, TweetMessageChain, TweetMessageService
 
 
@@ -98,6 +99,7 @@ class TweetDeliveryService:
         self.subscriptions = subscriptions
         self.messages = messages
         self.settings = settings
+        self.telegram_albums = TelegramAlbumService(context)
         self._collected_tweets: dict[str, list[CachedTweet]] = {}
         self._pending_retweet_seen: dict[str, set[str]] = {}
         self._collected_skips: list[SkippedTweet] = []
@@ -304,6 +306,75 @@ class TweetDeliveryService:
         if text_parts:
             return text_sent
         return image_sent
+
+    async def send_telegram_tweet(
+        self, umo: str, chain: list, username: str, tweet_info: dict,
+        *, on_primary_sent: Callable[[], None] | None = None,
+    ) -> bool:
+        """按帖子分组图片，链接放入说明；沿用正文回执及逐图降级规则。"""
+        images = [part for part in chain if isinstance(part, Comp.Image)]
+        if not images or any(not isinstance(part, (Comp.Image, Comp.Plain)) for part in chain):
+            return await self.send_plain_chain_resilient(
+                umo, chain, on_primary_sent=on_primary_sent,
+            )
+
+        link_component = self.messages.tweet_link_component(tweet_info, username)
+        link = link_component.text if link_component is not None else ""
+        texts = [
+            "\n".join(line for line in part.text.splitlines() if not link or line.strip() != link).strip()
+            for part in chain if isinstance(part, Comp.Plain)
+        ]
+        body = "\n\n".join(text for text in texts if text)
+        caption = "\n\n".join(text for text in (body, link) if text)
+        # 为非 BMP 字符预留 UTF-16 长度，避免超过 Telegram 的 1024 字说明限制。
+        separate_body = len(caption.encode("utf-16-le")) // 2 > 1024
+        if separate_body:
+            caption = link
+
+        required = {id(image) for image in getattr(chain, "required_images", ())}
+        remaining = set(required)
+        body_sent = False
+        primary_sent = False
+
+        def confirm_primary() -> None:
+            nonlocal primary_sent
+            if not primary_sent:
+                primary_sent = True
+                if on_primary_sent is not None:
+                    on_primary_sent()
+
+        if separate_body and body:
+            body_sent = await self.send_plain_chain_resilient(
+                umo, [Comp.Plain(body)],
+                on_primary_sent=confirm_primary if not required else None,
+            )
+
+        for offset in range(0, len(images), 10):
+            batch = images[offset:offset + 10]
+            batch_caption = caption if offset == 0 else link
+
+            def confirm_batch(batch=batch, offset=offset) -> None:
+                remaining.difference_update(id(image) for image in batch)
+                if required:
+                    if not remaining:
+                        confirm_primary()
+                elif not body or body_sent or (offset == 0 and not separate_body):
+                    confirm_primary()
+
+            sent = await self.telegram_albums.send(umo, batch, batch_caption)
+            if not sent:
+                # 仅补发当前失败批次，不重发已成功的相册。
+                fallback = TweetMessageChain(
+                    [*([Comp.Plain(batch_caption)] if batch_caption else []), *batch],
+                    required_images=[image for image in batch if id(image) in required],
+                )
+                sent = await self.send_plain_chain_resilient(
+                    umo, fallback, on_primary_sent=confirm_batch,
+                )
+            if sent:
+                confirm_batch()
+
+        return primary_sent
 
     async def send_video_or_fallback(
         self,
@@ -657,9 +728,16 @@ class TweetDeliveryService:
                 plain_chain, video_parts = self.split_plain_chain_and_videos(
                     chain
                 )
-                primary_sent = bool(plain_chain) and (
-                    await self.send_plain_chain_resilient(umo, plain_chain, on_primary_sent=record_sent)
-                )
+                primary_sent = False
+                if plain_chain:
+                    if is_telegram_target(self.context, umo):
+                        primary_sent = await self.send_telegram_tweet(
+                            umo, plain_chain, username, tweet_info, on_primary_sent=record_sent,
+                        )
+                    else:
+                        primary_sent = await self.send_plain_chain_resilient(
+                            umo, plain_chain, on_primary_sent=record_sent,
+                        )
                 video_sent = False
                 for video in video_parts:
                     if await self.send_video_or_fallback(umo, video):

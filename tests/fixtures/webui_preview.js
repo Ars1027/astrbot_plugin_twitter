@@ -31,11 +31,17 @@
         const umo = `${payload.platform_id}:GroupMessage:${payload.group_id}`;
         const created = !groups.some((group) => group.umo === umo);
         if (created) groups.push({umo, group_id: payload.group_id, group_name: "Telegram 演示群组",
-          platform_id: payload.platform_id, available: true, subscriptions: []});
+          platform_id: payload.platform_id, available: true, manually_added: true, subscriptions: []});
         return {saved: true, created, umo};
       }
       const group = [...groups, ...other_sessions].find((g) => g.umo === payload.umo);
       if (!group) throw new Error("会话不存在");
+      if (endpoint === "groups/telegram/remove") {
+        if (!group.manually_added) throw new Error("未找到手动添加的 Telegram 群组");
+        if (group.subscriptions.length) throw new Error("请先移除该群的全部订阅，再删除群组");
+        groups.splice(groups.indexOf(group), 1);
+        return {removed: true, umo: payload.umo};
+      }
       const existing = group.subscriptions.find((s) => s.username.toLowerCase() === payload.username?.toLowerCase());
       if (endpoint === "subscriptions/recent") {
         if (!existing) throw new Error("当前会话不存在这个订阅");

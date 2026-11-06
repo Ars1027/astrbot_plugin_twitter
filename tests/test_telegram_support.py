@@ -196,9 +196,10 @@ async def test_telegram_direct_commands_use_plain_text_images_and_videos(plugin_
     else:
         match = _module.TWITTER_LINK_PATTERN.search(event.message_str)
         results = [item async for item in plugin._handle_tweet_link(event, match, report_errors=True)]
-    primary = next(item for item in results if isinstance(item, list))
+    assert not any(isinstance(item, list) for item in results)
+    primary = calls[0][1]
     assert [type(part) for part in primary] == [Plain, Image]
-    assert calls[0][0] == TG_TOPIC and isinstance(calls[0][1][0], Video)
+    assert calls[1][0] == TG_TOPIC and isinstance(calls[1][1][0], Video)
 
 
 @pytest.mark.asyncio
@@ -443,3 +444,145 @@ async def test_registered_groups_concurrent_writes_preserve_platform_identity(pl
     snapshot = await service.get_telegram_groups()
     snapshot[TG_GROUP]["group_name"] = "不应修改 KV"
     assert data["twitter_telegram_groups"][TG_GROUP]["group_name"] == "测试群"
+
+
+@pytest.mark.asyncio
+async def test_screenshot_link_does_not_send_empty_text_or_repeat_screenshot(plugin_env):
+    _module, make, _data, _calls, _fail = plugin_env
+    plugin = make()
+    delivered = []
+    rejected = []
+
+    async def render(*_args, **_kwargs):
+        return "https://render.test/card.png"
+
+    async def telegram_send(_umo, message):
+        # 模拟真实 TG 适配器逐组件发送，空白文本被 Bot API 拒绝。
+        for part in message.chain:
+            if isinstance(part, Plain) and not part.text.strip():
+                rejected.append(part.text)
+                raise ValueError("Message text is empty")
+            delivered.append(part)
+        return True
+
+    plugin.message_service.html_render = render
+    plugin.context.send_message = telegram_send
+    chain = await plugin.message_service.build_screenshot_tweet_chain(
+        "tester", {"tweet_id": "101", "username": "tester", "text": "正文"},
+    )
+    # 直接使用相册功能加入前的普通消息路径。
+    assert await plugin.delivery_service.send_plain_chain_resilient(TG_GROUP, chain)
+    assert len([part for part in delivered if isinstance(part, Image)]) == 1
+    assert rejected == []
+    assert [part.text for part in delivered if isinstance(part, Plain)] == ["https://x.com/tester/status/101"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("availability", ["online", "offline", "platform_removed"])
+async def test_remove_manual_group_after_unsubscribe_preserves_other_groups_and_state(plugin_env, availability):
+    _module, make, data, _calls, _fail = plugin_env
+    plugin = make()
+    service = plugin.subscription_service
+    other = "second-bot:GroupMessage:-100123"
+    await service.register_telegram_group("my-bot", {"group_id": "-100123", "group_name": "待删除群"})
+    await service.register_telegram_group("second-bot", {"group_id": "-100123", "group_name": "保留群"})
+    data["twitter_subs"] = {"tester": {"since_id": "100", "subscribers": {
+        TG_GROUP: {"status": False, "pending_delivery_ids": ["101"]},
+        other: {"status": True, "pending_delivery_ids": ["102"]},
+    }}}
+    data["twitter_retweet_dedup_seen"] = {TG_GROUP: ["99"], other: ["98"]}
+    web = _load_webui_module()
+    controller = web.TwitterWebUIController(plugin, plugin.context)
+    if availability == "offline":
+        plugin.context.platform_manager.platform_insts[0].client.error = RuntimeError("secret token")
+    elif availability == "platform_removed":
+        plugin.context.platform_manager.platform_insts = []
+
+    overview = await controller._build_overview()
+    group = next(group for group in overview["groups"] if group["umo"] == TG_GROUP)
+    assert group["manually_added"] is True
+    web.fake_request.payload = {"umo": TG_GROUP}
+    before = copy.deepcopy(data)
+    payload, status = await controller.remove_telegram_group()
+    assert status == 409 and not payload.get("removed")
+    assert data == before
+
+    await service.remove(TG_GROUP, "tester")
+    before = copy.deepcopy(data)
+    payload, status = await controller.remove_telegram_group()
+    assert status == 200 and payload["removed"] is True
+    assert data["twitter_telegram_groups"] == {other: before["twitter_telegram_groups"][other]}
+    assert data["twitter_subs"] == before["twitter_subs"]
+    assert data["twitter_retweet_dedup_seen"] == before["twitter_retweet_dedup_seen"]
+    overview = await controller._build_overview()
+    assert TG_GROUP not in [group["umo"] for group in overview["groups"]]
+    assert other in [group["umo"] for group in overview["groups"]]
+    _payload, status = await controller.remove_telegram_group()
+    assert status == 404
+    # 可重新添加；存储刷新后删除结果仍保留。
+    reloaded = make()
+    assert TG_GROUP not in await reloaded.subscription_service.get_telegram_groups()
+    await reloaded.subscription_service.register_telegram_group("my-bot", {"group_id": "-100123", "group_name": "重新添加"})
+    assert TG_GROUP in await reloaded.subscription_service.get_telegram_groups()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [
+    [], {}, {"umo": None}, {"umo": TG_PRIVATE}, {"umo": TG_TOPIC},
+    {"umo": "qq-bot:GroupMessage:123"}, {"umo": "my-bot:GroupMessage:-0"},
+    {"umo": "my-bot:GroupMessage:-" + "1" * 40},
+])
+async def test_remove_manual_group_rejects_invalid_request(plugin_env, payload):
+    _module, make, data, _calls, _fail = plugin_env
+    plugin = make()
+    await plugin.subscription_service.register_telegram_group("my-bot", {"group_id": "-100123", "group_name": "保留群"})
+    web = _load_webui_module()
+    controller = web.TwitterWebUIController(plugin, plugin.context)
+    web.fake_request.payload = payload
+    before = copy.deepcopy(data)
+    _payload, status = await controller.remove_telegram_group()
+    assert status == 400 and data == before
+
+
+@pytest.mark.asyncio
+async def test_cannot_remove_discovered_group_or_treat_storage_failure_as_success(plugin_env):
+    _module, make, data, _calls, _fail = plugin_env
+    plugin = make()
+    web = _load_webui_module()
+    controller = web.TwitterWebUIController(plugin, plugin.context)
+    data["twitter_subs"] = {"tester": {"subscribers": {TG_GROUP: {}}}}
+    web.fake_request.payload = {"umo": TG_GROUP}
+    before = copy.deepcopy(data)
+    payload, status = await controller.remove_telegram_group()
+    assert status == 404 and not payload.get("removed") and data == before
+    overview = await controller._build_overview()
+    assert overview["groups"][0]["manually_added"] is False
+
+    data["twitter_subs"] = {}
+    await plugin.subscription_service.register_telegram_group("my-bot", {"group_id": "-100123", "group_name": "保留群"})
+    before = copy.deepcopy(data)
+    put = plugin.put_kv_data
+
+    async def fail_put(_key, _value):
+        raise OSError("secret token")
+
+    plugin.put_kv_data = fail_put
+    payload, status = await controller.remove_telegram_group()
+    assert status == 500 and not payload.get("removed") and "secret" not in str(payload)
+    assert data == before
+    plugin.put_kv_data = put
+    payload, status = await controller.remove_telegram_group()
+    assert status == 200 and payload["removed"] is True
+
+
+@pytest.mark.asyncio
+async def test_remove_and_register_different_manual_groups_do_not_lose_updates(plugin_env):
+    _module, make, _data, _calls, _fail = plugin_env
+    service = make().subscription_service
+    await service.register_telegram_group("my-bot", {"group_id": "-100123", "group_name": "待删除"})
+    result, created = await asyncio.gather(
+        service.remove_telegram_group(TG_GROUP),
+        service.register_telegram_group("second-bot", {"group_id": "-100123", "group_name": "新增群"}),
+    )
+    assert result["ok"] and created
+    assert set(await service.get_telegram_groups()) == {"second-bot:GroupMessage:-100123"}

@@ -674,8 +674,7 @@ class TweetMessageService:
 
         link_comp = self.tweet_link_component(tweet_info, username)
         if link_comp is not None:
-            if chain:
-                chain.append(Comp.Plain("\n"))
+            # TG 逐组件发送，独立的换行会成为空消息并触发截图降级重发。
             chain.append(link_comp)
 
         await self.append_tweet_media(chain, tweet_info)

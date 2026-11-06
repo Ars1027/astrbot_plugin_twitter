@@ -26,6 +26,7 @@ class TwitterWebUIController:
         routes = (
             ("overview", self.overview, ["GET"], "Twitter 订阅概览"),
             ("groups/telegram/add", self.add_telegram_group, ["POST"], "验证并添加 Telegram 群聊"),
+            ("groups/telegram/remove", self.remove_telegram_group, ["POST"], "移除空的 Telegram 手动群聊"),
             (
                 "subscriptions/recent",
                 self.recent_deliveries,
@@ -361,6 +362,7 @@ class TwitterWebUIController:
 
         groups = list(groups_by_umo.values())
         for group in groups:
+            group["manually_added"] = group["umo"] in registered
             group["subscriptions"].sort(key=lambda row: row["username"].casefold())
         for session in other_sessions:
             session["subscriptions"].sort(
@@ -505,6 +507,27 @@ class TwitterWebUIController:
             "umo": f"{platform_id}:GroupMessage:{group_id}",
             **group,
         })
+
+    async def remove_telegram_group(self):
+        payload = await self._payload()
+        if payload is None:
+            return error_response("请求内容必须是 JSON 对象", status_code=400)
+        parsed = self._parse_umo(payload.get("umo"))
+        if (
+            parsed is None or parsed[1] != "GroupMessage"
+            or len(parsed[2]) > 32 or not re.fullmatch(r"-[1-9]\d*", parsed[2])
+        ):
+            return error_response("Telegram 群聊 UMO 格式不正确", status_code=400)
+        try:
+            result = await self.plugin.subscription_service.remove_telegram_group(payload["umo"])
+        except Exception:  # noqa: BLE001 - KV 保存失败不能当作删除成功。
+            logger.error("删除手动添加的 Telegram 群聊失败")
+            return error_response("群聊删除失败，请重试", status_code=500)
+        if result.get("reason") == "has_subscriptions":
+            return error_response("请先移除该群的全部订阅，再删除群组", status_code=409)
+        if not result["ok"]:
+            return error_response("未找到手动添加的 Telegram 群组，请刷新列表", status_code=404)
+        return json_response({"removed": True, "umo": payload["umo"]})
 
     async def recent_deliveries(self):
         payload = await self._payload()

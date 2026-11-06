@@ -14,6 +14,7 @@ const elements = {
   intervalForm: document.getElementById("interval-form"),
   pollInterval: document.getElementById("poll-interval"),
   removeDialog: document.getElementById("remove-dialog"),
+  removeDialogTitle: document.getElementById("remove-dialog-title"),
   removeDialogText: document.getElementById("remove-dialog-text"),
   confirmRemove: document.getElementById("confirm-remove"),
   toast: document.getElementById("toast"),
@@ -206,6 +207,9 @@ function renderDetail() {
     ? el("label", { class: "group-switch" },
       el("input", { id: "group-status", type: "checkbox", "data-umo": session.umo, checked: allEnabled }),
       el("span", {}, "全部推送")) : null;
+  const removeGroup = isGroup && session.manually_added && !session.subscriptions.length
+    ? el("button", { class: "secondary-button delete-group-button", type: "button",
+      "data-remove-telegram-group": true, "data-umo": session.umo }, "删除群组") : null;
   let addSection = null;
   if (isGroup) {
     addSection = session.available
@@ -227,7 +231,7 @@ function renderDetail() {
     el("header", { class: "detail-header" },
       el("div", { class: "detail-heading" }, el("h2", {}, name),
         el("p", {}, el("span", { class: "type-badge" }, isGroup ? "群聊" : "其他会话"),
-          `${id} · ${session.platform_id}`)), groupSwitch),
+          `${id} · ${session.platform_id}`)), groupSwitch, removeGroup),
     ...(addSection ? [addSection] : []),
     el("section", { class: "subscription-section" },
       el("div", { class: "subscription-heading" },
@@ -501,12 +505,27 @@ elements.detailView.addEventListener("click", (event) => {
     openBatch();
     return;
   }
+  const removeGroup = event.target.closest("[data-remove-telegram-group]");
+  if (removeGroup) {
+    const session = selectedSession();
+    if (!session?.manually_added || session.subscriptions.length || session.umo !== removeGroup.dataset.umo) return;
+    state.removeTarget = {kind: "telegram-group", umo: session.umo};
+    elements.removeDialogTitle.textContent = "删除群组";
+    elements.removeDialogText.textContent = `确定删除「${session.group_name}」的群组列表记录吗？删除后可重新添加。`;
+    elements.confirmRemove.textContent = "删除";
+    elements.removeDialog.returnValue = "";
+    elements.removeDialog.showModal();
+    return;
+  }
   const button = event.target.closest("[data-remove-subscription]");
   if (!button) return;
   state.removeTarget = {
+    kind: "subscription",
     umo: button.dataset.umo,
     username: button.dataset.username,
   };
+  elements.removeDialogTitle.textContent = "移除订阅";
+  elements.confirmRemove.textContent = "移除";
   elements.removeDialogText.textContent = `确定移除 @${button.dataset.username}（${button.dataset.screenName}）吗？`;
   elements.removeDialog.returnValue = "";
   elements.removeDialog.showModal();
@@ -519,9 +538,14 @@ elements.removeDialog.addEventListener("close", async () => {
   }
   const target = state.removeTarget;
   state.removeTarget = null;
+  if (target.kind === "telegram-group") {
+    state.authorSearch = "";
+    await saveAndReload("groups/telegram/remove", {umo: target.umo}, "群组已从列表删除");
+    return;
+  }
   await saveAndReload(
     "subscriptions/remove",
-    target,
+    {umo: target.umo, username: target.username},
     `已移除 @${target.username}`,
   );
 });
