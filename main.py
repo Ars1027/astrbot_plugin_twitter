@@ -501,6 +501,11 @@ class TwitterPlugin(Star):
 
         logger.info("Twitter 推文转发插件初始化完成")
 
+    @filter.on_astrbot_loaded()
+    async def on_astrbot_loaded(self):
+        """冷启动时插件先于平台初始化，平台就绪后补做旧群订阅迁移。"""
+        await self._migrate_group_subscriptions()
+
     async def terminate(self):
         """停止后台任务，发送剩余缓存并关闭 HTTP 客户端。"""
         self._running = False
@@ -524,13 +529,15 @@ class TwitterPlugin(Star):
         logger.info("Twitter 推文转发插件已停止")
 
     # WebUI 与现有调用方使用的兼容委托。
-    async def _migrate_group_subscriptions(self) -> None:
-        """在轮询开始前修复 QQ 成员隔离产生的旧订阅目标。"""
+    async def _migrate_group_subscriptions(self) -> bool:
+        """平台实例可用后迁移旧 QQ 订阅；未就绪时由后续轮询重试。"""
         manager = getattr(self.context, "platform_manager", None)
         instances = getattr(manager, "platform_insts", None)
         if instances is None:
             get_insts = getattr(manager, "get_insts", None)
             instances = get_insts() if callable(get_insts) else []
+        if not instances:
+            return False
         platform_ids = set()
         for platform in instances or []:
             meta = platform.meta()
@@ -541,6 +548,7 @@ class TwitterPlugin(Star):
         count = await self.subscription_service.migrate_qq_group_sessions(platform_ids)
         if count:
             logger.info(f"已将 {count} 个 QQ 成员会话订阅归并到真实群聊")
+        return True
 
     async def _get_subs(self) -> dict:
         return await self.subscription_service.get_all()
@@ -605,6 +613,9 @@ class TwitterPlugin(Star):
         PollingService.attach_timeline_item_metadata(tweet_info, item)
 
     async def _check_all_subscriptions(self) -> None:
+        # 不在平台尚未初始化或迁移失败时读取旧会话快照并发送推文。
+        if not await self._migrate_group_subscriptions():
+            return
         await self.polling_service.check_all()
 
     async def _check_user_tweets(self, username: str, info: dict) -> bool:

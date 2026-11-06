@@ -87,6 +87,7 @@ def _load_main_module():
         event_message_type=_decorator,
         permission_type=_decorator,
         llm_tool=_decorator,
+        on_astrbot_loaded=_decorator,
         EventMessageType=types.SimpleNamespace(ALL="all"),
         PermissionType=types.SimpleNamespace(ADMIN="admin"),
     )

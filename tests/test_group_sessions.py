@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import sys
 import types
@@ -215,7 +216,10 @@ async def test_migration_discovers_only_qq_platforms_and_chooses_stable_options(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["plain", "node", "collective"])
-async def test_startup_migrates_before_polling_without_resending_acknowledged_tweets(session_store, transport):
+@pytest.mark.parametrize("startup", ["hot_reload", "cold_start", "poll_retry"])
+async def test_startup_migrates_before_polling_without_resending_acknowledged_tweets(
+    session_store, transport, startup,
+):
     module, plugin, data, _writes = session_store
     data["twitter_subs"] = {"tester": {
         "since_id": "100",
@@ -226,19 +230,22 @@ async def test_startup_migrates_before_polling_without_resending_acknowledged_tw
         },
     }}
     sent = []
+    timeline_calls = []
 
     async def send_message(umo, _chain):
         sent.append(umo)
         return True
 
     async def timeline(_username, since_id):
+        timeline_calls.append(since_id)
         return [{"tweet_id": tweet_id, "username": "tester"}
                 for tweet_id in ("101", "102") if int(tweet_id) > int(since_id)]
 
     async def get_tweet(username, tweet_id):
         return {"status": True, "username": username, "tweet_id": tweet_id, "text": "body"}
 
-    context = FakeContext([FakePlatform("bot-a", [{"group_id": "100"}])])
+    platform = FakePlatform("bot-a", [{"group_id": "100"}])
+    context = FakeContext([platform] if startup == "hot_reload" else [])
     context.send_message = send_message
     initialized = module.TwitterPlugin(context, {
         "twitter_data_provider": "fxtwitter",
@@ -250,20 +257,95 @@ async def test_startup_migrates_before_polling_without_resending_acknowledged_tw
     initialized.twitter_api.get_user_timeline_items = timeline
     initialized.twitter_api.get_tweet = get_tweet
 
-    async def poll_once():
-        assert list(data["twitter_subs"]["tester"]["subscribers"]) == [GROUP]
-        await initialized.polling_service.check_all()
+    waits = 0
 
-    initialized._poll_tweets = poll_once
+    async def next_poll():
+        nonlocal waits
+        waits += 1
+        if startup != "hot_reload" and waits == 1:
+            # initialize() 和首轮后台任务发生在平台实例创建之前。
+            assert sent == []
+            assert timeline_calls == []
+            assert list(data["twitter_subs"]["tester"]["subscribers"]) == [MEMBER_A, MEMBER_B]
+            context.platform_manager.platform_insts.append(platform)
+            if startup == "cold_start":
+                await initialized.on_astrbot_loaded()
+                assert list(data["twitter_subs"]["tester"]["subscribers"]) == [GROUP]
+        else:
+            initialized._running = False
+
+    initialized._wait_for_next_poll = next_poll
     try:
         await initialized.initialize()
-        await initialized._poll_task
+        await asyncio.wait_for(initialized._poll_task, timeout=10)
+        assert list(data["twitter_subs"]["tester"]["subscribers"]) == [GROUP]
         assert sent == []
         assert data["twitter_subs"]["tester"]["since_id"] == "101"
-        await initialized.polling_service.check_all()
+        await initialized._check_all_subscriptions()
         assert sent == [GROUP]
         assert data["twitter_subs"]["tester"]["since_id"] == "102"
-        await initialized.polling_service.check_all()
+        await initialized._check_all_subscriptions()
         assert sent == [GROUP]
     finally:
         await initialized.terminate()
+
+
+@pytest.mark.asyncio
+async def test_platform_ready_migrates_even_without_polling_and_commands_manage_old_subscriptions(
+    session_store, monkeypatch,
+):
+    module, plugin, data, _writes = session_store
+    data["twitter_subs"] = {"tester": {"subscribers": {MEMBER_A: {"status": True}}}}
+    context = FakeContext()
+    initialized = module.TwitterPlugin(context, {})
+    initialized.get_kv_data = plugin.subscription_service._get_kv_data
+    initialized.put_kv_data = plugin.subscription_service._put_kv_data
+
+    async def unavailable(_websites):
+        return None
+
+    monkeypatch.setattr(initialized.twitter_api, "check_website_available", unavailable)
+    try:
+        await initialized.initialize()
+        assert initialized._poll_task is None
+        context.platform_manager.platform_insts.append(FakePlatform("bot-a"))
+        await initialized.on_astrbot_loaded()
+
+        event = make_event(MEMBER_B)
+        results = [item async for item in initialized.list_follows(event)]
+        assert "@tester" in results[0][0].nodes[0].content[0].text
+        results = [item async for item in initialized.toggle_push(event, "关闭")]
+        assert "影响 1 个订阅" in results[0]
+        assert data["twitter_subs"]["tester"]["subscribers"] == {GROUP: {"status": False}}
+        results = [item async for item in initialized.unfollow_twitter(event, "tester")]
+        assert results
+        assert data["twitter_subs"] == {}
+    finally:
+        await initialized.terminate()
+
+
+@pytest.mark.asyncio
+async def test_migration_failure_blocks_polling_and_retries_before_next_snapshot(session_store):
+    _module, plugin, data, _writes = session_store
+    data["twitter_subs"] = {"tester": {"subscribers": {MEMBER_A: {"status": True}}}}
+    plugin.context = FakeContext([FakePlatform("bot-a")])
+    snapshots = []
+
+    async def check_all():
+        snapshots.append(copy.deepcopy(data["twitter_subs"]))
+
+    plugin.polling_service = types.SimpleNamespace(check_all=check_all)
+    put = plugin.subscription_service._put_kv_data
+
+    async def fail(_key, _value):
+        raise OSError("storage unavailable")
+
+    plugin.subscription_service._put_kv_data = fail
+    with pytest.raises(OSError, match="storage unavailable"):
+        await plugin._check_all_subscriptions()
+    assert snapshots == []
+    assert list(data["twitter_subs"]["tester"]["subscribers"]) == [MEMBER_A]
+
+    plugin.subscription_service._put_kv_data = put
+    await plugin._check_all_subscriptions()
+    assert list(snapshots[0]["tester"]["subscribers"]) == [GROUP]
