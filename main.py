@@ -673,7 +673,9 @@ class TwitterPlugin(Star):
                     self._poll_wakeup.wait(),
                     timeout=self.poll_interval * 60,
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:
+                # Python 3.10 的 asyncio.TimeoutError 不是内置 TimeoutError，
+                # 必须显式捕获，否则轮询任务会在第一次等待超时后退出。
                 return
 
     async def _poll_tweets(self) -> None:
