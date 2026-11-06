@@ -12,6 +12,7 @@ PLUGIN_NAME = "astrbot_plugin_twitter"
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 MESSAGE_TYPES = {"GroupMessage", "FriendMessage", "OtherMessage"}
 GROUP_LIST_TIMEOUT_SECONDS = 6
+TELEGRAM_GROUP_VERIFY_CONCURRENCY = 4
 
 
 class TwitterWebUIController:
@@ -187,14 +188,14 @@ class TwitterWebUIController:
             logger.warning(f"获取 QQ 群列表失败 ({platform_id}): {exc}")
         return result
 
-    async def _telegram_group(self, platform: Any, session_id: str) -> dict:
-        """检查真实群和机器人身份；保留 AstrBot 的 chat_id#topic_id 路由。"""
-        if not re.fullmatch(r"-[1-9]\d*(?:#[1-9]\d*)?", session_id):
+    async def _telegram_chat(self, platform: Any, chat_id: str) -> str:
+        """校验真实群和机器人身份，返回群标题；chat_id 不含话题号。"""
+        if not re.fullmatch(r"-[1-9]\d*", chat_id):
             raise ValueError("Telegram 群 ID 格式不正确")
+        numeric_id = int(chat_id)
         client = platform.get_client()
-        chat_id = int(session_id.split("#", 1)[0])
-        chat = await client.get_chat(chat_id=chat_id)
-        member = await client.get_chat_member(chat_id=chat_id, user_id=client.id)
+        chat = await client.get_chat(chat_id=numeric_id)
+        member = await client.get_chat_member(chat_id=numeric_id, user_id=client.id)
         if str(chat.type) not in {"group", "supergroup"}:
             raise ValueError("目标不是 Telegram 群聊")
         if str(member.status) in {"left", "kicked"} or (
@@ -203,9 +204,16 @@ class TwitterWebUIController:
             raise ValueError("机器人当前不在这个 Telegram 群聊中")
         if str(member.status) == "restricted" and not getattr(member, "can_send_messages", False):
             raise ValueError("机器人当前没有 Telegram 群聊发言权限")
-        title = str(chat.title or chat_id)
-        if "#" in session_id:
-            title += f" · 话题 {session_id.split('#', 1)[1]}"
+        return str(chat.title or numeric_id)
+
+    async def _telegram_group(self, platform: Any, session_id: str) -> dict:
+        """检查真实群和机器人身份；保留 AstrBot 的 chat_id#topic_id 路由。"""
+        if not re.fullmatch(r"-[1-9]\d*(?:#[1-9]\d*)?", session_id):
+            raise ValueError("Telegram 群 ID 格式不正确")
+        chat_id, separator, topic_id = session_id.partition("#")
+        title = await self._telegram_chat(platform, chat_id)
+        if separator:
+            title += f" · 话题 {topic_id}"
         return {"group_id": session_id, "group_name": title}
 
     async def _fetch_telegram_groups(self, platform: Any) -> dict:
@@ -233,23 +241,47 @@ class TwitterWebUIController:
                 parsed = self._parse_umo(umo)
                 if parsed and parsed[:2] == (platform_id, "GroupMessage"):
                     session_ids.add(parsed[2])
+
+        # 同一群的多个话题共用一次校验，避免按话题重复请求 Telegram。
+        chats: dict[str, list[tuple[str, str]]] = {}
         for session_id in sorted(session_ids):
-            try:
-                group = await asyncio.wait_for(
-                    self._telegram_group(platform, session_id),
+            chat_id, separator, topic_id = session_id.partition("#")
+            chats.setdefault(chat_id, []).append((session_id, topic_id if separator else ""))
+
+        semaphore = asyncio.Semaphore(TELEGRAM_GROUP_VERIFY_CONCURRENCY)
+
+        async def verify(chat_id: str) -> str:
+            async with semaphore:
+                return await asyncio.wait_for(
+                    self._telegram_chat(platform, chat_id),
                     timeout=GROUP_LIST_TIMEOUT_SECONDS,
                 )
-                result["groups"].append(group)
-            except Exception:  # noqa: BLE001 - 可选 Telegram SDK 的异常需在平台边界隔离。
+
+        verified = await asyncio.gather(
+            *(verify(chat_id) for chat_id in chats),
+            return_exceptions=True,
+        )
+        for (chat_id, entries), outcome in zip(chats.items(), verified):
+            if isinstance(outcome, asyncio.CancelledError):
+                raise outcome
+            if isinstance(outcome, Exception):
                 # 不回传 SDK 异常，避免错误消息包含 Bot Token。
                 result["available"] = False
                 result["error"] = "部分 Telegram 群聊暂时无法访问"
-                if session_id in registered_by_id:
-                    result["groups"].append({
-                        "group_id": session_id,
-                        "group_name": str(registered_by_id[session_id].get("group_name") or session_id),
-                        "available": False,
-                    })
+                for session_id, _topic in entries:
+                    if session_id in registered_by_id:
+                        result["groups"].append({
+                            "group_id": session_id,
+                            "group_name": str(
+                                registered_by_id[session_id].get("group_name") or session_id
+                            ),
+                            "available": False,
+                        })
+                continue
+            base_title = str(outcome) or chat_id
+            for session_id, topic_id in entries:
+                group_name = f"{base_title} · 话题 {topic_id}" if topic_id else base_title
+                result["groups"].append({"group_id": session_id, "group_name": group_name})
         return result
 
     async def _load_group_sources(self) -> list[dict]:

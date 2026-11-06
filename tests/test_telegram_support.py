@@ -222,6 +222,20 @@ async def test_webui_discovers_existing_telegram_groups_and_topics_and_adds_auth
 
 
 @pytest.mark.asyncio
+async def test_webui_verifies_each_telegram_chat_once_for_multiple_topics(plugin_env):
+    web = _load_webui_module()
+    second_topic = "my-bot:GroupMessage:-100123#43"
+    plugin = FakePlugin({"tester": {"subscribers": {TG_TOPIC: {}, second_topic: {}}}})
+    platform = telegram_platform()
+    controller = web.TwitterWebUIController(plugin, FakeContext([platform]))
+    overview = await controller._build_overview()
+    assert sorted(group["group_id"] for group in overview["groups"]) == ["-100123#42", "-100123#43"]
+    # 同一 chat 的多个话题只校验一次群与机器人身份。
+    assert [call for call in platform.client.calls if call[0] == "chat"] == [("chat", -100123)]
+    assert [call for call in platform.client.calls if call[0] == "member"] == [("member", -100123, 9876)]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status,error", [
     ("left", None), ("kicked", None), ("restricted", None),
     ("member", RuntimeError("URL contains secret token")),

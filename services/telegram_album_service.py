@@ -18,6 +18,23 @@ class TelegramAlbumService:
     def __init__(self, context: Any) -> None:
         self.context = context
 
+    @staticmethod
+    def _materializes_temp_file(image: Any) -> bool:
+        """判断图片是否由本服务转成临时文件，临时文件由本服务负责清理。"""
+        source = str(getattr(image, "file", "") or "")
+        if not source:
+            source = str(getattr(image, "url", "") or "")
+        return source.startswith(("http://", "https://", "base64://", "data:"))
+
+    @staticmethod
+    def _cleanup_materialized_files(paths: list[Path]) -> None:
+        """删除远端或 base64 下载产生的临时文件；本地截图继续保留。"""
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.debug(f"清理 Telegram 相册临时文件失败: {type(exc).__name__}")
+
     @traced
     async def send(self, umo: str, images: list, caption: str) -> bool:
         """发送 1 张照片或 2～10 张相册，保留群、话题和私聊路由。"""
@@ -25,6 +42,7 @@ class TelegramAlbumService:
         started = stage_started = perf_counter()
         stage = "resolve_platform"
         paths = []
+        materialized_paths: list[Path] = []
         total_bytes = 0
         logger.debug(anchor("tg.album.start", target=reference(umo), images=len(images)))
         try:
@@ -50,6 +68,8 @@ class TelegramAlbumService:
                 path = Path(await image.convert_to_file_path())
                 total_bytes += path.stat().st_size
                 paths.append(path)
+                if self._materializes_temp_file(image):
+                    materialized_paths.append(path)
                 logger.debug(anchor(
                     "tg.image.ready", index=len(paths), bytes=path.stat().st_size,
                     elapsed=round(perf_counter() - stage_started, 2),
@@ -127,3 +147,6 @@ class TelegramAlbumService:
                 f"{anchor('tg.album.failed', target=reference(umo))}"
             )
             return False
+        finally:
+            # 发送或中断后都要回收本服务下载的临时文件，避免轮询长期累积。
+            self._cleanup_materialized_files(materialized_paths)

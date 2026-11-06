@@ -447,6 +447,34 @@ async def test_upload_handles_close_after_send_failure_or_cancellation(albums, c
 
 
 @pytest.mark.asyncio
+async def test_album_cleans_materialized_temp_files_but_keeps_local(albums, monkeypatch, tmp_path):
+    plugin, _data, _ordinary, _sent, _converted, _client, chain = albums
+    created = {}
+
+    async def convert(image):
+        path = tmp_path / f"resolved-{len(created)}.png"
+        path.write_bytes(b"image")
+        created[id(image)] = path
+        return str(path)
+
+    monkeypatch.setattr(Image, "convert_to_file_path", convert, raising=False)
+    remote = Image(file="https://example.com/remote.png")
+    encoded = Image(file="base64://aW1hZ2U=")
+    local = Image(file=str(tmp_path / "local.png"))
+    (tmp_path / "local.png").write_bytes(b"local")
+
+    assert await plugin.delivery_service.send_telegram_tweet(
+        TG_GROUP, chain([remote, encoded, local], required=False),
+        "tester", {"tweet_id": "101"},
+    )
+    # 远端与 base64 图片会下载为临时文件，发送后必须回收。
+    assert not created[id(remote)].exists()
+    assert not created[id(encoded)].exists()
+    # 本地截图文件不属于本服务，不能误删。
+    assert created[id(local)].exists()
+
+
+@pytest.mark.asyncio
 async def test_image_download_timeout_logs_preparation_stage(albums, monkeypatch):
     plugin, _data, _ordinary, sent, _converted, _client, _chain = albums
     album = plugin.delivery_service.telegram_albums
