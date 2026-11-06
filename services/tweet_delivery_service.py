@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+from time import perf_counter
 from typing import Any
 
 from astrbot.api import logger
@@ -11,6 +12,7 @@ from astrbot.api.event import MessageChain
 import astrbot.api.message_components as Comp
 from astrbot.api.message_components import Node, Nodes
 
+from ..twitter_diagnostics import anchor, exception_type_chain, reference, traced
 from .platform_support import is_telegram_target
 from .subscription_service import DeliveredTweet, RecentDelivery, SkippedTweet, SubscriptionService
 from .telegram_album_service import TelegramAlbumService
@@ -25,6 +27,7 @@ class TweetDeliverySettings:
     collective_forward: bool
     collective_max_authors: int
     deduplicate_retweets: bool
+    telegram_video_max_size_mb: int = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,7 +211,23 @@ class TweetDeliveryService:
         message_chain: MessageChain,
     ) -> None:
         """将明确的 False 转为发送异常，保留其他无异常返回的既有行为。"""
-        result = await self.context.send_message(umo, message_chain)
+        started = perf_counter()
+        logger.debug(anchor(
+            "platform.send.start", target=reference(umo),
+            parts=len(message_chain.chain), types=[type(part).__name__ for part in message_chain.chain],
+        ))
+        try:
+            result = await self.context.send_message(umo, message_chain)
+        except BaseException as exc:
+            logger.debug(anchor(
+                "platform.send.failed", target=reference(umo), causes=exception_type_chain(exc),
+                elapsed=round(perf_counter() - started, 2),
+            ))
+            raise
+        logger.debug(anchor(
+            "platform.send.result", target=reference(umo), ok=result is not False,
+            elapsed=round(perf_counter() - started, 2),
+        ))
         if result is False:
             raise RuntimeError("Context.send_message returned False")
 
@@ -307,11 +326,16 @@ class TweetDeliveryService:
             return text_sent
         return image_sent
 
+    @traced
     async def send_telegram_tweet(
         self, umo: str, chain: list, username: str, tweet_info: dict,
         *, on_primary_sent: Callable[[], None] | None = None,
     ) -> bool:
         """按帖子分组图片，链接放入说明；沿用正文回执及逐图降级规则。"""
+        logger.debug(anchor(
+            "tg.tweet.start", author=username, tweet=str(tweet_info.get("tweet_id") or ""),
+            target=reference(umo), parts=len(chain),
+        ))
         images = [part for part in chain if isinstance(part, Comp.Image)]
         if not images or any(not isinstance(part, (Comp.Image, Comp.Plain)) for part in chain):
             return await self.send_plain_chain_resilient(
@@ -352,6 +376,11 @@ class TweetDeliveryService:
         for offset in range(0, len(images), 10):
             batch = images[offset:offset + 10]
             batch_caption = caption if offset == 0 else link
+            logger.debug(anchor(
+                "tg.batch.start", tweet=str(tweet_info.get("tweet_id") or ""),
+                target=reference(umo), batch=offset // 10 + 1, images=len(batch),
+                caption_units=len(batch_caption.encode("utf-16-le")) // 2,
+            ))
 
             def confirm_batch(batch=batch, offset=offset) -> None:
                 remaining.difference_update(id(image) for image in batch)
@@ -363,6 +392,7 @@ class TweetDeliveryService:
 
             sent = await self.telegram_albums.send(umo, batch, batch_caption)
             if not sent:
+                logger.debug(anchor("tg.batch.fallback", batch=offset // 10 + 1, target=reference(umo)))
                 # 仅补发当前失败批次，不重发已成功的相册。
                 fallback = TweetMessageChain(
                     [*([Comp.Plain(batch_caption)] if batch_caption else []), *batch],
@@ -373,29 +403,44 @@ class TweetDeliveryService:
                 )
             if sent:
                 confirm_batch()
+            logger.debug(anchor(
+                "tg.batch.result", batch=offset // 10 + 1, ok=sent, required_remaining=len(remaining),
+            ))
 
+        logger.debug(anchor("tg.tweet.result", target=reference(umo), primary_sent=primary_sent))
         return primary_sent
 
+    @traced
     async def send_video_or_fallback(
         self,
         umo: str,
         video_component: Comp.Video,
     ) -> bool:
         """发送视频组件，失败时回退为链接。"""
+        started = perf_counter()
+        media_ref = reference(getattr(video_component, "file", "") or getattr(video_component, "url", ""))
+        logger.debug(anchor("video.start", target=reference(umo), media=media_ref))
         try:
             await self._send_message_checked(
                 umo,
                 MessageChain(chain=[video_component]),
             )
+            logger.debug(anchor("video.sent", target=reference(umo), media=media_ref))
             return True
         except Exception as exc:
-            logger.warning(f"视频发送失败，回退为链接: {exc}")
+            # 平台调用包含媒体准备与发送；异常链可识别 SDK 包装的 HTTP 超时。
+            logger.warning(
+                f"视频发送失败，回退为链接: stage=platform_send; "
+                f"elapsed={perf_counter() - started:.2f}s; causes={exception_type_chain(exc)}; "
+                f"{anchor('video.failed', target=reference(umo), media=media_ref)}"
+            )
             video_url = getattr(video_component, "file", "") or getattr(
                 video_component,
                 "url",
                 "",
             )
             if video_url:
+                fallback_started = perf_counter()
                 try:
                     await self._send_message_checked(
                         umo,
@@ -403,10 +448,13 @@ class TweetDeliveryService:
                             chain=[Comp.Plain(str(f"视频: {video_url}"))]
                         ),
                     )
+                    logger.debug(anchor("video.link.sent", target=reference(umo), media=media_ref))
                     return True
                 except Exception as fallback_exc:
                     logger.error(
-                        f"视频与降级链接均发送失败: {fallback_exc}"
+                        f"视频与降级链接均发送失败: stage=send_video_link; "
+                        f"elapsed={perf_counter() - fallback_started:.2f}s; "
+                        f"causes={exception_type_chain(fallback_exc)}"
                     )
             return False
 
@@ -653,6 +701,7 @@ class TweetDeliveryService:
             DeliveryState.DELIVERED, tuple(recent_deliveries), tuple(delivered_tweets), tuple(skipped_tweets)
         )
 
+    @traced
     async def send_to_subscriber(
         self,
         umo: str,
@@ -674,6 +723,11 @@ class TweetDeliveryService:
         主要内容发送成功后追加，附加媒体中断不丢弃正文回执。
         """
         receipt_recorded = False
+        started = perf_counter()
+        logger.debug(anchor(
+            "delivery.start", author=username, tweet=str(tweet_info.get("tweet_id") or ""),
+            target=reference(umo), telegram=is_telegram_target(self.context, umo),
+        ))
 
         def record_sent() -> None:
             nonlocal receipt_recorded
@@ -690,7 +744,15 @@ class TweetDeliveryService:
                 sub_config,
                 translated_text=translated_text,
                 translate_model=translate_model,
+                video_max_size_mb=(
+                    self.settings.telegram_video_max_size_mb
+                    if is_telegram_target(self.context, umo) else None
+                ),
             )
+            logger.debug(anchor(
+                "delivery.prepared", parts=len(chain),
+                elapsed=round(perf_counter() - started, 2),
+            ))
             if not chain:
                 record_sent()
                 return True
@@ -752,9 +814,16 @@ class TweetDeliveryService:
                 logger.info(f"推文已推送至 {umo}")
             else:
                 logger.error(f"推文主要内容未能推送至 {umo}")
+            logger.debug(anchor(
+                "delivery.result", author=username, tweet=str(tweet_info.get("tweet_id") or ""),
+                target=reference(umo), ok=sent, elapsed=round(perf_counter() - started, 2),
+            ))
             return sent
         except Exception as exc:
-            logger.error(f"推送推文至 {umo} 失败: {exc}")
+            logger.error(
+                f"推送推文失败: {exception_type_chain(exc)}; "
+                f"{anchor('delivery.failed', author=username, tweet=str(tweet_info.get('tweet_id') or ''), target=reference(umo))}"
+            )
             return False
 
     async def flush_collected(

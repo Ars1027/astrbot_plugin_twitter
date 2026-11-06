@@ -3,10 +3,12 @@
 import re
 from contextlib import ExitStack
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 from astrbot.api import logger
 
+from ..twitter_diagnostics import anchor, exception_type_chain, reference, traced
 from .platform_support import meta_value, platform_instances
 
 
@@ -16,9 +18,15 @@ class TelegramAlbumService:
     def __init__(self, context: Any) -> None:
         self.context = context
 
+    @traced
     async def send(self, umo: str, images: list, caption: str) -> bool:
         """发送 1 张照片或 2～10 张相册，保留群、话题和私聊路由。"""
         client = None
+        started = stage_started = perf_counter()
+        stage = "resolve_platform"
+        paths = []
+        total_bytes = 0
+        logger.debug(anchor("tg.album.start", target=reference(umo), images=len(images)))
         try:
             platform_id, _message_type, session_id = umo.split(":", 2)
             platform = next(
@@ -27,28 +35,52 @@ class TelegramAlbumService:
                 and meta_value(item.meta(), "name") == "telegram"
             )
             client = platform.get_client()
+            logger.debug(anchor(
+                "tg.client", target=reference(umo),
+                local_mode=bool(getattr(client, "local_mode", False)),
+                endpoint=reference(str(getattr(client, "base_url", ""))),
+            ))
             chat_id, separator, topic_id = session_id.partition("#")
             target = {"chat_id": int(chat_id)}
             if separator:
                 target["message_thread_id"] = int(topic_id)
+            stage, stage_started = "prepare_images", perf_counter()
             # 与 AstrBot 图片适配器使用同一转换入口，兼容 URL、本地截图和预下载图片。
-            paths = [Path(await image.convert_to_file_path()) for image in images]
+            for image in images:
+                path = Path(await image.convert_to_file_path())
+                total_bytes += path.stat().st_size
+                paths.append(path)
+                logger.debug(anchor(
+                    "tg.image.ready", index=len(paths), bytes=path.stat().st_size,
+                    elapsed=round(perf_counter() - stage_started, 2),
+                ))
+            stage, stage_started = "check_images", perf_counter()
             for path in paths:
                 if path.suffix.lower() == ".gif":
+                    logger.debug(anchor("tg.album.skip", reason="gif", target=reference(umo)))
                     return False
                 with path.open("rb") as image_file:
                     if image_file.read(6) in (b"GIF87a", b"GIF89a"):
                         # 照片相册不支持动画，交回原适配器发送 GIF。
+                        logger.debug(anchor("tg.album.skip", reason="gif_header", target=reference(umo)))
                         return False
             with ExitStack() as stack:
+                stage, stage_started = "build_upload", perf_counter()
                 # InputMediaPhoto 会把 Path 转成 file:// URI；云端 Bot API 无法读取
                 # 插件服务器的本地文件。传二进制文件对象，强制 SDK 上传 multipart。
                 files = [stack.enter_context(path.open("rb")) for path in paths]
                 if len(files) == 1:
+                    stage, stage_started = "send_photo", perf_counter()
+                    logger.debug(anchor("tg.upload.start", stage=stage, bytes=total_bytes, images=1))
                     result = await client.send_photo(
                         **target, photo=files[0], caption=caption or None, parse_mode=None,
                     )
-                    return result is not None and result is not False
+                    succeeded = result is not None and result is not False
+                    logger.debug(anchor(
+                        "tg.upload.result", stage=stage, ok=succeeded,
+                        elapsed=round(perf_counter() - stage_started, 2),
+                    ))
+                    return succeeded
 
                 # Telegram SDK 由官方适配器提供；QQ 等平台加载插件时不导入它。
                 from telegram import InputMediaPhoto
@@ -60,11 +92,21 @@ class TelegramAlbumService:
                     )
                     for index, image_file in enumerate(files)
                 ]
+                stage, stage_started = "send_media_group", perf_counter()
+                logger.debug(anchor("tg.upload.start", stage=stage, bytes=total_bytes, images=len(files)))
                 result = await client.send_media_group(**target, media=media)
-                return (
+                succeeded = (
                     isinstance(result, (list, tuple)) and len(result) == len(images)
                     and all(item is not None and item is not False for item in result)
                 )
+                logger.debug(anchor(
+                    "tg.upload.result", stage=stage, ok=succeeded,
+                    received=len(result) if isinstance(result, (list, tuple)) else 0,
+                    elapsed=round(perf_counter() - stage_started, 2),
+                ))
+                if not succeeded:
+                    logger.warning(anchor("tg.upload.incomplete", target=reference(umo), expected=len(images)))
+                return succeeded
         except Exception as exc:  # noqa: BLE001 - 可选 SDK 的异常在平台边界统一降级。
             reason = type(exc).__name__
             if reason == "BadRequest":
@@ -76,5 +118,12 @@ class TelegramAlbumService:
                 detail = re.sub(r"(?:https?|file)://\S+", "[URL]", detail)
                 detail = re.sub(r"\b\d+:[A-Za-z0-9_-]+\b", "[TOKEN]", detail)
                 reason += f": {' '.join(detail.split())[:300]}"
-            logger.warning(f"Telegram 相册发送失败，回退到普通消息: {reason}")
+            logger.warning(
+                f"Telegram 相册发送失败，回退到普通消息: {reason}; "
+                f"stage={stage}; elapsed={perf_counter() - started:.2f}s; "
+                f"stage_elapsed={perf_counter() - stage_started:.2f}s; "
+                f"images={len(images)}; prepared={len(paths)}; bytes={total_bytes}; "
+                f"causes={exception_type_chain(exc)}; "
+                f"{anchor('tg.album.failed', target=reference(umo))}"
+            )
             return False

@@ -444,3 +444,22 @@ async def test_upload_handles_close_after_send_failure_or_cancellation(albums, c
     else:
         assert await pending is (outcome == "success")
     assert len(handles) == count and all(handle.closed for handle in handles)
+
+
+@pytest.mark.asyncio
+async def test_image_download_timeout_logs_preparation_stage(albums, monkeypatch):
+    plugin, _data, _ordinary, sent, _converted, _client, _chain = albums
+    album = plugin.delivery_service.telegram_albums
+    logs = []
+    module = sys.modules[type(album).__module__]
+    monkeypatch.setattr(module.logger, "warning", logs.append)
+
+    async def fail_convert(_image):
+        raise TimeoutError("secret image URL")
+
+    monkeypatch.setattr(Image, "convert_to_file_path", fail_convert)
+    assert not await album.send(TG_GROUP, [Image(file="a.png")], "link")
+    assert not sent
+    assert len(logs) == 1 and "stage=prepare_images" in logs[0]
+    assert "prepared=0; bytes=0" in logs[0] and "causes=TimeoutError" in logs[0]
+    assert "secret" not in logs[0]

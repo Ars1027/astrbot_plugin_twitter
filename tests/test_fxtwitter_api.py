@@ -175,6 +175,25 @@ async def test_timeline_discards_results_when_first_page_fails(api_module):
 
 
 @pytest.mark.asyncio
+async def test_repeated_cursor_logs_page_and_redacted_cursor_reference(api_module):
+    api = api_module.TwitterAPI(provider="fxtwitter")
+    page = _fixture("fxtwitter_timeline_page1.json")
+    page["cursor"]["bottom"] = "secret-opaque-cursor"
+
+    async def request(*_args, **_kwargs):
+        return page
+
+    api._request_fxtwitter_json = request
+    with pytest.raises(api_module.FxTwitterTimelineError, match="分页游标重复"):
+        await api.get_user_timeline_items("tester")
+    logs = [message for _level, message in api_module.logger.messages if "[twitter:" in message]
+    assert any("timeline.cursor.repeated" in line and "page=2" in line for line in logs)
+    assert any("timeline.page.result" in line and "accepted=0" in line for line in logs)
+    assert "secret-opaque-cursor" not in "\n".join(logs)
+    assert api._status_cache == {}
+
+
+@pytest.mark.asyncio
 async def test_timeline_discards_partial_results_when_later_page_fails(api_module):
     api = api_module.TwitterAPI(provider="fxtwitter")
     page1 = _fixture("fxtwitter_timeline_page1.json")

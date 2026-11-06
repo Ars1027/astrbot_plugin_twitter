@@ -270,6 +270,10 @@ class TwitterPlugin(Star):
                 )
             ),
         )
+        self.telegram_video_max_size_mb = max(
+            1,
+            int(self._cfg("message_format", "twitter_telegram_video_max_size_mb", 50)),
+        )
         self.collective_max_authors = max(
             1,
             int(
@@ -407,6 +411,7 @@ class TwitterPlugin(Star):
                 collective_forward=self.collective_forward,
                 collective_max_authors=self.collective_max_authors,
                 deduplicate_retweets=self.deduplicate_retweets,
+                telegram_video_max_size_mb=self.telegram_video_max_size_mb,
             ),
         )
         self.polling_service = PollingService(
@@ -1048,6 +1053,7 @@ class TwitterPlugin(Star):
             tweet_info,
             translated_text=translated_text,
             translate_model=translate_model,
+            video_max_size_mb=(self.telegram_video_max_size_mb if is_telegram_event(event) else None),
         )
         if not chain:
             yield event.plain_result(f"未找到 @{username} 的推文内容")
@@ -1112,6 +1118,7 @@ class TwitterPlugin(Star):
                 {"r18": True, "media": False, "status": True},
                 translated_text=translated_text,
                 translate_model=translate_model,
+                video_max_size_mb=(self.telegram_video_max_size_mb if is_telegram_event(event) else None),
             )
             if not chain:
                 if report_errors:

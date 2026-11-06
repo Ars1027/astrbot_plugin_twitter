@@ -2,7 +2,9 @@
 
 import base64
 import json
+import sys
 
+import httpx
 import pytest
 from test_telegram_support import (
     TG_TOPIC,
@@ -14,7 +16,7 @@ from test_telegram_support import (
 
 telegram = pytest.importorskip("telegram")
 from telegram.ext import ExtBot
-from telegram.request import BaseRequest
+from telegram.request import BaseRequest, HTTPXRequest
 
 
 class AlbumRequest(BaseRequest):
@@ -94,3 +96,45 @@ async def test_local_images_are_uploaded_as_files_with_real_sdk(
         assert params["media"][0]["caption"] == "https://x.com/tester/status/101"
     else:
         assert params["caption"] == "https://x.com/tester/status/101"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("timeout", [
+    httpx.ConnectTimeout, httpx.WriteTimeout, httpx.ReadTimeout, httpx.PoolTimeout,
+])
+async def test_real_sdk_timeout_logs_transport_cause_without_credentials(
+    plugin_env, monkeypatch, tmp_path, timeout,
+):
+    _module, make, _data, _ordinary, _fail = plugin_env
+    plugin = make()
+    logs = []
+    album = plugin.delivery_service.telegram_albums
+    module = sys.modules[type(album).__module__]
+    monkeypatch.setattr(module.logger, "warning", logs.append)
+    path = tmp_path / "photo.png"
+    path.write_bytes(b"test image")
+
+    async def convert(_image):
+        return str(path)
+
+    async def respond(request):
+        if request.url.path.endswith("getMe"):
+            return httpx.Response(200, json={"ok": True, "result": {
+                "id": 123456, "is_bot": True, "first_name": "Test",
+            }})
+        raise timeout("secret request URL and credentials", request=request)
+
+    monkeypatch.setattr(Image, "convert_to_file_path", convert, raising=False)
+    transport = HTTPXRequest(httpx_kwargs={"transport": httpx.MockTransport(respond)})
+    async with ExtBot(
+        token="123456:TEST_TOKEN", request=transport, get_updates_request=transport,
+    ) as client:
+        plugin.context.platform_manager.platform_insts[0].client = client
+        assert not await album.send(TG_TOPIC, [Image(file="a"), Image(file="b")], "link")
+
+    assert len(logs) == 1
+    log = logs[0]
+    assert f"causes=TimedOut <- {timeout.__name__}" in log
+    assert "stage=send_media_group" in log and "elapsed=" in log
+    assert "images=2; prepared=2; bytes=20" in log
+    assert "TEST_TOKEN" not in log and "123456" not in log and "secret" not in log

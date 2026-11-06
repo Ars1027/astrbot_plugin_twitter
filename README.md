@@ -152,16 +152,19 @@ QQ（aiocqhttp）群订阅以真实群号为准。开启 AstrBot「按成员隔�
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `twitter_use_node` | `true` | 单条推文使用合并转发 |
+| `twitter_use_node` | `true` | QQ 单条推文使用合并转发；Telegram 始终按帖子发送图片相册或单张照片，视频单独发送 |
 | `twitter_no_text` | `false` | 推文含媒体时不输出文字 |
 | `twitter_text_render_mode` | `text` | `text` 文字，或 `screenshot` 截图 |
 | `twitter_screenshot_theme` | `dark` | 截图使用 `dark` 或 `light` 主题 |
 | `twitter_send_media_separately` | `true` | 正文或截图之外继续发送原图、视频及视频降级链接 |
 | `twitter_image_quality` | `orig` | `large` 缩略图，或 `orig` 原图 |
-| `twitter_video_max_size_mb` | `256` | 视频直发大小上限，超过后发送链接 |
+| `twitter_video_max_size_mb` | `256` | QQ 等非 Telegram 平台的视频直发大小上限（MB），超过后发送链接 |
+| `twitter_telegram_video_max_size_mb` | `50` | Telegram 视频文件直发大小上限（MB），超过后发送说明和链接；公共 Bot API 限制为 50 MB，更大文件需自建并启用 `--local` 的 Bot API 服务（最高 2000 MB）后调高 |
 | `twitter_collective_forward` | `false` | 将一轮轮询的多条推文汇总为合并转发；需同时开启 `twitter_use_node` |
 | `twitter_collective_max_authors` | `5` | 单条集体转发消息中的最多推主数 |
 | `twitter_include_tweet_link` | `true` | 在推送、测试和解析消息末尾附带帖子链接 |
+
+Telegram 的视频上限独立于 QQ，适用于自动推送、集体转发、测试指令和链接解析，也适用于引用帖的视频。新设置未配置时使用 50 MB；自建 API 后可按需调高，单纯调高插件设置不能突破公共 API 限制。文件大小无法探测或属于流媒体时仍沿用尝试发送、失败后降级链接的逻辑。照片和相册的图片选择、大小限制不受此设置影响。
 
 ### 内容与翻译
 
@@ -192,6 +195,16 @@ QQ（aiocqhttp）群订阅以真实群号为准。开启 AstrBot「按成员隔�
 - **重复发送边界**：群消息发送与本地状态保存无法原子提交。发送成功后进程被强制终止，或本地 KV 持续写入失败时，下次轮询可能再次发送。
 - **会话隔离**：私聊和群聊分别保存订阅；在一处取关或关闭推送，不影响其他会话。
 - **截图头像缓存**：截图模式会在 AstrBot 插件数据目录的 `avatar_cache` 中保存有界头像缓存，最多 200 项、总计 16 MiB；它不包含推文原图或视频，也不受独立媒体发送开关控制。
+
+## Telegram 媒体超时排查
+
+排查时将 AstrBot 日志级别设为 DEBUG，单次复现后按 `[twitter:` 查找日志锚点，再按 `trace` 关联同一次操作。正常阶段使用 DEBUG，异常保留 WARN/ERROR。日志不新增消息正文、Bot Token、完整媒体 URL 或分页游标；`target`、`media` 和 `cursor` 使用哈希标记，同值可关联。
+
+常用锚点：`timeline.page.start/result` 与 `timeline.cursor.repeated` 定位分页停滞；`fx.request.start/response/failed` 查看 HTTP 状态和耗时；`render.start/complete/fallback` 定位截图；`video.size` 查看大小探测和实际上限；`tg.batch.*`、`tg.upload.*`、`platform.send.*` 定位发送；`video.link.sent` 确认视频链接降级成功；`poll.tweet.result`、`receipts.save.complete`、`cursor.*` 区分已发送、排队、失败和保存进度。`poll.author.end` 只表示检查结束，不能单独作为发送成功凭据；`cursor.*.result` 的 `accepted` 表示订阅服务是否接纳此次提交，`receipts.save.complete` 表示保存调用无异常结束，均不代表每次都新增了 KV 写入。
+
+失败日志中的 `stage`、`elapsed`、`bytes` 和 `causes` 可帮助定位问题。相册的 `prepare_images` 表示获取图片阶段，`send_photo` / `send_media_group` 表示文件已准备好、正在调用 Telegram；视频的 `platform_send` 包括适配器内部的下载和发送，不能仅凭该阶段区分二者。
+
+`ConnectTimeout`、`WriteTimeout`、`ReadTimeout`、`PoolTimeout` 分别提示连接、上传写入、等待响应、等待连接池超时；底层异常未保留时仍需结合服务器网络测试判断。请在 AstrBot 所在容器或进程的网络环境中检查 Telegram API 和媒体源的可达性；`twitter_proxy` 配置不会自动应用到 Telegram SDK 上传。超时后服务端可能已收件，重测前先核对聊天记录。
 
 ## 参考与反馈
 
