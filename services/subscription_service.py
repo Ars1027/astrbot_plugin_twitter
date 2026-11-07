@@ -173,11 +173,10 @@ class SubscriptionService:
     def session_target(event: Any) -> str:
         """QQ 群订阅使用真实群号，不随成员隔离上下文变化。"""
         umo = event.unified_msg_origin
-        platform_name = getattr(event, "get_platform_name", None)
-        if not callable(platform_name) or platform_name() != "aiocqhttp":
-            return umo
         parts = umo.split(":", 2)
         if len(parts) != 3 or parts[1] != "GroupMessage":
+            return umo
+        if event.get_platform_name() != "aiocqhttp":
             return umo
         group_id = event.get_group_id()
         return f"{parts[0]}:GroupMessage:{group_id}" if group_id else umo

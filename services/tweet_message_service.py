@@ -27,11 +27,12 @@ HtmlRender = Callable[..., Awaitable[str]]
 
 
 class TweetMessageChain(list):
-    """保留正文截图身份；其中全部图片送达才可确认整条推文。"""
+    """保留节点分组方式与正文截图身份，用于发送及送达确认。"""
 
-    def __init__(self, components=(), *, required_images=()):
+    def __init__(self, components=(), *, required_images=(), group_as_single_node=False):
         super().__init__(components)
         self.required_images = tuple(required_images)
+        self.group_as_single_node = group_as_single_node
 
 
 @dataclass(frozen=True, slots=True)
@@ -561,6 +562,8 @@ class TweetMessageService:
         has_media = self.tweet_has_media(tweet_info)
         if not (self.settings.no_text and has_media) and text:
             append_text_section(text)
+            if translate_model and translated_text is not None:
+                append_text_section(f"（由 {translate_model} 翻译自原文）")
 
         await self.append_media_components(
             chain, tweet_info.get("images") or [], tweet_info.get("videos") or [],
@@ -578,6 +581,8 @@ class TweetMessageService:
             append_text_section(f"{nickname} 引用了 {quote_display} 的帖子")
             if quote_text:
                 append_text_section(quote_text)
+                if translate_model and quote.get("translated_text"):
+                    append_text_section(f"（由 {translate_model} 翻译自原文）")
             await self.append_media_components(
                 chain, quote.get("images") or [], quote.get("videos") or [],
                 context_label="引用推文",
@@ -589,11 +594,10 @@ class TweetMessageService:
                 f"https://x.com/{author_username}/status/{tweet_id}"
             )
 
-        quote_translated = bool((quote or {}).get("translated_text"))
-        if translate_model and (translated_text is not None or quote_translated):
-            append_text_section(f"（由 {translate_model} 翻译自原文）")
-
-        return [component for component in chain if component is not None]
+        return TweetMessageChain(
+            (component for component in chain if component is not None),
+            group_as_single_node=True,
+        )
 
     def tweet_link_component(
         self,

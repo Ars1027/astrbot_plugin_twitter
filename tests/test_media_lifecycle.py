@@ -215,7 +215,8 @@ async def test_both_message_modes_keep_main_media_before_quote(plugin_module, mo
         assert "正文" in chain[0].text and "引用" not in chain[0].text
         assert "引用" in chain[3].text
         nodes, videos = plugin_module.TweetDeliveryService.split_chain_for_nodes(chain, "Tester")
-        assert [type(node.content[0]) for node in nodes] == [Plain, Image, Plain, Image]
+        assert len(nodes) == 1
+        assert [type(component) for component in nodes[0].content] == [Plain, Image, Plain, Image]
         assert [video.file for video in videos] == [
             "https://example.com/main.mp4", "https://example.com/quote.mp4",
         ]
@@ -286,9 +287,20 @@ async def test_recent_history_records_only_actual_session_success(
             return None, None
 
         async def build_message_chain(self, *_args, **_kwargs):
-            return [] if mode == "empty" else [Plain("tweet")]
+            return [] if mode == "empty" else await message_service.build_message_chain(
+                "tester", {"text": "tweet", "images": ["https://example.com/main.jpg"]},
+            )
+
+    message_service = plugin_module.TweetMessageService(
+        object(), object(), None, _message_settings(
+            plugin_module, text_render_mode="text", pre_download_media=False,
+        ),
+    )
 
     async def send(umo, message):
+        if isinstance(message.chain[0], Nodes):
+            assert len(message.chain[0].nodes) == 1
+            assert [type(part) for part in message.chain[0].nodes[0].content] == [Plain, Image]
         if umo == "bad" or mode == "failure":
             return False
         if mode == "fallback" and isinstance(message.chain[0], Nodes):
@@ -737,11 +749,10 @@ async def test_text_layout_keeps_retweet_quote_and_translation_paragraphs(
     assert len(chain) == 1
     assert chain[0].text == (
         "@retweeter (Retweeter) 转发了 @author (Author) 的帖子\n\n"
-        "正文译文\n\n"
+        "正文译文\n\n（由 model 翻译自原文）\n\n"
         "@author (Author) 引用了 @quoted (Quoted) 的帖子\n\n"
-        "引用译文\n\n"
-        "https://x.com/author/status/123\n\n"
-        "（由 model 翻译自原文）"
+        "引用译文\n\n（由 model 翻译自原文）\n\n"
+        "https://x.com/author/status/123"
     )
 
 
@@ -870,6 +881,12 @@ async def test_collective_delivery_flushes_and_clears_cache(plugin_module):
         async def save_retweet_seen(self, _data):
             return None
 
+    message_service = plugin_module.TweetMessageService(
+        object(), object(), None, _message_settings(
+            plugin_module, text_render_mode="text", pre_download_media=False,
+        ),
+    )
+
     class Messages:
         @staticmethod
         def build_nickname(username, screen_name):
@@ -886,8 +903,8 @@ async def test_collective_delivery_flushes_and_clears_cache(plugin_module):
         async def maybe_translate(self, _tweet_info, _umo, cycle=None):
             return None, None
 
-        async def build_message_chain(self, *_args, **_kwargs):
-            return [Plain("tweet")]
+        async def build_message_chain(self, *args, **kwargs):
+            return await message_service.build_message_chain(*args, **kwargs)
 
     class Context:
         def __init__(self):
@@ -908,15 +925,17 @@ async def test_collective_delivery_flushes_and_clears_cache(plugin_module):
         ),
     )
 
-    queued = await delivery.push_to_subscribers(
-        "tester",
-        {
-            "tweet_id": "1",
-            "username": "tester",
-            "screen_name": "Tester",
-            "text": "tweet",
-        },
-    )
+    for tweet_id in ("1", "2"):
+        queued = await delivery.push_to_subscribers(
+            "tester",
+            {
+                "tweet_id": tweet_id,
+                "username": "tester",
+                "screen_name": "Tester",
+                "text": f"tweet {tweet_id}",
+                "images": [f"https://example.com/{tweet_id}.jpg"],
+            },
+        )
 
     contract = _delivery_contract(plugin_module)
     assert queued.state is contract.DeliveryState.QUEUED
@@ -928,6 +947,12 @@ async def test_collective_delivery_flushes_and_clears_cache(plugin_module):
     assert delivery.has_collected is False
     assert len(context.sent) == 1
     assert isinstance(context.sent[0][0], Nodes)
+    nodes = context.sent[0][0].nodes
+    assert len(nodes) == 2
+    for tweet_id, node in zip(("1", "2"), nodes):
+        assert [type(component) for component in node.content] == [Plain, Image]
+        assert f"tweet {tweet_id}" in node.content[0].text
+        assert node.content[1].file == f"https://example.com/{tweet_id}.jpg"
     assert flushed.successful_authors == frozenset({"tester"})
     assert flushed.failed_authors == frozenset()
 
@@ -1021,3 +1046,67 @@ async def test_failed_collective_retweet_does_not_persist_dedup(plugin_module):
     assert flushed.successful_authors == frozenset()
     assert flushed.failed_authors == frozenset({"tester"})
     assert saved_seen == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["text", "screenshot"])
+@pytest.mark.parametrize("part", ["main", "quote", "both"])
+async def test_translation_credit_stays_with_body_before_images(plugin_module, mode, part):
+    async def render(*_args, **_kwargs):
+        raise RuntimeError("render unavailable")
+
+    service = plugin_module.TweetMessageService(
+        object(), object(), render, _message_settings(
+            plugin_module, text_render_mode=mode, pre_download_media=False,
+            send_media_separately=True, include_tweet_link=False,
+        ),
+    )
+    quote = {"text": "quote original", "images": ["https://example.com/quote.jpg"]}
+    if part in ("quote", "both"):
+        quote["translated_text"] = "quote translated"
+    chain = await service.build_message_chain(
+        "tester", {"text": "main original", "images": ["https://example.com/main.jpg"],
+                   "quote": quote},
+        translated_text="main translated" if part in ("main", "both") else None,
+        translate_model="X",
+    )
+    nodes, _ = plugin_module.TweetDeliveryService.split_chain_for_nodes(chain, "Tester")
+    assert len(nodes) == 1
+    assert [type(component) for component in nodes[0].content] == [Plain, Image, Plain, Image]
+    for index, translated in ((0, part in ("main", "both")), (2, part in ("quote", "both"))):
+        text = nodes[0].content[index].text
+        assert ("（由 X 翻译自原文）" in text) is translated
+        assert ("main" if index == 0 else "quote") in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("no_text", [False, True])
+async def test_successful_screenshot_keeps_separate_nodes(plugin_module, monkeypatch, no_text):
+    messages = sys.modules[f"{plugin_module.__package__}.services.tweet_message_service"]
+    monkeypatch.setattr(messages, "tweet_card_page_contexts", lambda context: [context, context])
+
+    async def render(*_args, **_kwargs):
+        return "https://example.com/card.png"
+
+    service = plugin_module.TweetMessageService(
+        object(), object(), render, _message_settings(
+            plugin_module, no_text=no_text, pre_download_media=False,
+        ),
+    )
+    chain = await service.build_message_chain(
+        "tester", {"text": "body", "images": ["https://example.com/main.jpg"]},
+    )
+    assert chain.group_as_single_node is False
+    nodes, videos = plugin_module.TweetDeliveryService.split_chain_for_nodes(chain, "Tester")
+    assert len(nodes) == (1 if no_text else 3)
+    assert all(len(node.content) == 1 for node in nodes)
+    assert videos == []
+
+
+def test_grouped_video_only_chain_has_no_empty_node(plugin_module):
+    messages = sys.modules[f"{plugin_module.__package__}.services.tweet_message_service"]
+    video = Video.fromURL("https://example.com/video.mp4")
+    chain = messages.TweetMessageChain([video], group_as_single_node=True)
+    nodes, videos = plugin_module.TweetDeliveryService.split_chain_for_nodes(chain, "Tester")
+    assert nodes == []
+    assert videos == [video]

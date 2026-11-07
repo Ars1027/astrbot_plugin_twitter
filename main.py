@@ -553,7 +553,7 @@ class TwitterPlugin(Star):
         if not instances:
             return False
         platform_ids = set()
-        for platform in instances or []:
+        for platform in instances:
             meta = platform.meta()
             name = meta.get("name") if isinstance(meta, dict) else getattr(meta, "name", None)
             platform_id = meta.get("id") if isinstance(meta, dict) else getattr(meta, "id", None)
