@@ -102,7 +102,7 @@
         "description": "Telegram 视频文件直发大小上限（MB）",
         "type": "int",
         "default": 50,
-        "hint": "仅用于 Telegram，超过上限时改发说明和视频链接。公共 Bot API 的单个视频上传上限为 50 MB；发送更大文件需自建并启用 --local 的 Bot API 服务（最高 2000 MB），再相应提高此设置。此项不会提高 Telegram 的照片大小限制；无法探测视频大小时仍尝试发送。"
+        "hint": "仅用于 Telegram，超过上限时改发说明和视频链接。公共 Bot API 的单个视频上传上限为 50 MB；发送更大文件需自建并启用 --local 的 Bot API 服务（最高 2000 MB），再相应提高此设置。另受 AstrBot Telegram 适配器约 20 秒上传写入超时限制，上行带宽不足时更小的视频也会降级为链接；建议按上行带宽设置，详见 README 的「Telegram 视频发送限制」。此项不会提高 Telegram 的照片大小限制；无法探测视频大小时仍尝试发送。"
       },
       "twitter_collective_forward": {
         "description": "轮询时汇总多条新推文为一条合并转发消息",

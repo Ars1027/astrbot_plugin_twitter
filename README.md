@@ -91,6 +91,29 @@ Telegram Bot API 无法枚举机器人加入的所有群聊。可在 WebUI 点�
 
 也可在目标聊天内通过指令建立订阅。话题需在对应话题中首次执行订阅指令，之后在 WebUI 管理；私聊订阅在“其他会话”中管理，新增仍使用聊天指令。
 
+#### Telegram 视频发送限制
+
+Telegram 的视频直发同时受两层限制，任何一层超限都会改为发送说明与链接：
+
+- **Telegram Bot API 文件上限**：公共 Bot API 的单个上传文件上限为 50 MB，插件默认的 `twitter_telegram_video_max_size_mb=50` 与之对齐。只有自建并启用 `--local` 的 Bot API 服务才能提高该上限（最高 2000 MB），此时才能按需调高插件设置。
+- **AstrBot 适配器的写入超时**：AstrBot 的 `telegram` 适配器使用 python-telegram-bot 的默认请求参数构建客户端，带文件的上传请求走 `media_write_timeout`，默认 **20 秒**。AstrBot 目前没有暴露该配置项，插件也无法为单次发送覆盖它，所以视频文件必须在 20 秒内上传完成。
+
+20 秒内能传完多少取决于**服务器上行带宽**，而不是推文本身：
+
+| 上行带宽 | 20 秒理论上限 | 建议上限（留 30% 余量） |
+| --- | --- | --- |
+| 5 Mbps | 12.5 MB | 8 MB |
+| 10 Mbps | 25 MB | 17 MB |
+| 20 Mbps | 50 MB | 35 MB |
+| 50 Mbps | 125 MB | 87 MB |
+
+因此即使把 `twitter_telegram_video_max_size_mb` 调到 50，在 10 Mbps 上行、经过代理或跨地域链路上，30 MB 左右的视频仍会因写入超时而降级为链接。日志表现为 `stage=platform_send` 且 `causes=TimedOut <- WriteTimeout <- WriteTimeout`；此时正文已正常送达，附加视频按最佳努力策略降级，游标照常推进，不会重发整条推文。
+
+处理建议：
+
+1. 按上表把 `twitter_telegram_video_max_size_mb` 调到上行带宽可承受的值，让超限视频直接发链接，避免每次白等 20 秒。
+2. 需要直发更大视频时，改用与 AstrBot 同机或同内网的自建 Bot API 服务，使上传不经过公网链路。
+
 ### 失败重试与补发
 
 同一推主向多个会话推送时，普通消息、单条合并转发和集体转发都会保存各会话的处理结果。一个会话发送失败后，重试会跳过已成功发送或按配置跳过的会话；这些记录跨插件重载和数据源切换保留。
@@ -159,12 +182,14 @@ QQ（aiocqhttp）群订阅以真实群号为准。开启 AstrBot「按成员隔�
 | `twitter_send_media_separately` | `true` | 正文或截图之外继续发送原图、视频及视频降级链接 |
 | `twitter_image_quality` | `orig` | `large` 缩略图，或 `orig` 原图 |
 | `twitter_video_max_size_mb` | `256` | QQ 等非 Telegram 平台的视频直发大小上限（MB），超过后发送链接 |
-| `twitter_telegram_video_max_size_mb` | `50` | Telegram 视频文件直发大小上限（MB），超过后发送说明和链接；公共 Bot API 限制为 50 MB，更大文件需自建并启用 `--local` 的 Bot API 服务（最高 2000 MB）后调高 |
+| `twitter_telegram_video_max_size_mb` | `50` | Telegram 视频文件直发大小上限（MB），超过后发送说明和链接；公共 Bot API 限制为 50 MB，更大文件需自建并启用 `--local` 的 Bot API 服务（最高 2000 MB）后调高。另受 AstrBot 适配器约 20 秒上传写入超时限制，详见 [Telegram 视频发送限制](#telegram-视频发送限制) |
 | `twitter_collective_forward` | `false` | 将一轮轮询的多条推文汇总为合并转发；需同时开启 `twitter_use_node` |
 | `twitter_collective_max_authors` | `5` | 单条集体转发消息中的最多推主数 |
 | `twitter_include_tweet_link` | `true` | 在推送、测试和解析消息末尾附带帖子链接 |
 
 Telegram 的视频上限独立于 QQ，适用于自动推送、集体转发、测试指令和链接解析，也适用于引用帖的视频。新设置未配置时使用 50 MB；自建 API 后可按需调高，单纯调高插件设置不能突破公共 API 限制。文件大小无法探测或属于流媒体时仍沿用尝试发送、失败后降级链接的逻辑。照片和相册的图片选择、大小限制不受此设置影响。
+
+除插件自身的 MB 上限外，视频上传还受 AstrBot 适配器约 20 秒的写入超时约束，上行带宽不足时更小的视频也会降级为链接，详见 [Telegram 视频发送限制](#telegram-视频发送限制)。
 
 ### 内容与翻译
 
