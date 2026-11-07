@@ -1,17 +1,12 @@
 import copy
-import importlib.util
 import json
-from pathlib import Path
+import sys
 
 import pytest
+from test_provider_initialization import _load_main_module
 
 
-spec = importlib.util.spec_from_file_location(
-    "history_subscription_service",
-    Path(__file__).resolve().parents[1] / "services/subscription_service.py",
-)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
+module = sys.modules[f"{_load_main_module().__package__}.services.subscription_service"]
 
 
 @pytest.fixture
@@ -312,3 +307,40 @@ async def test_skip_confirmations_survive_reconfiguration_and_share_cursor_clean
     author = data["twitter_subs"]["tester"]
     assert "pending_skip_ids" not in author["subscribers"]["group-a"]
     assert "pending_tweet_items" not in author
+
+
+@pytest.mark.asyncio
+async def test_success_commit_persists_tail_and_cursor_in_one_write(store):
+    data, get, put, _service = store
+    writes = []
+
+    async def capture(key, value):
+        writes.append(copy.deepcopy(value))
+        await put(key, value)
+
+    service = module.SubscriptionService(get, capture, None, lambda: True)
+    window = [{"tweet_id": str(i), "username": "original", "is_retweet": True}
+              for i in (1000, 1001, 1002)]
+    assert await service.commit_processed_tweets("tester", ["1000"], "1000", pending_tweet_items=window)
+    assert len(writes) == 1
+    author = writes[0]["tester"]
+    assert author["since_id"] == "1000"
+    assert [item["tweet_id"] for item in author["pending_tweet_items"]] == ["1001", "1002"]
+    assert all(item["is_retweet"] for item in author["pending_tweet_items"])
+    assert data["twitter_subs"]["tester"] == author
+
+
+@pytest.mark.asyncio
+async def test_failed_cursor_and_tail_commit_does_not_mutate_persisted_state(store):
+    data, get, _put, _service = store
+    before = copy.deepcopy(data)
+
+    async def fail(_key, _value):
+        raise OSError("KV write failed")
+
+    service = module.SubscriptionService(get, fail, None, lambda: True)
+    with pytest.raises(OSError):
+        await service.commit_processed_tweets("tester", ["1000"], "1000", pending_tweet_items=[
+            {"tweet_id": "1000"}, {"tweet_id": "1001"},
+        ])
+    assert data == before

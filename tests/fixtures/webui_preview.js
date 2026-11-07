@@ -20,14 +20,28 @@
     apiGet: async () => {
       await delay();
       const subs = [...groups, ...other_sessions].flatMap((g) => g.subscriptions);
-      return structuredClone({groups, other_sessions, group_sources: [], provider: {name: "fxtwitter", ready: true}, polling: {running: true, interval_minutes: interval},
+      return structuredClone({groups, other_sessions, group_sources: [], telegram_platforms: [{id: "telegram-demo", label: "Telegram · 演示机器人"}], provider: {name: "fxtwitter", ready: true}, polling: {running: true, interval_minutes: interval},
         totals: {groups: groups.length, authors: new Set(subs.map((s) => s.username)).size, subscriptions: subs.length, active: subs.filter((s) => s.enabled).length}});
     },
     apiPost: async (endpoint, payload) => {
       await delay();
       if (endpoint === "settings/poll-interval") { interval = payload.minutes; return {saved: true}; }
+      if (endpoint === "groups/telegram/add") {
+        if (payload.group_id === "-404") throw new Error("机器人当前不在这个 Telegram 群聊中");
+        const umo = `${payload.platform_id}:GroupMessage:${payload.group_id}`;
+        const created = !groups.some((group) => group.umo === umo);
+        if (created) groups.push({umo, group_id: payload.group_id, group_name: "Telegram 演示群组",
+          platform_id: payload.platform_id, available: true, manually_added: true, subscriptions: []});
+        return {saved: true, created, umo};
+      }
       const group = [...groups, ...other_sessions].find((g) => g.umo === payload.umo);
       if (!group) throw new Error("会话不存在");
+      if (endpoint === "groups/telegram/remove") {
+        if (!group.manually_added) throw new Error("未找到手动添加的 Telegram 群组");
+        if (group.subscriptions.length) throw new Error("请先移除该群的全部订阅，再删除群组");
+        groups.splice(groups.indexOf(group), 1);
+        return {removed: true, umo: payload.umo};
+      }
       const existing = group.subscriptions.find((s) => s.username.toLowerCase() === payload.username?.toLowerCase());
       if (endpoint === "subscriptions/recent") {
         if (!existing) throw new Error("当前会话不存在这个订阅");
@@ -54,6 +68,11 @@
         return {saved: true};
       }
       if (endpoint === "subscriptions/remove") group.subscriptions = group.subscriptions.filter((s) => s !== existing);
+      if (endpoint === "subscriptions/group-clear") {
+        const removed = group.subscriptions.length;
+        group.subscriptions = [];
+        return {saved: true, removed};
+      }
       if (endpoint === "subscriptions/update" && existing) Object.assign(existing, payload);
       if (endpoint === "subscriptions/group-status") group.subscriptions.forEach((s) => { s.enabled = payload.enabled; });
       return {saved: true};

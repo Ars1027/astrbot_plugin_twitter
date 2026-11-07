@@ -53,6 +53,22 @@ async def test_nitter_timeline_success_and_empty_remain_valid(api_module, body, 
 
 
 @pytest.mark.asyncio
+async def test_nitter_initial_cursor_uses_batch_maximum_instead_of_top_retweet(api_module):
+    api = api_module.TwitterAPI(nitter_url="https://nitter.test")
+    body = '''<div class="timeline-item"><div class="retweet-header">Tester retweeted</div>
+    <a class="tweet-link" href="/original/status/100"></a></div>'''
+    body += "".join(
+        f'<div class="timeline-item"><a class="tweet-link" href="/tester/status/{i}"></a></div>'
+        for i in (105, 104, 103)
+    )
+    body += '<div class="timeline-item"><i class="icon-pin"></i><a class="tweet-link" href="/tester/status/999"></a></div>'
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(200, text=body))) as client:
+        api._client = client
+        assert await api.get_user_newtimeline("tester") == ["105"]
+        assert await api.get_user_newtimeline("tester", "105") == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failed_parser", ["_extract_avatar", "_extract_date", "_contains_live_stream"])
 async def test_nitter_required_parse_failure_is_not_success(api_module, monkeypatch, failed_parser):
     api = api_module.TwitterAPI(nitter_url="https://nitter.test")

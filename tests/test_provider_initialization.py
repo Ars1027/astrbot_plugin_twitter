@@ -1241,6 +1241,37 @@ async def test_poll_interval_save_wakes_timer_and_rolls_back_on_failure(
 
 
 @pytest.mark.asyncio
+async def test_wait_for_next_poll_survives_legacy_asyncio_timeout(
+    plugin_module,
+    monkeypatch,
+):
+    """模拟 Python 3.10：asyncio.TimeoutError 与内置 TimeoutError 是两个类。
+
+    轮询等待若只捕获内置 TimeoutError，第一次等待超时就会让后台轮询任务退出。
+    """
+    plugin = plugin_module.TwitterPlugin.__new__(plugin_module.TwitterPlugin)
+    plugin._running = True
+    plugin.poll_interval = 1
+    plugin._poll_wakeup = asyncio.Event()
+
+    class LegacyTimeout(Exception):
+        pass
+
+    class FakeAsyncio:
+        TimeoutError = LegacyTimeout
+
+        @staticmethod
+        async def wait_for(awaitable, timeout):
+            if hasattr(awaitable, "close"):
+                awaitable.close()
+            raise LegacyTimeout
+
+    monkeypatch.setattr(plugin_module, "asyncio", FakeAsyncio)
+    # 未修复时这里会抛出 LegacyTimeout，无法返回。
+    await plugin._wait_for_next_poll()
+
+
+@pytest.mark.asyncio
 async def test_subscription_service_concurrent_adds_preserve_sessions(
     plugin_module,
 ):

@@ -8,6 +8,7 @@ import base64
 import re
 from collections import OrderedDict
 from datetime import datetime
+from time import perf_counter
 from typing import Any, Optional
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
@@ -16,6 +17,7 @@ from bs4 import BeautifulSoup, Tag
 from astrbot.api import logger
 
 from .twitter_article import attach_article, parse_fxtwitter_article, parse_nitter_article
+from .twitter_diagnostics import anchor, detail_debug, exception_type_chain, reference, traced
 
 # 内置 Nitter 镜像站列表
 WEBSITE_LIST = [
@@ -157,9 +159,19 @@ class TwitterAPI:
 
         for attempt in range(attempts):
             client = await self._get_client()
+            started = perf_counter()
+            detail_debug(
+                logger, self,
+                "fx.request.start", request=reference(path), attempt=attempt + 1,
+                paginated=bool((params or {}).get("cursor")), proxy=bool(self.proxy),
+            )
             try:
                 resp = await client.get(url, params=params)
             except httpx.TimeoutException as e:
+                logger.debug(anchor(
+                    "fx.request.failed", request=reference(path), attempt=attempt + 1,
+                    elapsed=round(perf_counter() - started, 2), causes=exception_type_chain(e),
+                ))
                 logger.warning(f"FxTwitter API 连接或读取超时: {url}, {e}")
                 client_invalidated = await self._invalidate_client(client)
                 if attempt + 1 < attempts:
@@ -169,6 +181,10 @@ class TwitterAPI:
                     self.provider_ready = False
                 return None
             except httpx.RequestError as e:
+                logger.debug(anchor(
+                    "fx.request.failed", request=reference(path), attempt=attempt + 1,
+                    elapsed=round(perf_counter() - started, 2), causes=exception_type_chain(e),
+                ))
                 logger.warning(f"FxTwitter API 请求失败: {url}, {e}")
                 client_invalidated = await self._invalidate_client(client)
                 if attempt + 1 < attempts:
@@ -178,6 +194,11 @@ class TwitterAPI:
                     self.provider_ready = False
                 return None
 
+            detail_debug(
+                logger, self,
+                "fx.request.response", request=reference(path), attempt=attempt + 1,
+                status=resp.status_code, elapsed=round(perf_counter() - started, 2),
+            )
             if resp.status_code == 429:
                 retry_after = str(resp.headers.get("Retry-After") or "").strip()
                 suffix = f"，Retry-After={retry_after}" if retry_after else ""
@@ -493,7 +514,7 @@ class TwitterAPI:
         参数:
             username: 推主用户名
             since_id: 已知最新推文 ID，仅返回比此 ID 更新的推文；
-                      为空时仅返回最新一条推文 ID（用于首次订阅定位）
+                      为空时返回首批有效条目中的最大原帖 ID（用于首次订阅定位）
 
         返回:
             新推文 ID 列表（时间正序），无新推文时返回空列表
@@ -501,9 +522,11 @@ class TwitterAPI:
         items = await self.get_user_timeline_items(
             username,
             since_id=since_id,
-            limit=1 if not since_id else 0,
+            first_page_only=not since_id,
         )
-        return [str(item.get("tweet_id") or "") for item in items if item.get("tweet_id")]
+        ids = [str(item.get("tweet_id") or "") for item in items if str(item.get("tweet_id") or "").isdigit()]
+        # 新转发可以位于顶部，但其原帖 ID 可能远小于同页已有的原创帖。
+        return [max(ids, key=int)] if not since_id and ids else ids
 
     def _parse_timeline_items(
         self,
@@ -628,8 +651,10 @@ class TwitterAPI:
             ).strip(),
         }
 
+    @traced
     async def _get_fxtwitter_timeline_items(
-        self, username: str, since_id: str = "", limit: int = 0
+        self, username: str, since_id: str = "", limit: int = 0,
+        *, first_page_only: bool = False,
     ) -> list[dict]:
         """获取完整的 FxTwitter 时间线增量，并保持既有排序语义。"""
         username = str(username or "").strip().lstrip("@")
@@ -660,6 +685,11 @@ class TwitterAPI:
             params: dict[str, Any] = {"count": 20}
             if cursor:
                 params["cursor"] = cursor
+            detail_debug(
+                logger, self,
+                "timeline.page.start", author=username, page=page_index + 1,
+                cursor=reference(cursor), since=since_id, limit=limit,
+            )
 
             payload = await self._request_fxtwitter_json(
                 f"2/profile/{quote(username, safe='')}/statuses",
@@ -679,6 +709,7 @@ class TwitterAPI:
                 )
 
             statuses = self._flatten_fxtwitter_results(raw_results)
+            before_count = len(items)
             for status in statuses:
                 tweet_id = str(status.get("id") or "")
                 if not tweet_id or tweet_id in seen_ids or status.get("is_pinned") is True:
@@ -706,7 +737,13 @@ class TwitterAPI:
                     local_item_limit_reached = True
                     break
 
-            if boundary_found or requested_limit_reached:
+            detail_debug(
+                logger, self,
+                "timeline.page.result", author=username, page=page_index + 1,
+                fetched=len(statuses), accepted=len(items) - before_count, total=len(items),
+                boundary_found=boundary_found, limit_reached=requested_limit_reached,
+            )
+            if boundary_found or requested_limit_reached or (first_page_only and since_int is None):
                 break
             if local_item_limit_reached:
                 if since_int is not None:
@@ -731,6 +768,11 @@ class TwitterAPI:
                 timeline_exhausted = True
                 break
             if next_cursor == cursor or next_cursor == previous_cursor:
+                logger.warning(anchor(
+                    "timeline.cursor.repeated", author=username, page=page_index + 1,
+                    cursor=reference(cursor), next_cursor=reference(next_cursor),
+                    previous_cursor=reference(previous_cursor), accepted=len(items),
+                ))
                 raise FxTwitterTimelineError(
                     f"获取 @{username} 的 FxTwitter 时间线失败：分页游标重复"
                 )
@@ -744,6 +786,11 @@ class TwitterAPI:
 
         for status in statuses_to_cache:
             self._cache_fxtwitter_status(status)
+        detail_debug(
+            logger, self,
+            "timeline.complete", author=username, accepted=len(items), exhausted=timeline_exhausted,
+            boundary_found=boundary_found,
+        )
         return self._finalize_fxtwitter_items(items, since_int, limit)
 
     @staticmethod
@@ -757,12 +804,13 @@ class TwitterAPI:
         return items
 
     async def get_user_timeline_items(
-        self, username: str, since_id: str = "", limit: int = 0
+        self, username: str, since_id: str = "", limit: int = 0,
+        *, first_page_only: bool = False,
     ) -> list[dict]:
         """获取用户时间线条目，包含转帖元数据。"""
         if self.provider == DATA_PROVIDER_FXTWITTER:
             return await self._get_fxtwitter_timeline_items(
-                username, since_id=since_id, limit=limit
+                username, since_id=since_id, limit=limit, first_page_only=first_page_only
             )
 
         if not self.nitter_url:

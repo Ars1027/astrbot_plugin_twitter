@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+from time import perf_counter
 from typing import Any
 
 from astrbot.api import logger
@@ -11,7 +12,11 @@ from astrbot.api.event import MessageChain
 import astrbot.api.message_components as Comp
 from astrbot.api.message_components import Node, Nodes
 
+from ..twitter_diagnostics import anchor, detail_debug, exception_type_chain, reference, traced
+from .platform_support import is_telegram_target
+from .platform_send_backoff import PlatformRateLimited, PlatformSendBackoff
 from .subscription_service import DeliveredTweet, RecentDelivery, SkippedTweet, SubscriptionService
+from .telegram_album_service import TelegramAlbumService
 from .tweet_message_service import TranslationCycleState, TweetMessageChain, TweetMessageService
 
 
@@ -23,6 +28,7 @@ class TweetDeliverySettings:
     collective_forward: bool
     collective_max_authors: int
     deduplicate_retweets: bool
+    telegram_video_max_size_mb: int = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +103,8 @@ class TweetDeliveryService:
         self.subscriptions = subscriptions
         self.messages = messages
         self.settings = settings
+        self.send_backoff = PlatformSendBackoff()
+        self.telegram_albums = TelegramAlbumService(context, self.send_backoff)
         self._collected_tweets: dict[str, list[CachedTweet]] = {}
         self._pending_retweet_seen: dict[str, set[str]] = {}
         self._collected_skips: list[SkippedTweet] = []
@@ -181,9 +189,12 @@ class TweetDeliveryService:
         self,
         chain: list,
         nickname: str,
+        *,
+        use_node: bool | None = None,
     ) -> PreparedDelivery:
         """为测试指令和链接识别准备一致的主消息与视频列表。"""
-        if self.settings.use_node:
+        use_nodes = self.settings.use_node if use_node is None else use_node
+        if use_nodes:
             try:
                 nodes, videos = self.split_chain_for_nodes(chain, nickname)
                 primary_chain = [Nodes(nodes)] if nodes else []
@@ -201,10 +212,54 @@ class TweetDeliveryService:
         umo: str,
         message_chain: MessageChain,
     ) -> None:
-        """将明确的 False 转为发送异常，保留其他无异常返回的既有行为。"""
-        result = await self.context.send_message(umo, message_chain)
-        if result is False:
-            raise RuntimeError("Context.send_message returned False")
+        """检查发送结果；TG 按组件和文本分段重试，不重放成功的前缀。"""
+        started = perf_counter()
+        detail_debug(
+            logger, self,
+            "platform.send.start", target=reference(umo),
+            parts=len(message_chain.chain), types=[type(part).__name__ for part in message_chain.chain],
+        )
+        try:
+            requests = (
+                self._telegram_request_chains(message_chain)
+                if is_telegram_target(self.context, umo) else [message_chain]
+            )
+            for request in requests:
+                result = await self.send_backoff.run(
+                    umo, lambda request=request: self.context.send_message(umo, request),
+                )
+                if result is False:
+                    raise RuntimeError("Context.send_message returned False")
+        except BaseException as exc:
+            logger.debug(anchor(
+                "platform.send.failed", target=reference(umo), causes=exception_type_chain(exc),
+                elapsed=round(perf_counter() - started, 2),
+            ))
+            raise
+        detail_debug(
+            logger, self,
+            "platform.send.result", target=reference(umo), ok=True,
+            elapsed=round(perf_counter() - started, 2),
+        )
+
+    @staticmethod
+    def _telegram_request_chains(message_chain: MessageChain) -> list[MessageChain]:
+        """每段最多 4096 个 UTF-16 单位，避免适配器内部再次拆分文本。"""
+        requests = []
+        for component in message_chain.chain:
+            if not isinstance(component, Comp.Plain):
+                requests.append(MessageChain(chain=[component]))
+                continue
+            text = component.text
+            start = units = 0
+            for index, char in enumerate(text):
+                char_units = 2 if ord(char) > 0xFFFF else 1
+                if units + char_units > 4096:
+                    requests.append(MessageChain(chain=[Comp.Plain(text[start:index])]))
+                    start, units = index, 0
+                units += char_units
+            requests.append(MessageChain(chain=[Comp.Plain(text[start:])]))
+        return requests
 
     async def _record_recent_delivery(
         self, umo: str, username: str, tweet_info: dict,
@@ -227,20 +282,27 @@ class TweetDeliveryService:
         """发送普通消息；媒体失败时优先补发文字，再逐图尝试。"""
         if not chain:
             return True
-        try:
-            await self._send_message_checked(umo, MessageChain(chain=chain))
-            if on_primary_sent is not None:
-                on_primary_sent()
-            return True
-        except Exception as exc:
-            logger.warning(f"包含媒体的消息发送失败，尝试保留文字内容: {exc}")
-
         required_images = getattr(chain, "required_images", ())
+        # TG 已按组件发送。先确认必需截图，再发送链接和附加媒体，避免后者
+        # 中断时丢失已经完整送达的正文回执，也避免失败后重发成功的截图。
+        if not (required_images and is_telegram_target(self.context, umo)):
+            try:
+                await self._send_message_checked(umo, MessageChain(chain=chain))
+                if on_primary_sent is not None:
+                    on_primary_sent()
+                return True
+            except PlatformRateLimited:
+                return False
+            except Exception as exc:
+                logger.warning(f"包含媒体的消息发送失败，尝试保留文字内容: {exc}")
+
         if required_images:
             all_pages_sent = True
             for image in required_images:
                 try:
                     await self._send_message_checked(umo, MessageChain(chain=[image]))
+                except PlatformRateLimited:
+                    return False
                 except Exception as exc:
                     all_pages_sent = False
                     logger.error(f"正文截图分页发送失败，保留整条推文重试: {exc}")
@@ -274,6 +336,8 @@ class TweetDeliveryService:
                 text_sent = True
                 if on_primary_sent is not None:
                     on_primary_sent()
+            except PlatformRateLimited:
+                return False
             except Exception as exc:
                 logger.error(f"媒体降级后的文字消息仍发送失败: {exc}")
 
@@ -287,6 +351,8 @@ class TweetDeliveryService:
                 image_sent = True
                 if not text_parts and on_primary_sent is not None:
                     on_primary_sent()
+            except PlatformRateLimited:
+                return text_sent
             except Exception as exc:
                 image_url = getattr(image_part, "file", "") or getattr(
                     image_part,
@@ -301,26 +367,130 @@ class TweetDeliveryService:
             return text_sent
         return image_sent
 
+    @traced
+    async def send_telegram_tweet(
+        self, umo: str, chain: list, username: str, tweet_info: dict,
+        *, on_primary_sent: Callable[[], None] | None = None,
+    ) -> bool:
+        """按帖子分组图片，链接放入说明；沿用正文回执及逐图降级规则。"""
+        detail_debug(
+            logger, self,
+            "tg.tweet.start", author=username, tweet=str(tweet_info.get("tweet_id") or ""),
+            target=reference(umo), parts=len(chain),
+        )
+        images = [part for part in chain if isinstance(part, Comp.Image)]
+        if not images or any(not isinstance(part, (Comp.Image, Comp.Plain)) for part in chain):
+            return await self.send_plain_chain_resilient(
+                umo, chain, on_primary_sent=on_primary_sent,
+            )
+
+        link_component = self.messages.tweet_link_component(tweet_info, username)
+        link = link_component.text if link_component is not None else ""
+        texts = [
+            "\n".join(line for line in part.text.splitlines() if not link or line.strip() != link).strip()
+            for part in chain if isinstance(part, Comp.Plain)
+        ]
+        body = "\n\n".join(text for text in texts if text)
+        caption = "\n\n".join(text for text in (body, link) if text)
+        # 为非 BMP 字符预留 UTF-16 长度，避免超过 Telegram 的 1024 字说明限制。
+        separate_body = len(caption.encode("utf-16-le")) // 2 > 1024
+        if separate_body:
+            caption = link
+
+        required = {id(image) for image in getattr(chain, "required_images", ())}
+        remaining = set(required)
+        body_sent = False
+        primary_sent = False
+
+        def confirm_primary() -> None:
+            nonlocal primary_sent
+            if not primary_sent:
+                primary_sent = True
+                if on_primary_sent is not None:
+                    on_primary_sent()
+
+        if separate_body and body:
+            body_sent = await self.send_plain_chain_resilient(
+                umo, [Comp.Plain(body)],
+                on_primary_sent=confirm_primary if not required else None,
+            )
+
+        for offset in range(0, len(images), 10):
+            batch = images[offset:offset + 10]
+            batch_caption = caption if offset == 0 else link
+            detail_debug(
+                logger, self,
+                "tg.batch.start", tweet=str(tweet_info.get("tweet_id") or ""),
+                target=reference(umo), batch=offset // 10 + 1, images=len(batch),
+                caption_units=len(batch_caption.encode("utf-16-le")) // 2,
+            )
+
+            def confirm_batch(batch=batch, offset=offset) -> None:
+                remaining.difference_update(id(image) for image in batch)
+                if required:
+                    if not remaining:
+                        confirm_primary()
+                elif not body or body_sent or (offset == 0 and not separate_body):
+                    confirm_primary()
+
+            try:
+                sent = await self.telegram_albums.send(umo, batch, batch_caption)
+            except PlatformRateLimited:
+                return primary_sent
+            if not sent:
+                logger.debug(anchor("tg.batch.fallback", batch=offset // 10 + 1, target=reference(umo)))
+                # 仅补发当前失败批次，不重发已成功的相册。
+                fallback = TweetMessageChain(
+                    [*([Comp.Plain(batch_caption)] if batch_caption else []), *batch],
+                    required_images=[image for image in batch if id(image) in required],
+                )
+                sent = await self.send_plain_chain_resilient(
+                    umo, fallback, on_primary_sent=confirm_batch,
+                )
+            if sent:
+                confirm_batch()
+            detail_debug(
+                logger, self,
+                "tg.batch.result", batch=offset // 10 + 1, ok=sent, required_remaining=len(remaining),
+            )
+
+        detail_debug(logger, self, "tg.tweet.result", target=reference(umo), primary_sent=primary_sent)
+        return primary_sent
+
+    @traced
     async def send_video_or_fallback(
         self,
         umo: str,
         video_component: Comp.Video,
     ) -> bool:
         """发送视频组件，失败时回退为链接。"""
+        started = perf_counter()
+        media_ref = reference(getattr(video_component, "file", "") or getattr(video_component, "url", ""))
+        detail_debug(logger, self, "video.start", target=reference(umo), media=media_ref)
         try:
             await self._send_message_checked(
                 umo,
                 MessageChain(chain=[video_component]),
             )
+            detail_debug(logger, self, "video.sent", target=reference(umo), media=media_ref)
             return True
+        except PlatformRateLimited:
+            # 已明确拒收，不能再发送链接绕过冷却。
+            return False
         except Exception as exc:
-            logger.warning(f"视频发送失败，回退为链接: {exc}")
+            # 平台调用包含媒体准备与发送；异常链可识别 SDK 包装的 HTTP 超时。
+            logger.warning(
+                f"视频发送失败，回退为链接: stage=platform_send; "
+                f"elapsed={perf_counter() - started:.2f}s; causes={exception_type_chain(exc)}; "
+                f"{anchor('video.failed', target=reference(umo), media=media_ref)}"
+            )
             video_url = getattr(video_component, "file", "") or getattr(
                 video_component,
                 "url",
                 "",
             )
             if video_url:
+                fallback_started = perf_counter()
                 try:
                     await self._send_message_checked(
                         umo,
@@ -328,10 +498,13 @@ class TweetDeliveryService:
                             chain=[Comp.Plain(str(f"视频: {video_url}"))]
                         ),
                     )
+                    logger.debug(anchor("video.link.sent", target=reference(umo), media=media_ref))
                     return True
                 except Exception as fallback_exc:
                     logger.error(
-                        f"视频与降级链接均发送失败: {fallback_exc}"
+                        f"视频与降级链接均发送失败: stage=send_video_link; "
+                        f"elapsed={perf_counter() - fallback_started:.2f}s; "
+                        f"causes={exception_type_chain(fallback_exc)}"
                     )
             return False
 
@@ -578,6 +751,7 @@ class TweetDeliveryService:
             DeliveryState.DELIVERED, tuple(recent_deliveries), tuple(delivered_tweets), tuple(skipped_tweets)
         )
 
+    @traced
     async def send_to_subscriber(
         self,
         umo: str,
@@ -599,6 +773,12 @@ class TweetDeliveryService:
         主要内容发送成功后追加，附加媒体中断不丢弃正文回执。
         """
         receipt_recorded = False
+        started = perf_counter()
+        detail_debug(
+            logger, self,
+            "delivery.start", author=username, tweet=str(tweet_info.get("tweet_id") or ""),
+            target=reference(umo), telegram=is_telegram_target(self.context, umo),
+        )
 
         def record_sent() -> None:
             nonlocal receipt_recorded
@@ -615,12 +795,21 @@ class TweetDeliveryService:
                 sub_config,
                 translated_text=translated_text,
                 translate_model=translate_model,
+                video_max_size_mb=(
+                    self.settings.telegram_video_max_size_mb
+                    if is_telegram_target(self.context, umo) else None
+                ),
+            )
+            detail_debug(
+                logger, self,
+                "delivery.prepared", parts=len(chain),
+                elapsed=round(perf_counter() - started, 2),
             )
             if not chain:
                 record_sent()
                 return True
 
-            if self.settings.use_node:
+            if self.settings.use_node and not is_telegram_target(self.context, umo):
                 try:
                     nodes, video_parts = self.split_chain_for_nodes(
                         chain,
@@ -639,6 +828,8 @@ class TweetDeliveryService:
                             if not nodes:
                                 record_sent()
                     sent = bool(nodes) or video_sent
+                except PlatformRateLimited:
+                    raise
                 except Exception as exc:
                     logger.warning(
                         f"合并转发失败，回退到普通消息: {exc}"
@@ -653,9 +844,16 @@ class TweetDeliveryService:
                 plain_chain, video_parts = self.split_plain_chain_and_videos(
                     chain
                 )
-                primary_sent = bool(plain_chain) and (
-                    await self.send_plain_chain_resilient(umo, plain_chain, on_primary_sent=record_sent)
-                )
+                primary_sent = False
+                if plain_chain:
+                    if is_telegram_target(self.context, umo):
+                        primary_sent = await self.send_telegram_tweet(
+                            umo, plain_chain, username, tweet_info, on_primary_sent=record_sent,
+                        )
+                    else:
+                        primary_sent = await self.send_plain_chain_resilient(
+                            umo, plain_chain, on_primary_sent=record_sent,
+                        )
                 video_sent = False
                 for video in video_parts:
                     if await self.send_video_or_fallback(umo, video):
@@ -670,9 +868,17 @@ class TweetDeliveryService:
                 logger.info(f"推文已推送至 {umo}")
             else:
                 logger.error(f"推文主要内容未能推送至 {umo}")
+            detail_debug(
+                logger, self,
+                "delivery.result", author=username, tweet=str(tweet_info.get("tweet_id") or ""),
+                target=reference(umo), ok=sent, elapsed=round(perf_counter() - started, 2),
+            )
             return sent
         except Exception as exc:
-            logger.error(f"推送推文至 {umo} 失败: {exc}")
+            logger.error(
+                f"推送推文失败: {exception_type_chain(exc)}; "
+                f"{anchor('delivery.failed', author=username, tweet=str(tweet_info.get('tweet_id') or ''), target=reference(umo))}"
+            )
             return False
 
     async def flush_collected(
@@ -771,6 +977,20 @@ class TweetDeliveryService:
                 if not valid_tweets:
                     continue
 
+                if is_telegram_target(self.context, umo):
+                    # Telegram 会静默忽略 Nodes，按条发送并沿用真实回执契约。
+                    for cached_tweet in valid_tweets:
+                        sent = await self.send_to_subscriber(
+                            umo, cached_tweet.username, cached_tweet.tweet_info,
+                            cached_tweet.sub_config, cached_tweet.nickname,
+                            translated_text=cached_tweet.translated_text,
+                            translate_model=cached_tweet.translate_model,
+                            recent_deliveries=recent_deliveries,
+                            delivered_tweets=delivered_tweets,
+                        )
+                        record_result(umo, cached_tweet, sent)
+                    continue
+
                 tweets_by_author: dict[str, list[CachedTweet]] = {}
                 author_order: list[str] = []
                 for cached_tweet in valid_tweets:
@@ -842,6 +1062,10 @@ class TweetDeliveryService:
                                 f"集体转发已推送至 {umo} "
                                 f"{batch_label}共 {len(nodes)} 个节点"
                             )
+                        except PlatformRateLimited:
+                            for cached_tweet, _tweet_nodes, _tweet_videos in prepared:
+                                record_result(umo, cached_tweet, False)
+                            continue
                         except Exception as exc:
                             logger.warning(
                                 f"集体合并转发失败，回退逐条发送: {exc}"

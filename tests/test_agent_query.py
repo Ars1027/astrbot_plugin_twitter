@@ -1,19 +1,13 @@
 import copy
-import importlib.util
+import sys
 import types
-from pathlib import Path
 
 import pytest
 
 from test_provider_initialization import _load_main_module
 
 
-spec = importlib.util.spec_from_file_location(
-    "agent_query_subscription_service",
-    Path(__file__).resolve().parents[1] / "services/subscription_service.py",
-)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
+module = sys.modules[f"{_load_main_module().__package__}.services.subscription_service"]
 
 
 def test_format_recent_deliveries_for_agent_empty_and_rich():

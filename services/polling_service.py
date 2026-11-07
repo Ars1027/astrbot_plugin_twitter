@@ -1,7 +1,8 @@
 """单轮订阅检查、游标推进和 Nitter 镜像切换。"""
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Any
 
 from astrbot.api import logger
@@ -12,6 +13,7 @@ from ..twitter_api import (
     FxTwitterTimelineError,
     get_next_website,
 )
+from ..twitter_diagnostics import anchor, detail_debug, traced
 from .subscription_service import (
     PENDING_TWEET_MAX_ITEMS,
     DeliveredTweet,
@@ -36,6 +38,17 @@ class PollingSettings:
     custom_nitter_url: str
     website_list: tuple[str, ...]
     max_tweets_per_user: int = 5
+
+
+@dataclass(slots=True)
+class PollRoundStats:
+    """仅属于当前轮询，手动测试与其他轮次不共享统计状态。"""
+
+    known_items: dict[str, set[str]] = field(default_factory=dict)
+    checked: int = 0
+    checks_failed: int = 0
+    delivery_failures: int = 0
+    limit_authors: int = 0
 
 
 class PollingService:
@@ -85,17 +98,21 @@ class PollingService:
         username: str,
         tweet_id: str,
         recent_deliveries: tuple[RecentDelivery, ...] = (),
+        *, pending_tweet_items: list[dict] | None = None,
     ) -> None:
         """普通模式立即落盘，集体转发模式延迟到实际发送后。"""
         if getattr(self.delivery, "collective_enabled", False):
             self._set_pending_collective_cursor(username, tweet_id)
+            logger.debug(anchor("cursor.deferred", author=username, tweet=tweet_id))
             return
-        await self.subscriptions.commit_processed_tweets(
+        accepted = await self.subscriptions.commit_processed_tweets(
             username,
             [tweet_id],
             tweet_id,
+            pending_tweet_items=pending_tweet_items,
             **({"recent_deliveries": recent_deliveries} if recent_deliveries else {}),
         )
+        logger.debug(anchor("cursor.commit.result", author=username, tweet=tweet_id, accepted=bool(accepted)))
 
     async def _save_partial_deliveries(
         self,
@@ -113,9 +130,14 @@ class PollingService:
                 pending_tweet_items=pending_tweet_items,
                 skipped_tweets=skipped_tweets,
             )
+            logger.debug(anchor(
+                "receipts.save.complete", delivered=len(delivered_tweets), skipped=len(skipped_tweets),
+                pending_authors=len(pending_tweet_items or {}),
+            ))
         except Exception as exc:
             logger.warning(f"保存部分推送结果失败，下次可能重复推送: {exc}")
 
+    @traced
     async def flush_pending_collective(self) -> None:
         """发送集体转发缓存，并只提交发送成功推主的候选游标。"""
         if not self.delivery.collective_enabled:
@@ -126,6 +148,7 @@ class PollingService:
         pending_cursors = self._pending_collective_cursors
         pending_tweet_ids = self._pending_collective_tweet_ids
         pending_tweet_items = self._pending_collective_tweet_items
+        logger.debug(anchor("collective.flush.start", authors=len(pending_cursors)))
         self._pending_collective_cursors = {}
         self._pending_collective_tweet_ids = {}
         self._pending_collective_tweet_items = {}
@@ -140,6 +163,10 @@ class PollingService:
             return
 
         recent_deliveries = flush_result.recent_deliveries
+        logger.debug(anchor(
+            "collective.flush.result", successful=len(flush_result.successful_authors),
+            failed=len(flush_result.failed_authors), delivered=len(flush_result.delivered_tweets),
+        ))
         uncommitted_authors = set(pending_tweet_items)
         try:
             for username, tweet_id in pending_cursors.items():
@@ -148,14 +175,16 @@ class PollingService:
                         f"@{username} 集体转发未全部成功，保留当前游标"
                     )
                     continue
-                await self.subscriptions.commit_processed_tweets(
+                accepted = await self.subscriptions.commit_processed_tweets(
                     username,
                     pending_tweet_ids.get(username, []),
                     tweet_id,
+                    pending_tweet_items=pending_tweet_items.get(username, []),
                     **({"recent_deliveries": tuple(
                         item for item in recent_deliveries if item.username == username
                     )} if recent_deliveries else {}),
                 )
+                logger.debug(anchor("cursor.collective.result", author=username, tweet=tweet_id, accepted=bool(accepted)))
                 uncommitted_authors.discard(username)
         finally:
             # 已提交条目由订阅服务排除；提交异常也保留尚未提交作者的回执。
@@ -184,23 +213,81 @@ class PollingService:
         else:
             tweet_info["retweet"] = None
 
+    @staticmethod
+    def _remaining_backlog(subs: dict, known_items: dict[str, set[str]]) -> dict[str, set[str]]:
+        """按最终游标去除已提交项，合并窗口与旧回执，每位作者内去重。"""
+        remaining = {}
+        for username, info in subs.items():
+            ids = set(known_items.get(username, ()))
+            window = info.get("pending_tweet_items") or []
+            if isinstance(window, list):
+                ids.update(str(item.get("tweet_id") or "") for item in window if isinstance(item, dict))
+            ids.update(
+                str(tweet_id)
+                for subscriber in info.get("subscribers", {}).values()
+                for field in ("pending_delivery_ids", "pending_skip_ids")
+                for tweet_id in (subscriber.get(field) or [])
+            )
+            cursor = str(info.get("since_id") or "")
+            processed = SubscriptionService.processed_tweet_ids(info)
+            ids = {
+                tweet_id for tweet_id in ids
+                if tweet_id.isdigit() and tweet_id not in processed
+                and (not cursor.isdigit() or int(tweet_id) > int(cursor))
+            }
+            if ids:
+                remaining[username] = ids
+        return remaining
+
+    @traced
     async def check_all(self) -> None:
-        """检查全部已订阅推主的一轮新推文。"""
+        """整轮耗时包括固定等待、媒体发送和集体刷新，不包括轮询间隔。"""
+        started = perf_counter()
         subscribe_list = await self.subscriptions.get_all()
+        stats = PollRoundStats(known_items=self._remaining_backlog(subscribe_list, {}))
+        logger.info("开始订阅轮询: " + anchor(
+            "poll.round.start", authors=len(subscribe_list),
+            known_backlog=sum(map(len, stats.known_items.values())),
+        ))
+        status = "interrupted"
+        try:
+            await self._check_round(subscribe_list, stats)
+            status = "completed" if stats.checked == len(subscribe_list) else "stopped_early"
+        finally:
+            backlog = None
+            backlog_authors = None
+            try:
+                # 集体发送完成后读取最终状态，不能将已排队的条目算作已送达。
+                remaining = self._remaining_backlog(await self.subscriptions.get_all(), stats.known_items)
+                backlog = sum(map(len, remaining.values()))
+                backlog_authors = len(remaining)
+            except Exception as exc:  # noqa: BLE001 - 统计失败不能覆盖发送异常或取消。
+                logger.warning(f"读取轮询积压统计失败: {type(exc).__name__}")
+            logger.info("订阅轮询结束: " + anchor(
+                "poll.round.end", status=status, elapsed=round(perf_counter() - started, 2),
+                authors=len(subscribe_list), checked=stats.checked,
+                unchecked=len(subscribe_list) - stats.checked, checks_failed=stats.checks_failed,
+                delivery_failures=stats.delivery_failures, limit_authors=stats.limit_authors,
+                known_backlog=backlog, backlog_authors=backlog_authors,
+            ))
+
+    async def _check_round(self, subscribe_list: dict, stats: PollRoundStats) -> None:
         if not subscribe_list:
             return
-
         results: list[bool] = []
         translation_cycle = TranslationCycleState()
         for username, info in subscribe_list.items():
             check_completed = False
+            stats.checked += 1
             try:
-                result = await self.check_user(username, info, cycle=translation_cycle)
+                result = await self.check_user(username, info, cycle=translation_cycle, stats=stats)
                 results.append(result)
+                stats.checks_failed += int(not result)
                 check_completed = True
             except Exception as exc:
                 logger.error(f"检查 {username} 推文失败: {exc}")
                 results.append(False)
+                stats.checks_failed += 1
 
             if (
                 self.settings.data_provider == DATA_PROVIDER_FXTWITTER
@@ -239,10 +326,23 @@ class PollingService:
                     logger.info(f"当前镜像站出错过多，切换至: {new_url}")
                     self.twitter_api.nitter_url = new_url
 
+    @traced
     async def check_user(
-        self, username: str, info: dict, cycle: TranslationCycleState | None = None
+        self, username: str, info: dict, cycle: TranslationCycleState | None = None,
+        *, stats: PollRoundStats | None = None,
     ) -> bool:
         """检查一个推主的新推文，并仅推进已成功处理的游标。"""
+        started = perf_counter()
+        starting_since = str(info.get("since_id") or "")
+        summary_status = "interrupted"
+        new_count = None
+        retry_count = 0
+        handled_count = 0
+        detail_debug(
+            logger, self,
+            "poll.author.start", author=username, since=str(info.get("since_id") or ""),
+            provider=self.settings.data_provider,
+        )
         try:
             since_id = info.get("since_id", "")
             processed_tweet_ids = self.subscriptions.processed_tweet_ids(info)
@@ -273,6 +373,8 @@ class PollingService:
                 for tweet_id in missing_ids
             )
             retrying = bool(new_tweet_items)
+            retry_count = len(new_tweet_items)
+            detail_debug(logger, self, "poll.retry_window", author=username, retrying=retrying, items=len(new_tweet_items))
             if not new_tweet_items:
                 new_tweet_items = await self.twitter_api.get_user_timeline_items(
                     username,
@@ -284,13 +386,20 @@ class PollingService:
                 (item for item in new_tweet_items if str(item.get("tweet_id") or "").isdigit()),
                 key=lambda item: int(item["tweet_id"]),
             )[:PENDING_TWEET_MAX_ITEMS]
+            new_count = 0 if retrying else len(new_tweet_items)
+            if stats is not None:
+                stats.known_items.setdefault(username, set()).update(
+                    str(item["tweet_id"]) for item in new_tweet_items
+                )
 
             if not new_tweet_items:
+                summary_status = "no_updates"
                 return True
 
             latest_subs = await self.subscriptions.get_all()
             latest_key = self.subscriptions.find_key(latest_subs, username)
             if latest_key is None:
+                summary_status = "unsubscribed"
                 logger.info(f"@{username} 已无订阅者，跳过推送")
                 return True
             retry_window = {username: new_tweet_items}
@@ -299,8 +408,12 @@ class PollingService:
             max_tweets = min(PENDING_TWEET_MAX_ITEMS, max(1, int(self.settings.max_tweets_per_user)))
             pushed_count = 0
             detail_failed = False
+            summary_status = "checked"
             for item_index, item in enumerate(new_tweet_items):
                 if pushed_count >= max_tweets:
+                    summary_status = "limited"
+                    if stats is not None:
+                        stats.limit_authors += 1
                     remaining = len(new_tweet_items) - item_index
                     logger.info(
                         f"@{username} 本轮已处理 {max_tweets} 条推文，"
@@ -310,11 +423,16 @@ class PollingService:
 
                 tweet_id = str(item.get("tweet_id") or "")
                 tweet_username = str(item.get("username") or username)
+                logger.debug(anchor(
+                    "poll.tweet.start", author=username, tweet=tweet_id, retrying=retrying,
+                    is_retweet=bool(item.get("is_retweet")),
+                ))
                 if tweet_id in processed_tweet_ids:
                     logger.info(
                         f"跳过 @{username} 已处理的重复推文: {tweet_id}"
                     )
-                    await self._record_processed_cursor(username, tweet_id)
+                    await self._record_processed_cursor(username, tweet_id, pending_tweet_items=new_tweet_items)
+                    handled_count += 1
                     continue
 
                 already_handled = retrying and all(
@@ -363,6 +481,7 @@ class PollingService:
                     if not retrying:
                         await self._save_partial_deliveries((), (), retry_window)
                         detail_failed = True
+                        summary_status = "failed"
                         break
                     tweet_info["tweet_id"] = tweet_id
 
@@ -379,12 +498,20 @@ class PollingService:
                     await self._save_partial_deliveries((), (), retry_window)
                     raise
                 if not isinstance(delivery_result, DeliveryResult):
+                    summary_status = "failed"
                     logger.error(
                         f"@{username} 推送服务返回了无效结果，保留游标: "
                         f"{tweet_id}"
                     )
                     break
+                logger.debug(anchor(
+                    "poll.tweet.result", author=username, tweet=tweet_id, state=delivery_result.state.value,
+                    delivered=len(delivery_result.delivered_tweets), skipped=len(delivery_result.skipped_tweets),
+                ))
                 if delivery_result.state is DeliveryState.FAILED:
+                    summary_status = "failed"
+                    if stats is not None:
+                        stats.delivery_failures += 1
                     detail_failed = not tweet_info.get("status", True)
                     logger.warning(
                         f"@{username} 推文发送失败，保留游标等待重试: "
@@ -398,7 +525,10 @@ class PollingService:
                     break
 
                 try:
-                    await self._record_processed_cursor(username, tweet_id, delivery_result.recent_deliveries)
+                    await self._record_processed_cursor(
+                        username, tweet_id, delivery_result.recent_deliveries,
+                        pending_tweet_items=new_tweet_items,
+                    )
                 except (Exception, asyncio.CancelledError):
                     await self._save_partial_deliveries(
                         delivery_result.delivered_tweets, delivery_result.recent_deliveries,
@@ -407,15 +537,28 @@ class PollingService:
                     )
                     raise
                 processed_tweet_ids.add(tweet_id)
+                handled_count += 1
                 if delivery_result.counts_toward_limit:
                     pushed_count += 1
 
             return not detail_failed
+        except asyncio.CancelledError:
+            summary_status = "interrupted"
+            raise
         except FxTwitterTimelineError as exc:
+            summary_status = "failed"
             logger.warning(
                 f"获取 @{username} 时间线失败，保留当前游标: {exc}"
             )
             return False
         except Exception as exc:
+            summary_status = "failed"
             logger.error(f"获取 {username} 推文异常: {exc}")
             return False
+        finally:
+            logger.debug(anchor(
+                "poll.author.summary", author=username, since=starting_since,
+                new=new_count, retry_items=retry_count, handled=handled_count,
+                status=summary_status, elapsed=round(perf_counter() - started, 2),
+            ))
+            detail_debug(logger, self, "poll.author.end", author=username, elapsed=round(perf_counter() - started, 2))

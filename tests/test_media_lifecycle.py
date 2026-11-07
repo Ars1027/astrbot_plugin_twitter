@@ -507,7 +507,10 @@ async def test_screenshot_uses_prepared_copy_but_sends_original_media(
         assert options
         return str(tmp_path / "card.png")
 
-    async def append_media(_chain, images, _videos, context_label="推文"):
+    async def append_media(
+        _chain, images, _videos, context_label="推文", *, video_max_size_mb=None,
+    ):
+        assert video_max_size_mb is None
         captured_media.append((context_label, list(images)))
 
     service = plugin_module.TweetMessageService(

@@ -14,6 +14,7 @@ const elements = {
   intervalForm: document.getElementById("interval-form"),
   pollInterval: document.getElementById("poll-interval"),
   removeDialog: document.getElementById("remove-dialog"),
+  removeDialogTitle: document.getElementById("remove-dialog-title"),
   removeDialogText: document.getElementById("remove-dialog-text"),
   confirmRemove: document.getElementById("confirm-remove"),
   toast: document.getElementById("toast"),
@@ -41,12 +42,18 @@ const state = {
   leaving: false,
   historyTarget: null,
   historyRequest: 0,
+  addingGroup: false,
 };
 
 const batch = Object.fromEntries([
   "dialog", "target", "form", "input", "r18", "media", "summary", "progress",
   "entries", "error", "start", "stop", "retry", "reset", "close",
 ].map((key) => [key, document.getElementById(`batch-${key}`)]));
+
+const telegramGroup = Object.fromEntries([
+  "dialog", "form", "platform", "id", "error", "submit", "cancel", "close",
+].map((key) => [key, document.getElementById(`telegram-group-${key}`)]));
+const openTelegramGroup = document.getElementById("open-telegram-group");
 
 function busy() {
   return state.saving || state.loading || state.batchPreparing || state.batch?.running;
@@ -115,6 +122,7 @@ function selectedSession() {
 function renderRuntime() {
   if (!state.overview) return;
   const { provider, polling, totals } = state.overview;
+  openTelegramGroup.hidden = !(state.overview.telegram_platforms || []).length;
   elements.runtimeStatus.classList.toggle("is-ready", provider.ready && polling.running);
   elements.runtimeStatus.classList.toggle("is-error", !provider.ready);
   const providerLabel = provider.name === "fxtwitter" ? "FxTwitter" : "Nitter";
@@ -132,7 +140,7 @@ function renderRuntime() {
   const failedSources = state.overview.group_sources.filter((source) => !source.available);
   if (failedSources.length) {
     setError(
-      `${failedSources.length} 个 QQ 实例暂时无法读取群列表；已有订阅仍可管理。`,
+      `${failedSources.length} 个平台实例暂时无法读取部分群聊；已有订阅仍可管理。`,
     );
   } else {
     setError("");
@@ -199,6 +207,12 @@ function renderDetail() {
     ? el("label", { class: "group-switch" },
       el("input", { id: "group-status", type: "checkbox", "data-umo": session.umo, checked: allEnabled }),
       el("span", {}, "全部推送")) : null;
+  const removeGroup = isGroup && session.manually_added && !session.subscriptions.length
+    ? el("button", { class: "secondary-button delete-group-button", type: "button",
+      "data-remove-telegram-group": true, "data-umo": session.umo }, "删除群组") : null;
+  const clearGroup = isGroup && session.subscriptions.length
+    ? el("button", { class: "secondary-button delete-group-button", type: "button",
+      "data-clear-group-subscriptions": true, "data-umo": session.umo }, "清空订阅") : null;
   let addSection = null;
   if (isGroup) {
     addSection = session.available
@@ -220,14 +234,18 @@ function renderDetail() {
     el("header", { class: "detail-header" },
       el("div", { class: "detail-heading" }, el("h2", {}, name),
         el("p", {}, el("span", { class: "type-badge" }, isGroup ? "群聊" : "其他会话"),
-          `${id} · ${session.platform_id}`)), groupSwitch),
+          `${id} · ${session.platform_id}`)),
+      el("div", { class: "detail-actions" }, groupSwitch, clearGroup, removeGroup)),
     ...(addSection ? [addSection] : []),
     el("section", { class: "subscription-section" },
       el("div", { class: "subscription-heading" },
         el("div", { class: "section-title" }, "订阅名单 ",
           el("span", { class: "count-badge" }, session.subscriptions.length)),
-        el("label", { class: "author-search" }, el("span", { class: "visually-hidden" }, "搜索推主"),
-          el("input", { id: "author-search", type: "search", placeholder: "搜索名称或 @用户名", value: state.authorSearch }))),
+        el("div", { class: "subscription-tools" },
+          session.subscriptions.length ? el("button", { class: "secondary-button", type: "button",
+            "data-copy-subscriptions": true, title: "复制本会话全部推主 ID，以空格分隔" }, "复制列表") : null,
+          el("label", { class: "author-search" }, el("span", { class: "visually-hidden" }, "搜索推主"),
+            el("input", { id: "author-search", type: "search", placeholder: "搜索名称或 @用户名", value: state.authorSearch })))),
       el("div", { class: "subscription-list", id: "subscription-list" })));
   renderSubscriptions();
   syncBusy();
@@ -257,6 +275,47 @@ function render() {
   renderSessionList();
   renderDetail();
   elements.workspace.setAttribute("aria-busy", "false");
+}
+
+async function copySubscriptions() {
+  const session = selectedSession();
+  const usernames = (session?.subscriptions || []).map((item) => String(item.username || "").trim().replace(/^@/, "")).filter(Boolean);
+  if (!usernames.length) return;
+  const text = usernames.join(" ");
+  const button = document.querySelector("[data-copy-subscriptions]");
+  setSaving(true);
+  try {
+    let copied = false;
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        copied = true;
+      } catch {
+        // HTTP 部署或嵌入页面可能禁止 Clipboard API，继续尝试选中文本复制。
+      }
+    }
+    if (!copied) {
+      const input = document.createElement("textarea");
+      input.value = text;
+      input.readOnly = true;
+      input.style.cssText = "position:fixed;left:0;top:0;opacity:0;pointer-events:none";
+      document.body.append(input);
+      try {
+        input.focus({preventScroll: true});
+        input.select();
+        copied = document.execCommand("copy");
+      } finally {
+        input.remove();
+      }
+    }
+    if (!copied) throw new Error("clipboard unavailable");
+    showToast(`已复制 ${usernames.length} 个推主 ID，以空格分隔`);
+  } catch {
+    showToast("复制失败，请允许浏览器访问剪贴板后重试", true);
+  } finally {
+    setSaving(false);
+    button?.focus({preventScroll: true});
+  }
 }
 
 async function loadOverview({ announce = false } = {}) {
@@ -306,6 +365,82 @@ async function saveAndReload(endpoint, payload, successMessage) {
 
 elements.refreshButton.addEventListener("click", () => {
   if (!busy()) loadOverview({ announce: true });
+});
+
+function setGroupError(message = "") {
+  telegramGroup.error.textContent = message;
+  telegramGroup.error.classList.toggle("is-hidden", !message);
+}
+
+openTelegramGroup.addEventListener("click", () => {
+  if (busy()) return;
+  const platforms = state.overview?.telegram_platforms || [];
+  if (!platforms.length) return;
+  telegramGroup.platform.replaceChildren(...platforms.map((platform) =>
+    el("option", { value: platform.id }, platform.label || platform.id)));
+  telegramGroup.id.value = "";
+  setGroupError();
+  telegramGroup.dialog.showModal();
+  telegramGroup.id.focus();
+});
+
+for (const button of [telegramGroup.cancel, telegramGroup.close]) {
+  button.addEventListener("click", () => {
+    if (!state.addingGroup) telegramGroup.dialog.close();
+  });
+}
+telegramGroup.dialog.addEventListener("cancel", (event) => {
+  if (state.addingGroup) event.preventDefault();
+});
+telegramGroup.dialog.addEventListener("close", () => openTelegramGroup.focus());
+telegramGroup.form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (busy()) return;
+  const payload = {
+    platform_id: telegramGroup.platform.value,
+    group_id: telegramGroup.id.value.trim(),
+  };
+  if (!/^-[1-9]\d*$/.test(payload.group_id)) {
+    setGroupError("请输入以负号开头的完整群 ID，例如 -1001234567890。");
+    telegramGroup.id.focus();
+    return;
+  }
+  state.addingGroup = true;
+  setSaving(true);
+  setGroupError();
+  telegramGroup.form.setAttribute("aria-busy", "true");
+  for (const control of Object.values(telegramGroup)) {
+    if (control.matches("button, input, select")) control.disabled = true;
+  }
+  telegramGroup.submit.textContent = "正在验证…";
+  try {
+    const result = await bridge.apiPost("groups/telegram/add", payload);
+    if (result.saved !== true) throw new Error("未收到群组保存确认，请重试。");
+    state.view = "groups";
+    state.selectedUmo = result.umo;
+    state.search = state.authorSearch = "";
+    elements.sessionSearch.value = "";
+    document.querySelectorAll("[data-view]").forEach((button) => {
+      const active = button.dataset.view === "groups";
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-selected", String(active));
+    });
+    const refreshed = await loadOverview();
+    telegramGroup.dialog.close();
+    showToast(refreshed
+      ? (result.created ? "群组已添加，可以开始订阅推主" : "群组已在列表中，信息已更新")
+      : "群组已保存，但列表刷新失败，请点击刷新");
+  } catch (error) {
+    setGroupError(error?.message || "验证或添加群组失败，请重试。");
+  } finally {
+    state.addingGroup = false;
+    for (const control of Object.values(telegramGroup)) {
+      if (control.matches("button, input, select")) control.disabled = false;
+    }
+    telegramGroup.submit.textContent = "验证并添加";
+    telegramGroup.form.setAttribute("aria-busy", "false");
+    setSaving(false);
+  }
 });
 
 elements.sessionSearch.addEventListener("input", (event) => {
@@ -409,6 +544,10 @@ elements.detailView.addEventListener("change", async (event) => {
 
 elements.detailView.addEventListener("click", (event) => {
   if (busy()) return;
+  if (event.target.closest("[data-copy-subscriptions]")) {
+    copySubscriptions();
+    return;
+  }
   const author = event.target.closest("[data-show-history]");
   if (author) {
     openHistory(author);
@@ -418,12 +557,39 @@ elements.detailView.addEventListener("click", (event) => {
     openBatch();
     return;
   }
+  const clearGroup = event.target.closest("[data-clear-group-subscriptions]");
+  if (clearGroup) {
+    const session = selectedSession();
+    if (state.view !== "groups" || !session?.subscriptions.length || session.umo !== clearGroup.dataset.umo) return;
+    state.removeTarget = {kind: "group-subscriptions", umo: session.umo};
+    elements.removeDialogTitle.textContent = "清空本群订阅";
+    elements.removeDialogText.textContent = `确定清空「${session.group_name}」的全部 ${session.subscriptions.length} 个订阅吗？仅影响本群，其他群和私聊不受影响。清空后需重新添加。`;
+    elements.confirmRemove.textContent = "清空";
+    elements.removeDialog.returnValue = "";
+    elements.removeDialog.showModal();
+    return;
+  }
+  const removeGroup = event.target.closest("[data-remove-telegram-group]");
+  if (removeGroup) {
+    const session = selectedSession();
+    if (!session?.manually_added || session.subscriptions.length || session.umo !== removeGroup.dataset.umo) return;
+    state.removeTarget = {kind: "telegram-group", umo: session.umo};
+    elements.removeDialogTitle.textContent = "删除群组";
+    elements.removeDialogText.textContent = `确定删除「${session.group_name}」的群组列表记录吗？删除后可重新添加。`;
+    elements.confirmRemove.textContent = "删除";
+    elements.removeDialog.returnValue = "";
+    elements.removeDialog.showModal();
+    return;
+  }
   const button = event.target.closest("[data-remove-subscription]");
   if (!button) return;
   state.removeTarget = {
+    kind: "subscription",
     umo: button.dataset.umo,
     username: button.dataset.username,
   };
+  elements.removeDialogTitle.textContent = "移除订阅";
+  elements.confirmRemove.textContent = "移除";
   elements.removeDialogText.textContent = `确定移除 @${button.dataset.username}（${button.dataset.screenName}）吗？`;
   elements.removeDialog.returnValue = "";
   elements.removeDialog.showModal();
@@ -436,9 +602,22 @@ elements.removeDialog.addEventListener("close", async () => {
   }
   const target = state.removeTarget;
   state.removeTarget = null;
+  if (target.kind === "group-subscriptions") {
+    const saved = await saveAndReload("subscriptions/group-clear", {umo: target.umo}, "已清空本群订阅");
+    if (saved) {
+      state.authorSearch = "";
+      renderDetail();
+    }
+    return;
+  }
+  if (target.kind === "telegram-group") {
+    state.authorSearch = "";
+    await saveAndReload("groups/telegram/remove", {umo: target.umo}, "群组已从列表删除");
+    return;
+  }
   await saveAndReload(
     "subscriptions/remove",
-    target,
+    {umo: target.umo, username: target.username},
     `已移除 @${target.username}`,
   );
 });
