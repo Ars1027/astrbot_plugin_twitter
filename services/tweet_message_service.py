@@ -19,7 +19,7 @@ from ..twitter_renderer import (
     tweet_card_page_contexts,
 )
 from .avatar_cache_service import AvatarCacheService
-from ..twitter_diagnostics import anchor, exception_type_chain, reference
+from ..twitter_diagnostics import anchor, detail_debug, exception_type_chain, reference
 from ..twitter_article import article_text
 
 
@@ -191,12 +191,13 @@ class TweetMessageService:
                 exceeds_limit, size_bytes = await self.video_exceeds_size_limit(
                     video_url, video_max_size_mb=video_max_size_mb,
                 )
-                logger.debug(anchor(
+                detail_debug(
+                    logger, self,
                     "video.size", media=reference(video_url), bytes=size_bytes,
                     limit_mb=self.settings.video_max_size_mb if video_max_size_mb is None else video_max_size_mb,
                     exceeded=exceeds_limit, source=context_label,
                     stream=self.is_stream_video_url(video_url),
-                ))
+                )
                 if exceeds_limit:
                     logger.warning(
                         f"{context_label}视频超过大小限制，已改为链接: {video_url}"
@@ -233,7 +234,7 @@ class TweetMessageService:
 
         try:
             started = perf_counter()
-            logger.debug(anchor("image.download.start", media=reference(img_url), proxy=True))
+            detail_debug(logger, self, "image.download.start", media=reference(img_url), proxy=True)
             data = await self.twitter_api.download_media(img_url)
         except Exception as exc:
             logger.debug(anchor(
@@ -245,10 +246,11 @@ class TweetMessageService:
             )
             return Comp.Image.fromURL(img_url)
 
-        logger.debug(anchor(
+        detail_debug(
+            logger, self,
             "image.download.complete", media=reference(img_url), bytes=len(data),
             elapsed=round(perf_counter() - started, 2),
-        ))
+        )
         return Comp.Image.fromBytes(data)
 
     async def maybe_translate(
@@ -706,10 +708,11 @@ class TweetMessageService:
             pages = tweet_card_page_contexts(context)
             for page_number, page_context in enumerate(pages, 1):
                 started = perf_counter()
-                logger.debug(anchor(
+                detail_debug(
+                    logger, self,
                     "render.start", author=username, tweet=str(tweet_info.get("tweet_id") or ""),
                     page=page_number, pages=len(pages),
-                ))
+                )
                 rendered_url = await self.html_render(
                     load_tweet_card_template(), page_context,
                     options=tweet_card_render_options(page_context),
@@ -719,10 +722,11 @@ class TweetMessageService:
                     raise RuntimeError("html_render returned an empty image result")
                 chain.append(image_comp)
                 required_images.append(image_comp)
-                logger.debug(anchor(
+                detail_debug(
+                    logger, self,
                     "render.complete", author=username, tweet=str(tweet_info.get("tweet_id") or ""),
                     page=page_number, elapsed=round(perf_counter() - started, 2),
-                ))
+                )
 
         link_comp = self.tweet_link_component(tweet_info, username)
         if link_comp is not None:

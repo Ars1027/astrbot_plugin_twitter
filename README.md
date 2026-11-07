@@ -1,18 +1,6 @@
-<div align="center">
-
-<img src="./logo.png" width="72" alt="Twitter 推文转发插件图标">
-
 # Twitter 推文转发
 
-将关注的 X/Twitter 推文自动送到 AstrBot 会话；也可在聊天中解析链接、翻译推文，并通过 WebUI 管理订阅。
-
-[![AstrBot 插件](https://img.shields.io/badge/AstrBot-Plugin-3178c6?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776ab?style=flat-square)](https://www.python.org/)
-[![MIT License](https://img.shields.io/badge/License-MIT-238636?style=flat-square)](./LICENSE)
-
-**[快速开始](#快速开始) · [效果展示](#效果展示) · [指令](#聊天指令) · [配置](#配置参考)**
-
-</div>
+自动推送关注的 X/Twitter 推文，支持 QQ、Telegram、链接解析、翻译、截图及 WebUI 订阅管理。
 
 ![Nitter 或 FxTwitter 获取推文，经插件处理后推送到不同 AstrBot 会话的流程](./asset/readme/hero.svg)
 
@@ -48,20 +36,21 @@
    ```bash
    pip install -r requirements.txt
    ```
-
-2. 在 AstrBot 中加载插件。默认数据源是 Nitter；也可将 `twitter_data_provider` 改为 `fxtwitter`，请配置可用的 `twitter_nitter_url`或`twitter_fxtwitter_api_base`，保存后重载插件。
+2. 在 AstrBot 中加载插件，选择可用的数据源：默认使用 Nitter，需填写可用的 `twitter_nitter_url`；使用 FxTwitter 时，将 `twitter_data_provider` 改为 `fxtwitter`，并配置可用的 `twitter_fxtwitter_api_base`。保存后重载插件。
 3. 在要接收推送的会话中发送 `/推特关注 <用户名>`，然后用 `/推特测试 <用户名>` 检查消息效果；发送 `/推特列表` 可查看当前会话的订阅。
 
-首次将新推主加入插件时，会以当前最新推文建立增量游标，之后的自动轮询推送新内容；需要立即查看一条推文时可使用 `/推特测试`。
+首次将新推主加入插件时，默认从当前最新内容开始跟踪，之后自动推送新帖；需要立即查看一条推文时可使用 `/推特测试`。
+
+正文发送失败会自动重试，已完成的会话会跳过，无需重新关注。积压较多时，按“每个推主每轮最多推送推文数”分轮发送。
 
 ## 主要功能
 
 - **按会话订阅**：群聊、私聊各自维护订阅与推送开关；支持指令和 WebUI 管理。
 - **定时追踪**：从 Nitter 或 FxTwitter 读取增量推文，按旧到新推送；每个推主每轮可限制推送数量。
-- **失败补发**：保存各会话已发送或按配置跳过的结果，重试只向未完成的会话补发。
+- **失败补发**：正文发送失败后自动重试，只向未完成的会话补发。
 - **消息呈现**：支持普通消息、单条或集体合并转发、深浅色截图、图片与视频，以及可选的转帖去重。
 - **按需解析与翻译**：手动或自动解析 `twitter.com` / `x.com` 链接；可选择 X 自带翻译（仅 FxTwitter）或 LLM 翻译。
-- **Agent 推送摘要**：可选开启，供模型通过工具按需查询本会话最近成功推送的摘要，推送时不主动追加 LLM 对话历史。
+- **Agent 推送摘要**：开启后，可向 AI 询问本会话最近成功推送的内容。
 
 ### WebUI 订阅管理
 
@@ -75,17 +64,17 @@
 
 旧版 AstrBot 若缺少 Plugin Pages API，插件主体仍可加载，订阅可继续通过聊天指令管理。
 
+群详情右上角的“清空订阅”可一次取消本群的全部订阅，确认后生效，不影响其他群和私聊；群聊本身不会被删除。
+
+订阅名单旁的“复制列表”可复制当前会话的全部推主 ID，以空格分隔（如 `AstrBot OpenAI`），可直接粘贴用于批量关注。搜索筛选不影响复制范围。
+
 ### Telegram
 
 支持 AstrBot 官方 `telegram` 适配器，可在私聊、群聊和超级群话题中使用订阅、定时推送、链接解析、翻译、截图及媒体发送。先按照 [AstrBot Telegram 接入文档](https://docs.astrbot.app/platform/telegram.html) 配置机器人；群聊需要接收普通链接时，按文档关闭 BotFather 的 Privacy mode，并确认机器人有发言与媒体发送权限。
 
-在目标聊天或话题内发送 `/twitter_follow 用户名` 建立订阅，使用 `/twitter_list` 查看，`/twitter_unfollow 用户名` 取消，`/twitter_push 开启` 或 `/twitter_push 关闭` 调整推送。超级群话题保留 AstrBot 的 `chat_id#话题ID`，不同话题独立管理，消息发送回原话题；私聊订阅同样独立。
+Telegram 按帖子发送图片相册，链接附于说明，长正文和视频单独发送；无需关闭 QQ 的合并转发设置。开启集体转发后，Telegram 会在轮询结束时逐帖发送。
 
-Telegram 按单条帖子发送图片相册，不同帖子和推主不会混入同一相册；原帖链接放入相册说明文字，仍遵循原帖链接开关。单张图片使用带说明的照片消息，超过 10 张图片按原顺序分批发送；文字模式下，正文能放入说明时与图片一起发送，超过说明长度限制时单独发送正文。图片选择、截图分页、主帖与引用帖顺序、代理预下载及独立媒体开关沿用原有逻辑，视频仍单独发送，失败时尝试发送视频链接。GIF 保留原有动画发送方式，相册失败时回退到现有普通消息发送方式。
-
-不需要关闭全局合并转发设置；订阅列表仍使用分段文字。若开启集体转发，Telegram 会在轮询结束后按帖子分别发送，QQ 继续使用合并转发。聊天测试指令和链接解析同样支持相册发送。
-
-Telegram Bot API 无法枚举机器人加入的所有群聊。可在 WebUI 点击“添加 Telegram 群组”，选择已配置的机器人实例，填写完整负数群 ID（例如 `-1001234567890`）。页面会检查机器人是否在群内且有发言权限，通过后保存群名并加入列表，无需先订阅推主。手动群组使用独立 KV `twitter_telegram_groups` 保存，即使暂无订阅或重载插件也会保留；重复添加更新同一个群，不会重复创建。接口不可用或机器人退群时仍保留群组供查看，暂不能新增订阅。
+Telegram 无法自动列出机器人加入的全部群聊。可在 WebUI 点击“添加 Telegram 群组”，选择机器人并填写完整负数群 ID。机器人需在群内且有发言权限。手动添加的群组即使暂无订阅或重载插件也会保留；机器人退群或暂时无法连接时，群组仍会显示，但暂不能新增订阅。
 
 手动添加的群组清空全部订阅后，可在群详情右上角点击“删除群组”，确认后从列表移除。此操作仅删除列表记录；机器人离线、退群或平台实例已移除时，也可删除空的手动群组记录。有订阅的群组需先移除全部订阅。
 
@@ -93,120 +82,96 @@ Telegram Bot API 无法枚举机器人加入的所有群聊。可在 WebUI 点�
 
 #### Telegram 视频发送限制
 
-Telegram 的视频直发同时受两层限制，任何一层超限都会改为发送说明与链接：
+公共 Bot API 的视频上传上限为 **50 MB**，插件默认与之对齐。发送更大视频需自建并启用 `--local` 的 Bot API 服务（最高 2000 MB），再提高插件的 Telegram 视频上限。
 
-- **Telegram Bot API 文件上限**：公共 Bot API 的单个上传文件上限为 50 MB，插件默认的 `twitter_telegram_video_max_size_mb=50` 与之对齐。只有自建并启用 `--local` 的 Bot API 服务才能提高该上限（最高 2000 MB），此时才能按需调高插件设置。
-- **AstrBot 适配器的写入超时**：AstrBot 的 `telegram` 适配器使用 python-telegram-bot 的默认请求参数构建客户端，带文件的上传请求走 `media_write_timeout`，默认 **20 秒**。AstrBot 目前没有暴露该配置项，插件也无法为单次发送覆盖它，所以视频文件必须在 20 秒内上传完成。
+AstrBot v4.29.4 的 Telegram 适配器默认上传写入超时为 **20 秒**，插件无法通过视频大小设置调整它。这是网络写入等待的超时，不是整个视频上传的总时限；网络不稳定或上传阻塞时，未达到文件大小上限的视频也可能发送失败。
 
-20 秒内能传完多少取决于**服务器上行带宽**，而不是推文本身：
-
-| 上行带宽 | 20 秒理论上限 | 建议上限（留 30% 余量） |
-| --- | --- | --- |
-| 5 Mbps | 12.5 MB | 8 MB |
-| 10 Mbps | 25 MB | 17 MB |
-| 20 Mbps | 50 MB | 35 MB |
-| 50 Mbps | 125 MB | 87 MB |
-
-因此即使把 `twitter_telegram_video_max_size_mb` 调到 50，在 10 Mbps 上行、经过代理或跨地域链路上，30 MB 左右的视频仍会因写入超时而降级为链接。日志表现为 `stage=platform_send` 且 `causes=TimedOut <- WriteTimeout <- WriteTimeout`；此时正文已正常送达，附加视频按最佳努力策略降级，游标照常推进，不会重发整条推文。
-
-处理建议：
-
-1. 按上表把 `twitter_telegram_video_max_size_mb` 调到上行带宽可承受的值，让超限视频直接发链接，避免每次白等 20 秒。
-2. 需要直发更大视频时，改用与 AstrBot 同机或同内网的自建 Bot API 服务，使上传不经过公网链路。
-
-### 失败重试与补发
-
-同一推主向多个会话推送时，普通消息、单条合并转发和集体转发都会保存各会话的处理结果。一个会话发送失败后，重试会跳过已成功发送或按配置跳过的会话；这些记录跨插件重载和数据源切换保留。
-
-每位推主每次最多接纳 **500 条**重试条目，窗口未完成前，同一推主的新批次等待。失败会话恢复、暂停或退订后，继续处理窗口；如果仍有未完成会话且推文详情不可用，则保留游标等待重试。已有订阅数据继续使用，旧回执按批恢复。
-
-已成功发送的转帖记录会在重试时补存，先于当前配置判断；暂时关闭转帖去重或转帖推送，不会抹去这次发送记录。配置跳过和仅排队的推文不会被记为实际发送。
+频繁失败时，可降低视频直发上限，或使用同机、同内网的自建 Bot API 服务。超限或发送失败的视频会改发说明与链接，不影响已发送的正文。
 
 ## 聊天指令
 
 指令作用于**当前会话**，除非下表另有说明。`<用户名>` 可填写推主 ID，关注时也可带 `@`。
 
-QQ（aiocqhttp）群订阅以真实群号为准。开启 AstrBot「按成员隔离会话」后，同群成员共享订阅、推送开关和推送摘要，WebUI 仍显示一个真实群聊。插件启动时会自动合并该平台旧的 `成员号_群号` 订阅，保留发送回执、最近历史和转帖去重记录，游标与重试窗口不变；选项冲突时优先采用已有群级配置，没有群级配置时采用按旧 UMO 排序的首个成员配置。
+QQ 群内成员共享订阅、推送开关和推送摘要，不受 AstrBot「按成员隔离会话」设置影响。旧的成员订阅会自动合并为群订阅，无需重新关注。
 
-| 指令 | 英文别名 | 作用 |
-| --- | --- | --- |
-| `/推特关注 <用户名> [r18] [媒体]` | `/twitter_follow` | 关注推主；可选允许 R18、仅推送含媒体的内容 |
-| `/推特批量关注 <用户1> <用户2> ... [r18] [媒体]` | `/twitter_batch_follow` | 批量关注，选项应用于本次所有推主 |
-| `/推特取关 <用户名>` | `/twitter_unfollow` | 取消当前会话中的订阅 |
-| `/推特批量取关 <用户1> <用户2> ...` | `/twitter_batch_unfollow` | 批量取消当前会话中的订阅 |
-| `/推特列表` | `/twitter_list` | 以分段合并转发列出当前会话的订阅 |
-| `/推特推送 <开启\|关闭>` | `/twitter_push` | 开关当前会话的全部推送 |
-| `/推特测试 <用户名>` | `/twitter_test` | 立即获取并发送该推主的最新推文 |
-| `/推特解析 <推文链接>` | `/twitter_parse` | 手动解析指定推文链接 |
-| `/推特清空订阅` | `/twitter_clear_all` | 清空所有会话的订阅；需要 AstrBot 管理员权限 |
+| 指令                                               | 英文别名                    | 作用                                        |
+| -------------------------------------------------- | --------------------------- | ------------------------------------------- |
+| `/推特关注 <用户名> [r18] [媒体]`                | `/twitter_follow`         | 关注推主；可选允许 R18、仅推送含媒体的内容  |
+| `/推特批量关注 <用户1> <用户2> ... [r18] [媒体]` | `/twitter_batch_follow`   | 批量关注，选项应用于本次所有推主            |
+| `/推特取关 <用户名>`                             | `/twitter_unfollow`       | 取消当前会话中的订阅                        |
+| `/推特批量取关 <用户1> <用户2> ...`              | `/twitter_batch_unfollow` | 批量取消当前会话中的订阅                    |
+| `/推特列表`                                      | `/twitter_list`           | 查看当前群聊或私聊关注的推主                |
+| `/推特推送 <开启\|关闭>`                          | `/twitter_push`           | 开关当前会话的全部推送                      |
+| `/推特测试 <用户名>`                             | `/twitter_test`           | 立即获取并发送该推主的最新推文              |
+| `/推特解析 <推文链接>`                           | `/twitter_parse`          | 手动解析指定推文链接                        |
+| `/推特清空订阅`                                  | `/twitter_clear_all`      | 清空所有会话的订阅；需要 AstrBot 管理员权限 |
 
-`/推特列表` 会把完整列表分成多个合并转发节点，每段最多 50 条订阅、正文不超过 1000 个字符；名称较长时每段可能少于 50 条。
+`/推特列表` 在 QQ 中显示为合并转发卡片，在 Telegram 中直接显示为文字；列表较长时自动分段。
 
 ## 配置参考
 
-在 AstrBot 插件配置页面设置以下选项。默认值与当前 `_conf_schema.json` 一致；旧版顶层扁平配置仍可读取。
+在 AstrBot 插件配置页面设置以下选项，下表列出默认值。
 
-| 常用配置 | 默认值 | 用途 |
-| --- | --- | --- |
-| `twitter_data_provider` | `nitter` | 选择 `nitter` 或 `fxtwitter` |
-| `twitter_nitter_url` | 空 | 自定义 Nitter 镜像地址；只在 Nitter 模式使用 |
-| `twitter_fxtwitter_api_base` | `https://api.fxtwitter.com` | FxTwitter API 地址；只在 FxTwitter 模式使用 |
-| `twitter_poll_interval` | `5` | 轮询间隔，单位为分钟 |
-| `twitter_poll_max_tweets_per_user` | `5` | 每位推主每轮最多推送的条数 |
-| `twitter_text_render_mode` | `text` | `text` 文字，或 `screenshot` 截图 |
-| `twitter_translate_enabled` | `false` | 是否翻译推文正文 |
+| 常用配置                             | 默认值                        | 用途                                         |
+| ------------------------------------ | ----------------------------- | -------------------------------------------- |
+| `twitter_data_provider`            | `nitter`                    | 选择 `nitter` 或 `fxtwitter`             |
+| `twitter_nitter_url`               | 空                            | 自定义 Nitter 镜像地址；只在 Nitter 模式使用 |
+| `twitter_fxtwitter_api_base`       | `https://api.fxtwitter.com` | FxTwitter API 地址；只在 FxTwitter 模式使用  |
+| `twitter_poll_interval`            | `5`                         | 轮询间隔，单位为分钟                         |
+| `twitter_poll_max_tweets_per_user` | `5`                         | 每位推主每轮最多推送的条数                   |
+| `twitter_text_render_mode`         | `text`                      | `text` 文字，或 `screenshot` 截图        |
+| `twitter_translate_enabled`        | `false`                     | 是否翻译推文正文                             |
 
 <details>
 <summary>展开查看全部配置项</summary>
 
 ### 数据源与网络
 
-| 配置项 | 默认值 | 说明 |
-| --- | --- | --- |
-| `twitter_data_provider` | `nitter` | `nitter` 抓取 HTML；`fxtwitter` 读取 JSON API |
-| `twitter_nitter_url` | 空 | 自定义 Nitter 镜像地址 |
-| `twitter_fxtwitter_api_base` | `https://api.fxtwitter.com` | FxTwitter API 基础地址 |
-| `twitter_proxy` | 空 | 可选代理，例如 `http://127.0.0.1:7890` |
-| `twitter_pre_download_media` | `false` | 配置代理后预下载图片与视频封面；失败时回退原 URL |
-| `twitter_poll_interval` | `5` | 轮询间隔（分钟），建议不低于 3 |
-| `twitter_poll_max_tweets_per_user` | `5` | 每位推主每轮最多推送条数，实际范围为 1–500 |
+| 配置项                               | 默认值                        | 说明                                                                        |
+| ------------------------------------ | ----------------------------- | --------------------------------------------------------------------------- |
+| `twitter_data_provider`            | `nitter`                    | `nitter` 抓取 HTML；`fxtwitter` 读取 JSON API                           |
+| `twitter_nitter_url`               | 空                            | 自定义 Nitter 镜像地址                                                      |
+| `twitter_fxtwitter_api_base`       | `https://api.fxtwitter.com` | FxTwitter API 基础地址                                                      |
+| `twitter_proxy`                    | 空                            | 可选代理，例如 `http://127.0.0.1:7890`                                    |
+| `twitter_pre_download_media`       | `false`                     | 配置代理后预下载图片与视频封面；失败时回退原 URL                            |
+| `twitter_poll_interval`            | `5`                         | 轮询间隔（分钟），建议不低于 3                                              |
+| `twitter_poll_max_tweets_per_user` | `5`                         | 每位推主每轮最多推送条数，实际范围为 1–500                                 |
+| `twitter_detailed_diagnostics`     | `false`                     | 详细诊断日志；开启后配合 AstrBot DEBUG 级别查看逐请求、逐页、逐图和上传过程 |
 
 ### 消息格式
 
-| 配置项 | 默认值 | 说明 |
-| --- | --- | --- |
-| `twitter_use_node` | `true` | QQ 单条推文使用合并转发；Telegram 始终按帖子发送图片相册或单张照片，视频单独发送 |
-| `twitter_no_text` | `false` | 推文含媒体时不输出文字 |
-| `twitter_text_render_mode` | `text` | `text` 文字，或 `screenshot` 截图 |
-| `twitter_screenshot_theme` | `dark` | 截图使用 `dark` 或 `light` 主题 |
-| `twitter_send_media_separately` | `true` | 正文或截图之外继续发送原图、视频及视频降级链接 |
-| `twitter_image_quality` | `orig` | `large` 缩略图，或 `orig` 原图 |
-| `twitter_video_max_size_mb` | `256` | QQ 等非 Telegram 平台的视频直发大小上限（MB），超过后发送链接 |
-| `twitter_telegram_video_max_size_mb` | `50` | Telegram 视频文件直发大小上限（MB），超过后发送说明和链接；公共 Bot API 限制为 50 MB，更大文件需自建并启用 `--local` 的 Bot API 服务（最高 2000 MB）后调高。另受 AstrBot 适配器约 20 秒上传写入超时限制，详见 [Telegram 视频发送限制](#telegram-视频发送限制) |
-| `twitter_collective_forward` | `false` | 将一轮轮询的多条推文汇总为合并转发；需同时开启 `twitter_use_node` |
-| `twitter_collective_max_authors` | `5` | 单条集体转发消息中的最多推主数 |
-| `twitter_include_tweet_link` | `true` | 在推送、测试和解析消息末尾附带帖子链接 |
+| 配置项                                 | 默认值    | 说明                                                                                                                                             |
+| -------------------------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `twitter_use_node`                   | `true`  | QQ 使用合并转发；Telegram 按帖子发送相册或单张照片，长正文和视频单独发送                                                                         |
+| `twitter_no_text`                    | `false` | 推文含媒体时不输出文字                                                                                                                           |
+| `twitter_text_render_mode`           | `text`  | `text` 文字，或 `screenshot` 截图                                                                                                            |
+| `twitter_screenshot_theme`           | `dark`  | 截图使用 `dark` 或 `light` 主题                                                                                                              |
+| `twitter_send_media_separately`      | `true`  | 正文或截图之外继续发送原图、视频及视频降级链接                                                                                                   |
+| `twitter_image_quality`              | `orig`  | `large` 缩略图，或 `orig` 原图                                                                                                               |
+| `twitter_video_max_size_mb`          | `256`   | QQ 等非 Telegram 平台的视频直发大小上限（MB），超过后发送链接                                                                                    |
+| `twitter_telegram_video_max_size_mb` | `50`    | 视频超限时改发链接。公共 API 上限 50 MB；更大文件需自建 `--local` Bot API（最高 2000 MB）。详见 [Telegram 视频发送限制](#telegram-视频发送限制) |
+| `twitter_collective_forward`         | `false` | 将一轮轮询的多条推文汇总为合并转发；需同时开启 `twitter_use_node`                                                                              |
+| `twitter_collective_max_authors`     | `5`     | 单条集体转发消息中的最多推主数                                                                                                                   |
+| `twitter_include_tweet_link`         | `true`  | 在推送、测试和解析消息末尾附带帖子链接                                                                                                           |
 
-Telegram 的视频上限独立于 QQ，适用于自动推送、集体转发、测试指令和链接解析，也适用于引用帖的视频。新设置未配置时使用 50 MB；自建 API 后可按需调高，单纯调高插件设置不能突破公共 API 限制。文件大小无法探测或属于流媒体时仍沿用尝试发送、失败后降级链接的逻辑。照片和相册的图片选择、大小限制不受此设置影响。
-
-除插件自身的 MB 上限外，视频上传还受 AstrBot 适配器约 20 秒的写入超时约束，上行带宽不足时更小的视频也会降级为链接，详见 [Telegram 视频发送限制](#telegram-视频发送限制)。
+Telegram 视频上限独立于 QQ，对引用帖、测试和链接解析同样生效，不影响照片限制。大小无法探测时仍尝试发送，更多说明见 [Telegram 视频发送限制](#telegram-视频发送限制)。
 
 ### 内容与翻译
 
-| 配置项 | 默认值 | 说明 |
-| --- | --- | --- |
-| `twitter_include_retweets` | `true` | 轮询与测试时包含转帖 |
-| `twitter_deduplicate_retweets` | `false` | 同一原帖被多个推主转发时按会话去重 |
-| `twitter_link_recognition_enabled` | `auto` | `auto` 自动解析、`command` 仅指令解析、`off` 关闭 |
-| `twitter_agent_query_enabled` | `false` | 允许 Agent 调用 `twitter_recent_pushes` 查询本会话推送摘要 |
-| `twitter_translate_enabled` | `false` | 自动翻译推文正文 |
-| `twitter_translate_method` | `llm` | `x` 使用 X 自带翻译，`llm` 使用 LLM 翻译；旧配置默认使用 LLM |
-| `twitter_translate_native_lang` | `zh` | X 翻译目标语言代码，如 `zh`、`ja`、`en`；仅选择 X 翻译时显示 |
-| `twitter_translate_target_lang` | `简体中文` | LLM 翻译目标语言；仅选择 LLM 翻译时显示 |
-| `twitter_translate_provider_id` | 空 | 仅选择 LLM 翻译时显示；留空时依次尝试当前会话与第一个可用 Provider |
-| `twitter_translate_timeout_seconds` | `60` | 单条推文翻译的总时限（秒），超时回退原文 |
-| `twitter_translate_custom_prompt_enabled` | `false` | 使用自定义翻译 system prompt；仅选择 LLM 翻译时显示 |
-| `twitter_translate_custom_prompt` | 内置提示词 | 自定义提示词，支持 `{target_lang}` 变量；仅选择 LLM 翻译时显示 |
+| 配置项                                      | 默认值       | 说明                                                               |
+| ------------------------------------------- | ------------ | ------------------------------------------------------------------ |
+| `twitter_include_retweets`                | `true`     | 轮询与测试时包含转帖                                               |
+| `twitter_deduplicate_retweets`            | `false`    | 同一原帖被多个推主转发时按会话去重                                 |
+| `twitter_link_recognition_enabled`        | `auto`     | `auto` 自动解析、`command` 仅指令解析、`off` 关闭            |
+| `twitter_agent_query_enabled`             | `false`    | 允许 Agent 调用 `twitter_recent_pushes` 查询本会话推送摘要       |
+| `twitter_translate_enabled`               | `false`    | 自动翻译推文正文                                                   |
+| `twitter_translate_method`                | `llm`      | `x` 使用 X 自带翻译，`llm` 使用 LLM 翻译；旧配置默认使用 LLM   |
+| `twitter_translate_native_lang`           | `zh`       | X 翻译目标语言代码，如 `zh`、`ja`、`en`；仅选择 X 翻译时显示 |
+| `twitter_translate_target_lang`           | `简体中文` | LLM 翻译目标语言；仅选择 LLM 翻译时显示                            |
+| `twitter_translate_provider_id`           | 空           | 仅选择 LLM 翻译时显示；留空时依次尝试当前会话与第一个可用 Provider |
+| `twitter_translate_timeout_seconds`       | `60`       | 单条推文翻译的总时限（秒），超时回退原文                           |
+| `twitter_translate_custom_prompt_enabled` | `false`    | 使用自定义翻译 system prompt；仅选择 LLM 翻译时显示                |
+| `twitter_translate_custom_prompt`         | 内置提示词   | 自定义提示词，支持 `{target_lang}` 变量；仅选择 LLM 翻译时显示   |
 
 **翻译方式说明**：X 自带翻译仅支持 FxTwitter 数据源；使用 Nitter 时选择此方式不翻译。接口未返回译文或翻译失败时保留原文，不自动调用 LLM。上游不支持 **X Article 长文章正文翻译**，文章正文仍显示原文；如需翻译文章，请选择 LLM 翻译并配置可用的 Provider。
 
@@ -216,20 +181,23 @@ Telegram 的视频上限独立于 QQ，适用于自动推送、集体转发、�
 
 - **Nitter 镜像**：nitter镜像站目前已不可用 2026/8/27；需要自行部署时可参考 [Nitter 项目](https://github.com/zedeus/nitter)及[本地部署教程](https://mib7kzqsrf5.feishu.cn/wiki/O1ztwWl3GiBc4AknKvIcyaKsnFb?from=from_copylink)。
 - **FxTwitter 数据**：FxTwitter 是第三方公开 JSON API，并非 X/Twitter 官方 API；接口、限流和可用性由其服务决定。也可参考 [FxTwitter 官方仓库（FxEmbed）](https://github.com/FxEmbed/FxEmbed) 自行部署，并将 `twitter_fxtwitter_api_base` 设置为自建实例的 API 地址。
-- **历史补发范围**：已进入重试窗口的推文按保存的条目继续尝试；尚未接纳、且数据源已删除或不再返回的推文，无法保证补齐。停机时间过长或数据源分页不足也会影响历史补发范围。
-- **重复发送边界**：群消息发送与本地状态保存无法原子提交。发送成功后进程被强制终止，或本地 KV 持续写入失败时，下次轮询可能再次发送。
+- **历史补发范围**：已获取但未完成推送的帖子会继续尝试；停机过久、帖子被删除或数据源不再提供时，无法保证补齐全部历史。
+- **重复发送**：发送后进程异常退出或保存进度失败，恢复后可能重复发送少量内容。
 - **会话隔离**：私聊和群聊分别保存订阅；在一处取关或关闭推送，不影响其他会话。
-- **截图头像缓存**：截图模式会在 AstrBot 插件数据目录的 `avatar_cache` 中保存有界头像缓存，最多 200 项、总计 16 MiB；它不包含推文原图或视频，也不受独立媒体发送开关控制。
+- **截图头像缓存**：截图模式会在本地缓存头像，缓存有容量限制，不保存推文原图或视频。
 
-## Telegram 媒体超时排查
+## 遇到问题时
 
-排查时将 AstrBot 日志级别设为 DEBUG，单次复现后按 `[twitter:` 查找日志锚点，再按 `trace` 关联同一次操作。正常阶段使用 DEBUG，异常保留 WARN/ERROR。日志不新增消息正文、Bot Token、完整媒体 URL 或分页游标；`target`、`media` 和 `cursor` 使用哈希标记，同值可关联。
+正文推送失败时先等待下一轮自动重试；视频频繁变成链接时，可先降低 Telegram 视频直发上限，并检查网络连接。插件的代理设置不会自动应用于 Telegram 发送。
 
-常用锚点：`timeline.page.start/result` 与 `timeline.cursor.repeated` 定位分页停滞；`fx.request.start/response/failed` 查看 HTTP 状态和耗时；`render.start/complete/fallback` 定位截图；`video.size` 查看大小探测和实际上限；`tg.batch.*`、`tg.upload.*`、`platform.send.*` 定位发送；`video.link.sent` 确认视频链接降级成功；`poll.tweet.result`、`receipts.save.complete`、`cursor.*` 区分已发送、排队、失败和保存进度。`poll.author.end` 只表示检查结束，不能单独作为发送成功凭据；`cursor.*.result` 的 `accepted` 表示订阅服务是否接纳此次提交，`receipts.save.complete` 表示保存调用无异常结束，均不代表每次都新增了 KV 写入。
+需要提交问题时：
 
-失败日志中的 `stage`、`elapsed`、`bytes` 和 `causes` 可帮助定位问题。相册的 `prepare_images` 表示获取图片阶段，`send_photo` / `send_media_group` 表示文件已准备好、正在调用 Telegram；视频的 `platform_send` 包括适配器内部的下载和发送，不能仅凭该阶段区分二者。
+1. 在插件基础设置中开启“详细诊断日志”，将 AstrBot 日志级别设为 DEBUG，保存并重载插件。
+2. 重现一次问题，记录发生时间和执行的指令。
+3. 提交问题描述、AstrBot 与插件版本，以及对应时段的日志。
+4. 排查结束后关闭详细诊断日志。
 
-`ConnectTimeout`、`WriteTimeout`、`ReadTimeout`、`PoolTimeout` 分别提示连接、上传写入、等待响应、等待连接池超时；底层异常未保留时仍需结合服务器网络测试判断。请在 AstrBot 所在容器或进程的网络环境中检查 Telegram API 和媒体源的可达性；`twitter_proxy` 配置不会自动应用到 Telegram SDK 上传。超时后服务端可能已收件，重测前先核对聊天记录。
+日志字段和进度说明见[诊断日志参考](./docs/diagnostics.md)。
 
 ## 参考与反馈
 

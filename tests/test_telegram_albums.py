@@ -221,7 +221,7 @@ async def test_album_failure_falls_back_without_losing_primary_receipt(albums, m
         on_primary_sent=lambda: receipts.append("sent"),
     )
     assert receipts == ["sent"]
-    assert [part for part in ordinary[0][1] if isinstance(part, Image)] == images
+    assert [part for _target, request in ordinary for part in request if isinstance(part, Image)] == images
 
 
 @pytest.mark.asyncio
@@ -234,7 +234,7 @@ async def test_gif_keeps_existing_animation_delivery(albums, header, count):
         TG_GROUP, chain(images), "tester", {"tweet_id": "101"},
     )
     assert not sent
-    assert [part for part in ordinary[0][1] if isinstance(part, Image)] == images
+    assert [part for _target, request in ordinary for part in request if isinstance(part, Image)] == images
 
 
 @pytest.mark.asyncio

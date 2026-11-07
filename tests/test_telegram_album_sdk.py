@@ -6,6 +6,7 @@ import sys
 
 import httpx
 import pytest
+from test_platform_backoff import clock_for
 from test_telegram_support import (
     TG_TOPIC,
     Image,
@@ -52,6 +53,41 @@ class AlbumRequest(BaseRequest):
             }}
             result = [message] * len(params["media"]) if "media" in params else message
         return 200, json.dumps({"ok": True, "result": result}).encode()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [1, 2])
+async def test_real_sdk_429_retry_preserves_multipart_content(plugin_env, monkeypatch, tmp_path, count):
+    _module, make, _data, ordinary, _fail = plugin_env
+    plugin = make()
+    clock, _module = clock_for(plugin, monkeypatch)
+    path = tmp_path / "photo.png"
+    path.write_bytes(b"image content")
+
+    async def convert(_image):
+        return str(path)
+
+    class ThrottledRequest(AlbumRequest):
+        async def do_request(self, url, method, request_data=None, **kwargs):
+            result = await super().do_request(url, method, request_data=request_data, **kwargs)
+            if not url.endswith("/getMe") and len(self.uploads) == 1:
+                return 429, json.dumps({
+                    "ok": False, "error_code": 429, "description": "Too Many Requests",
+                    "parameters": {"retry_after": 3},
+                }).encode()
+            return result
+
+    monkeypatch.setattr(Image, "convert_to_file_path", convert, raising=False)
+    transport = ThrottledRequest()
+    async with ExtBot(token="123456:TEST_TOKEN", request=transport, get_updates_request=transport) as client:
+        plugin.context.platform_manager.platform_insts[0].client = client
+        assert await plugin.delivery_service.telegram_albums.send(
+            TG_TOPIC, [Image(file=str(path)) for _ in range(count)], "link",
+        )
+    assert clock.sleeps == [3] and len(transport.uploads) == 2
+    assert not ordinary
+    for _params, files in transport.uploads:
+        assert [file[1] for file in files.values()] == [b"image content"] * count
 
 
 @pytest.mark.asyncio

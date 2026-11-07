@@ -12,8 +12,9 @@ from astrbot.api.event import MessageChain
 import astrbot.api.message_components as Comp
 from astrbot.api.message_components import Node, Nodes
 
-from ..twitter_diagnostics import anchor, exception_type_chain, reference, traced
+from ..twitter_diagnostics import anchor, detail_debug, exception_type_chain, reference, traced
 from .platform_support import is_telegram_target
+from .platform_send_backoff import PlatformRateLimited, PlatformSendBackoff
 from .subscription_service import DeliveredTweet, RecentDelivery, SkippedTweet, SubscriptionService
 from .telegram_album_service import TelegramAlbumService
 from .tweet_message_service import TranslationCycleState, TweetMessageChain, TweetMessageService
@@ -102,7 +103,8 @@ class TweetDeliveryService:
         self.subscriptions = subscriptions
         self.messages = messages
         self.settings = settings
-        self.telegram_albums = TelegramAlbumService(context)
+        self.send_backoff = PlatformSendBackoff()
+        self.telegram_albums = TelegramAlbumService(context, self.send_backoff)
         self._collected_tweets: dict[str, list[CachedTweet]] = {}
         self._pending_retweet_seen: dict[str, set[str]] = {}
         self._collected_skips: list[SkippedTweet] = []
@@ -210,26 +212,54 @@ class TweetDeliveryService:
         umo: str,
         message_chain: MessageChain,
     ) -> None:
-        """将明确的 False 转为发送异常，保留其他无异常返回的既有行为。"""
+        """检查发送结果；TG 按组件和文本分段重试，不重放成功的前缀。"""
         started = perf_counter()
-        logger.debug(anchor(
+        detail_debug(
+            logger, self,
             "platform.send.start", target=reference(umo),
             parts=len(message_chain.chain), types=[type(part).__name__ for part in message_chain.chain],
-        ))
+        )
         try:
-            result = await self.context.send_message(umo, message_chain)
+            requests = (
+                self._telegram_request_chains(message_chain)
+                if is_telegram_target(self.context, umo) else [message_chain]
+            )
+            for request in requests:
+                result = await self.send_backoff.run(
+                    umo, lambda request=request: self.context.send_message(umo, request),
+                )
+                if result is False:
+                    raise RuntimeError("Context.send_message returned False")
         except BaseException as exc:
             logger.debug(anchor(
                 "platform.send.failed", target=reference(umo), causes=exception_type_chain(exc),
                 elapsed=round(perf_counter() - started, 2),
             ))
             raise
-        logger.debug(anchor(
-            "platform.send.result", target=reference(umo), ok=result is not False,
+        detail_debug(
+            logger, self,
+            "platform.send.result", target=reference(umo), ok=True,
             elapsed=round(perf_counter() - started, 2),
-        ))
-        if result is False:
-            raise RuntimeError("Context.send_message returned False")
+        )
+
+    @staticmethod
+    def _telegram_request_chains(message_chain: MessageChain) -> list[MessageChain]:
+        """每段最多 4096 个 UTF-16 单位，避免适配器内部再次拆分文本。"""
+        requests = []
+        for component in message_chain.chain:
+            if not isinstance(component, Comp.Plain):
+                requests.append(MessageChain(chain=[component]))
+                continue
+            text = component.text
+            start = units = 0
+            for index, char in enumerate(text):
+                char_units = 2 if ord(char) > 0xFFFF else 1
+                if units + char_units > 4096:
+                    requests.append(MessageChain(chain=[Comp.Plain(text[start:index])]))
+                    start, units = index, 0
+                units += char_units
+            requests.append(MessageChain(chain=[Comp.Plain(text[start:])]))
+        return requests
 
     async def _record_recent_delivery(
         self, umo: str, username: str, tweet_info: dict,
@@ -252,20 +282,27 @@ class TweetDeliveryService:
         """发送普通消息；媒体失败时优先补发文字，再逐图尝试。"""
         if not chain:
             return True
-        try:
-            await self._send_message_checked(umo, MessageChain(chain=chain))
-            if on_primary_sent is not None:
-                on_primary_sent()
-            return True
-        except Exception as exc:
-            logger.warning(f"包含媒体的消息发送失败，尝试保留文字内容: {exc}")
-
         required_images = getattr(chain, "required_images", ())
+        # TG 已按组件发送。先确认必需截图，再发送链接和附加媒体，避免后者
+        # 中断时丢失已经完整送达的正文回执，也避免失败后重发成功的截图。
+        if not (required_images and is_telegram_target(self.context, umo)):
+            try:
+                await self._send_message_checked(umo, MessageChain(chain=chain))
+                if on_primary_sent is not None:
+                    on_primary_sent()
+                return True
+            except PlatformRateLimited:
+                return False
+            except Exception as exc:
+                logger.warning(f"包含媒体的消息发送失败，尝试保留文字内容: {exc}")
+
         if required_images:
             all_pages_sent = True
             for image in required_images:
                 try:
                     await self._send_message_checked(umo, MessageChain(chain=[image]))
+                except PlatformRateLimited:
+                    return False
                 except Exception as exc:
                     all_pages_sent = False
                     logger.error(f"正文截图分页发送失败，保留整条推文重试: {exc}")
@@ -299,6 +336,8 @@ class TweetDeliveryService:
                 text_sent = True
                 if on_primary_sent is not None:
                     on_primary_sent()
+            except PlatformRateLimited:
+                return False
             except Exception as exc:
                 logger.error(f"媒体降级后的文字消息仍发送失败: {exc}")
 
@@ -312,6 +351,8 @@ class TweetDeliveryService:
                 image_sent = True
                 if not text_parts and on_primary_sent is not None:
                     on_primary_sent()
+            except PlatformRateLimited:
+                return text_sent
             except Exception as exc:
                 image_url = getattr(image_part, "file", "") or getattr(
                     image_part,
@@ -332,10 +373,11 @@ class TweetDeliveryService:
         *, on_primary_sent: Callable[[], None] | None = None,
     ) -> bool:
         """按帖子分组图片，链接放入说明；沿用正文回执及逐图降级规则。"""
-        logger.debug(anchor(
+        detail_debug(
+            logger, self,
             "tg.tweet.start", author=username, tweet=str(tweet_info.get("tweet_id") or ""),
             target=reference(umo), parts=len(chain),
-        ))
+        )
         images = [part for part in chain if isinstance(part, Comp.Image)]
         if not images or any(not isinstance(part, (Comp.Image, Comp.Plain)) for part in chain):
             return await self.send_plain_chain_resilient(
@@ -376,11 +418,12 @@ class TweetDeliveryService:
         for offset in range(0, len(images), 10):
             batch = images[offset:offset + 10]
             batch_caption = caption if offset == 0 else link
-            logger.debug(anchor(
+            detail_debug(
+                logger, self,
                 "tg.batch.start", tweet=str(tweet_info.get("tweet_id") or ""),
                 target=reference(umo), batch=offset // 10 + 1, images=len(batch),
                 caption_units=len(batch_caption.encode("utf-16-le")) // 2,
-            ))
+            )
 
             def confirm_batch(batch=batch, offset=offset) -> None:
                 remaining.difference_update(id(image) for image in batch)
@@ -390,7 +433,10 @@ class TweetDeliveryService:
                 elif not body or body_sent or (offset == 0 and not separate_body):
                     confirm_primary()
 
-            sent = await self.telegram_albums.send(umo, batch, batch_caption)
+            try:
+                sent = await self.telegram_albums.send(umo, batch, batch_caption)
+            except PlatformRateLimited:
+                return primary_sent
             if not sent:
                 logger.debug(anchor("tg.batch.fallback", batch=offset // 10 + 1, target=reference(umo)))
                 # 仅补发当前失败批次，不重发已成功的相册。
@@ -403,11 +449,12 @@ class TweetDeliveryService:
                 )
             if sent:
                 confirm_batch()
-            logger.debug(anchor(
+            detail_debug(
+                logger, self,
                 "tg.batch.result", batch=offset // 10 + 1, ok=sent, required_remaining=len(remaining),
-            ))
+            )
 
-        logger.debug(anchor("tg.tweet.result", target=reference(umo), primary_sent=primary_sent))
+        detail_debug(logger, self, "tg.tweet.result", target=reference(umo), primary_sent=primary_sent)
         return primary_sent
 
     @traced
@@ -419,14 +466,17 @@ class TweetDeliveryService:
         """发送视频组件，失败时回退为链接。"""
         started = perf_counter()
         media_ref = reference(getattr(video_component, "file", "") or getattr(video_component, "url", ""))
-        logger.debug(anchor("video.start", target=reference(umo), media=media_ref))
+        detail_debug(logger, self, "video.start", target=reference(umo), media=media_ref)
         try:
             await self._send_message_checked(
                 umo,
                 MessageChain(chain=[video_component]),
             )
-            logger.debug(anchor("video.sent", target=reference(umo), media=media_ref))
+            detail_debug(logger, self, "video.sent", target=reference(umo), media=media_ref)
             return True
+        except PlatformRateLimited:
+            # 已明确拒收，不能再发送链接绕过冷却。
+            return False
         except Exception as exc:
             # 平台调用包含媒体准备与发送；异常链可识别 SDK 包装的 HTTP 超时。
             logger.warning(
@@ -724,10 +774,11 @@ class TweetDeliveryService:
         """
         receipt_recorded = False
         started = perf_counter()
-        logger.debug(anchor(
+        detail_debug(
+            logger, self,
             "delivery.start", author=username, tweet=str(tweet_info.get("tweet_id") or ""),
             target=reference(umo), telegram=is_telegram_target(self.context, umo),
-        ))
+        )
 
         def record_sent() -> None:
             nonlocal receipt_recorded
@@ -749,10 +800,11 @@ class TweetDeliveryService:
                     if is_telegram_target(self.context, umo) else None
                 ),
             )
-            logger.debug(anchor(
+            detail_debug(
+                logger, self,
                 "delivery.prepared", parts=len(chain),
                 elapsed=round(perf_counter() - started, 2),
-            ))
+            )
             if not chain:
                 record_sent()
                 return True
@@ -776,6 +828,8 @@ class TweetDeliveryService:
                             if not nodes:
                                 record_sent()
                     sent = bool(nodes) or video_sent
+                except PlatformRateLimited:
+                    raise
                 except Exception as exc:
                     logger.warning(
                         f"合并转发失败，回退到普通消息: {exc}"
@@ -814,10 +868,11 @@ class TweetDeliveryService:
                 logger.info(f"推文已推送至 {umo}")
             else:
                 logger.error(f"推文主要内容未能推送至 {umo}")
-            logger.debug(anchor(
+            detail_debug(
+                logger, self,
                 "delivery.result", author=username, tweet=str(tweet_info.get("tweet_id") or ""),
                 target=reference(umo), ok=sent, elapsed=round(perf_counter() - started, 2),
-            ))
+            )
             return sent
         except Exception as exc:
             logger.error(
@@ -1007,6 +1062,10 @@ class TweetDeliveryService:
                                 f"集体转发已推送至 {umo} "
                                 f"{batch_label}共 {len(nodes)} 个节点"
                             )
+                        except PlatformRateLimited:
+                            for cached_tweet, _tweet_nodes, _tweet_videos in prepared:
+                                record_result(umo, cached_tweet, False)
+                            continue
                         except Exception as exc:
                             logger.warning(
                                 f"集体合并转发失败，回退逐条发送: {exc}"

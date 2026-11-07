@@ -64,6 +64,12 @@ class TwitterWebUIController:
                 ["POST"],
                 "移除 Twitter 订阅",
             ),
+            (
+                "subscriptions/group-clear",
+                self.clear_group_subscriptions,
+                ["POST"],
+                "清空指定群聊的 Twitter 订阅",
+            ),
         )
         for endpoint, handler, methods, description in routes:
             self.context.register_web_api(
@@ -688,6 +694,20 @@ class TwitterWebUIController:
         if not count:
             return error_response("这个群当前没有订阅", status_code=404)
         return json_response({"saved": True, "updated": count})
+
+    async def clear_group_subscriptions(self):
+        payload = await self._payload()
+        if payload is None:
+            return error_response("请求内容必须是 JSON 对象", status_code=400)
+        parsed = self._parse_umo(payload.get("umo"))
+        if parsed is None or parsed[1] != "GroupMessage":
+            return error_response("群聊 UMO 格式不正确", status_code=400)
+        try:
+            result = await self.plugin.subscription_service.clear_session(payload["umo"])
+        except Exception:  # noqa: BLE001 - 保存失败不能当作清空成功。
+            logger.error("WebUI 清空群聊订阅失败")
+            return error_response("清空订阅失败，请重试", status_code=500)
+        return json_response({"saved": True, "removed": result["relations"]})
 
     async def remove_subscription(self):
         payload = await self._payload()

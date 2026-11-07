@@ -9,11 +9,24 @@
     totals: {groups: 1, authors: 1, subscriptions: 1, active: 1}};
   let finishRequest;
   let failNext = false;
+  let failClearNext = false;
+  const clearCalls = [];
   const calls = [];
   window.AstrBotPluginPage = {
     ready: async () => ({isDark: false}),
     apiGet: async () => structuredClone(overview),
     apiPost: async (endpoint, payload) => {
+      if (endpoint === "subscriptions/group-clear") {
+        clearCalls.push(payload);
+        if (failClearNext) {
+          failClearNext = false;
+          throw new Error("模拟清空失败");
+        }
+        const target = overview.groups.find((item) => item.umo === payload.umo);
+        const removed = target.subscriptions.length;
+        target.subscriptions = [];
+        return {saved: true, removed};
+      }
       if (endpoint === "subscriptions/recent") return {items: [
         {tweet_id: "123", text: attack, delivered_at: "2026-09-22T00:00:00Z"},
         {tweet_id: `123\" onclick=\"bad()`, text: attack, delivered_at: "invalid"},
@@ -148,6 +161,98 @@
       assert(select(".batch-entry p").textContent.includes(attack), "接口错误应显示原始文本");
       select("#batch-close").click();
       pass("接口错误内容只显示为文本");
+
+      await waitFor(() => !select("#refresh-button").disabled);
+      group.subscriptions.at(-1).enabled = false;
+      select("#refresh-button").click();
+      await waitFor(() => !select("#refresh-button").disabled);
+      fill("#author-search", "AstrBot");
+      const expectedCopy = group.subscriptions.map((item) => item.username).join(" ");
+      const clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+      const originalExecCommand = document.execCommand;
+      const copiedTexts = [];
+      const setClipboard = (value) => Object.defineProperty(navigator, "clipboard", {configurable: true, value});
+      let finishCopy;
+      setClipboard({writeText: async (text) => {
+        copiedTexts.push(text);
+        await new Promise((resolve) => { finishCopy = resolve; });
+      }});
+      select("[data-copy-subscriptions]").click();
+      await waitFor(() => Boolean(finishCopy));
+      assert(select("[data-copy-subscriptions]").disabled, "复制期间避免重复请求");
+      finishCopy();
+      await waitFor(() => !select("[data-copy-subscriptions]").disabled);
+      assert(copiedTexts[0] === expectedCopy, "复制完整用户名列表，以单个空格分隔，包含隐藏及暂停项");
+      assert(!copiedTexts[0].includes("@") && !copiedTexts[0].includes("\n"), "复制内容不含 @ 或换行");
+      assert(select("#toast").textContent.includes(`已复制 ${group.subscriptions.length} 个`), "显示实际复制数量");
+      pass("复制全部推主 ID，以空格分隔，不受搜索和推送开关影响");
+
+      document.execCommand = (command) => {
+        assert(command === "copy", "兼容路径只能执行复制");
+        copiedTexts.push(document.activeElement.value);
+        return true;
+      };
+      for (const clipboard of [undefined, {writeText: async () => { throw new Error("clipboard denied"); }}]) {
+        const beforeCopy = copiedTexts.length;
+        setClipboard(clipboard);
+        select("[data-copy-subscriptions]").click();
+        await waitFor(() => !select("[data-copy-subscriptions]").disabled);
+        assert(copiedTexts.length === beforeCopy + 1 && copiedTexts.at(-1) === expectedCopy, "HTTP 或剪贴板权限受限时使用选中文本复制");
+        assert(!select("body > textarea"), "复制完成后移除临时文本框");
+      }
+      pass("浏览器无 Clipboard API 或拒绝权限时兼容复制，且清理临时元素");
+
+      document.execCommand = () => false;
+      select("[data-copy-subscriptions]").click();
+      await waitFor(() => !select("[data-copy-subscriptions]").disabled);
+      assert(select("#toast").textContent.includes("复制失败"), "两种复制方式均失败时不能提示成功");
+      assert(!select("body > textarea"), "失败时也要移除临时文本框");
+      pass("剪贴板不可用时显示失败并恢复按钮");
+      document.execCommand = originalExecCommand;
+      setClipboard({writeText: async (text) => { copiedTexts.push(text); }});
+
+      overview.groups.push({umo: "bot:GroupMessage:200", group_id: "200", group_name: "其他群",
+        platform_id: "bot", available: true, subscriptions: [{username: "keep", screen_name: "Keep"}]});
+      overview.other_sessions.push({umo: "bot:FriendMessage:300", session_id: "300", session_name: "私聊",
+        platform_id: "bot", subscriptions: [{username: "private", screen_name: "Private"}]});
+      fill("#author-search", attack);
+      const beforeClear = group.subscriptions.length;
+      select("[data-clear-group-subscriptions]").click();
+      assert(select("#remove-dialog").open, "清空前必须弹出确认框");
+      assert(select("#remove-dialog-text").textContent.includes(group.group_name), "确认框应显示目标群名");
+      assert(select("#remove-dialog-text").textContent.includes(String(beforeClear)), "清空数量应包含被搜索隐藏的订阅");
+      safe();
+      select("#remove-dialog").close("cancel");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert(clearCalls.length === 0 && group.subscriptions.length === beforeClear, "取消不能发送清空请求");
+      pass("清空订阅确认框安全显示群名和总数量，取消不改数据");
+
+      failClearNext = true;
+      select("[data-clear-group-subscriptions]").click();
+      select("#confirm-remove").click();
+      await waitFor(() => clearCalls.length === 1 && !select("#refresh-button").disabled);
+      assert(group.subscriptions.length === beforeClear, "清空失败不能移除页面数据");
+      assert(select("#toast").textContent.includes("模拟清空失败"), "清空失败必须提示");
+      pass("清空失败保留列表并显示错误");
+
+      select("[data-clear-group-subscriptions]").click();
+      select("#confirm-remove").click();
+      await waitFor(() => clearCalls.length === 2 && !select("#refresh-button").disabled);
+      assert(clearCalls.every((payload) => payload.umo === group.umo), "只清空确认的当前群");
+      assert(group.subscriptions.length === 0, "本群订阅应清空");
+      assert(overview.groups[1].subscriptions.length === 1 && overview.other_sessions[0].subscriptions.length === 1, "其他群和私聊必须保留");
+      assert(!select("[data-clear-group-subscriptions]"), "空群不应显示清空按钮");
+      assert(!select("[data-copy-subscriptions]"), "空会话不应显示复制按钮");
+      assert(select("#author-search").value === "", "成功后清除搜索条件");
+      assert(select(".detail-heading h2").textContent === group.group_name, "清空后仍保留当前群");
+      pass("确认后仅清空本群全部订阅，刷新列表且保留群聊");
+      select('[data-view="others"]').click();
+      select("[data-copy-subscriptions]").click();
+      await waitFor(() => !select("[data-copy-subscriptions]").disabled);
+      assert(copiedTexts.at(-1) === "private", "私聊会话仅复制自己的订阅");
+      pass("私聊会话也可复制列表，内容不混入其他群");
+      if (clipboardDescriptor) Object.defineProperty(navigator, "clipboard", clipboardDescriptor);
+      else delete navigator.clipboard;
       results.dataset.result = "passed";
       results.textContent += `${passed} 项浏览器 DOM 回归全部通过`;
     } catch (error) {

@@ -138,6 +138,9 @@ class TwitterPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        self.detailed_diagnostics = bool(
+            self._cfg("basic", "twitter_detailed_diagnostics", False)
+        )
 
         self.proxy = str(self._cfg("basic", "twitter_proxy", "") or "") or None
         self.data_provider = str(
@@ -426,6 +429,12 @@ class TwitterPlugin(Star):
                 max_tweets_per_user=self.poll_max_tweets_per_user,
             ),
         )
+
+        for service in (
+            self.twitter_api, self.subscription_service, self.message_service,
+            self.delivery_service, self.delivery_service.telegram_albums, self.polling_service,
+        ):
+            service.detailed_diagnostics = self.detailed_diagnostics
 
         self._webui_controller = None
         register_web_api = getattr(context, "register_web_api", None)

@@ -9,6 +9,12 @@ from uuid import uuid4
 _TRACE = ContextVar("twitter_diagnostic_trace", default="-")
 
 
+def detail_debug(logger, owner, event: str, **fields) -> None:
+    """详细阶段仅由所属插件实例的诊断开关控制，避免跨实例串扰。"""
+    if getattr(owner, "detailed_diagnostics", False):
+        logger.debug(anchor(event, **fields))
+
+
 def traced(operation):
     """为一次操作及其子调用关联日志，异步任务之间隔离且退出后恢复。"""
     @wraps(operation)

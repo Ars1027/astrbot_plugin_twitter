@@ -177,6 +177,7 @@ async def test_timeline_discards_results_when_first_page_fails(api_module):
 @pytest.mark.asyncio
 async def test_repeated_cursor_logs_page_and_redacted_cursor_reference(api_module):
     api = api_module.TwitterAPI(provider="fxtwitter")
+    api.detailed_diagnostics = True
     page = _fixture("fxtwitter_timeline_page1.json")
     page["cursor"]["bottom"] = "secret-opaque-cursor"
 
@@ -314,7 +315,7 @@ async def test_stale_client_invalidation_does_not_close_replacement(api_module):
 
 
 @pytest.mark.asyncio
-async def test_first_subscription_uses_only_latest_id(api_module):
+async def test_first_subscription_uses_maximum_id_from_first_page(api_module):
     api = api_module.TwitterAPI(provider="fxtwitter")
     page = _fixture("fxtwitter_timeline_page1.json")
 
@@ -325,6 +326,41 @@ async def test_first_subscription_uses_only_latest_id(api_module):
     latest_ids = await api.get_user_newtimeline("tester")
 
     assert latest_ids == ["105"]
+
+
+@pytest.mark.asyncio
+async def test_initial_cursor_ignores_old_retweet_at_top_without_following_pagination(api_module):
+    api = api_module.TwitterAPI(provider="fxtwitter")
+    calls = []
+    page = {"code": 200, "results": [
+        {"type": "status", "id": "100", "author": {"screen_name": "original"},
+         "reposted_by": {"screen_name": "tester"}},
+        *[{"type": "status", "id": str(i), "author": {"screen_name": "tester"}}
+          for i in (105, 104, 103)],
+        {"type": "status", "id": "999", "is_pinned": True},
+    ], "cursor": {"bottom": "next-page"}}
+
+    async def request(_path, params=None, retries=2):
+        calls.append(params)
+        assert "cursor" not in params
+        return page
+
+    api._request_fxtwitter_json = request
+    assert await api.get_user_newtimeline("tester") == ["105"]
+    assert len(calls) == 1
+    # 同一时间线里的既有内容不会在第一次轮询被当成新增。
+    assert await api.get_user_timeline_items("tester", "105") == []
+
+
+@pytest.mark.asyncio
+async def test_initial_cursor_empty_page_is_valid(api_module):
+    api = api_module.TwitterAPI(provider="fxtwitter")
+
+    async def request(*_args, **_kwargs):
+        return {"code": 200, "results": []}
+
+    api._request_fxtwitter_json = request
+    assert await api.get_user_newtimeline("tester") == []
 
 
 @pytest.mark.asyncio

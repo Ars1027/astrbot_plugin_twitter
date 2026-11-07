@@ -68,6 +68,11 @@
         return {saved: true};
       }
       if (endpoint === "subscriptions/remove") group.subscriptions = group.subscriptions.filter((s) => s !== existing);
+      if (endpoint === "subscriptions/group-clear") {
+        const removed = group.subscriptions.length;
+        group.subscriptions = [];
+        return {saved: true, removed};
+      }
       if (endpoint === "subscriptions/update" && existing) Object.assign(existing, payload);
       if (endpoint === "subscriptions/group-status") group.subscriptions.forEach((s) => { s.enabled = payload.enabled; });
       return {saved: true};

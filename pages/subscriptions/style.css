@@ -91,6 +91,7 @@ input::placeholder, textarea::placeholder { color: var(--text-muted); opacity: .
 .availability-mark { color: var(--warning); }
 .detail-view { min-width: 0; padding: 26px 28px; }
 .detail-header { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 24px; }
+.detail-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 12px; flex-shrink: 0; }
 .detail-heading { min-width: 0; }
 .detail-heading h2 { overflow-wrap: anywhere; }
 .detail-heading p { color: var(--text-muted); font-size: 12px; margin-top: 7px; overflow-wrap: anywhere; }
@@ -110,7 +111,9 @@ input[type="checkbox"] { accent-color: var(--accent); width: 16px; height: 16px;
 .switch-field input:checked, .group-switch input:checked { background: var(--accent); }
 .switch-field input:checked::after, .group-switch input:checked::after { transform: translateX(12px); }
 .subscription-heading { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-bottom: 12px; }
-.author-search { width: 230px; max-width: 55%; }
+.subscription-tools { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.subscription-tools button { flex-shrink: 0; }
+.author-search { width: 200px; min-width: 0; }
 .author-search input { font-size: 12px; padding: 8px 12px; background: var(--surface-subtle); }
 .subscription-row { display: grid; grid-template-columns: minmax(110px, 1fr) repeat(3, auto) 30px; align-items: center; gap: 22px; border-bottom: 1px solid var(--border); padding: 16px 4px; }
 .subscription-row:hover { background: var(--surface-subtle); }
@@ -211,6 +214,7 @@ progress { display: block; width: 100%; height: 6px; accent-color: var(--accent)
   .section-title { flex-wrap: wrap; gap: 6px; }
   .section-title .muted { width: 100%; }
   .subscription-heading { align-items: flex-start; flex-direction: column; gap: 12px; }
+  .subscription-tools { width: 100%; }
   .author-search { max-width: none; width: 100%; }
   .subscription-list { display: grid; gap: 12px; }
   .subscription-row { grid-template-columns: repeat(3, minmax(0, 1fr)) 30px; gap: 12px 8px; border: 1px solid var(--border); border-radius: 12px; padding: 14px 12px; }

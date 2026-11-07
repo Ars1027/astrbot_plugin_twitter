@@ -46,6 +46,12 @@
         "type": "int",
         "default": 5,
         "hint": "数据源恢复或积压较多时，每个推主每轮最多按时间顺序推送此数量，剩余推文将在后续轮询继续推送；最小值为 1"
+      },
+      "twitter_detailed_diagnostics": {
+        "description": "详细诊断日志",
+        "type": "bool",
+        "default": false,
+        "hint": "需同时将 AstrBot 日志级别设为 DEBUG。开启后输出逐请求、逐页、逐图及上传阶段日志，适合临时排查；关闭时保留推主检查摘要、新帖处理、游标提交、订阅操作和异常日志。"
       }
     }
   },
@@ -58,7 +64,7 @@
         "description": "单条推文使用合并转发消息发送",
         "type": "bool",
         "default": true,
-        "hint": "开启后 QQ 使用合并转发。Telegram 始终按帖子发送：多张截图和图片组成相册，单张发送照片，原帖链接放入说明文字；超长正文和视频单独发送，相册失败时回退为普通消息，不同帖子不会混入同一相册。"
+        "hint": "开启后 QQ 使用合并转发。Telegram 按帖子发送：多图组成相册，单图发送照片，链接附于说明；长正文和视频单独发送。"
       },
       "twitter_no_text": {
         "description": "推文含媒体时不输出文字内容",
@@ -102,7 +108,7 @@
         "description": "Telegram 视频文件直发大小上限（MB）",
         "type": "int",
         "default": 50,
-        "hint": "仅用于 Telegram，超过上限时改发说明和视频链接。公共 Bot API 的单个视频上传上限为 50 MB；发送更大文件需自建并启用 --local 的 Bot API 服务（最高 2000 MB），再相应提高此设置。另受 AstrBot Telegram 适配器约 20 秒上传写入超时限制，上行带宽不足时更小的视频也会降级为链接；建议按上行带宽设置，详见 README 的「Telegram 视频发送限制」。此项不会提高 Telegram 的照片大小限制；无法探测视频大小时仍尝试发送。"
+        "hint": "视频超限时改发链接。公共 API 上限 50 MB；更大文件需自建 --local Bot API（最高 2000 MB）。上传超时等限制详见 README 的「Telegram 视频发送限制」。"
       },
       "twitter_collective_forward": {
         "description": "轮询时汇总多条新推文为一条合并转发消息",

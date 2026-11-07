@@ -8,15 +8,23 @@ from typing import Any
 
 from astrbot.api import logger
 
-from ..twitter_diagnostics import anchor, exception_type_chain, reference, traced
+from ..twitter_diagnostics import (
+    anchor,
+    detail_debug,
+    exception_type_chain,
+    reference,
+    traced,
+)
+from .platform_send_backoff import PlatformRateLimited, PlatformSendBackoff
 from .platform_support import meta_value, platform_instances
 
 
 class TelegramAlbumService:
     """仅负责一批图片的 SDK 调用；降级和推文回执由发送服务统一处理。"""
 
-    def __init__(self, context: Any) -> None:
+    def __init__(self, context: Any, backoff: PlatformSendBackoff | None = None) -> None:
         self.context = context
+        self.backoff = backoff if backoff is not None else PlatformSendBackoff()
 
     @staticmethod
     def _materializes_temp_file(image: Any) -> bool:
@@ -44,7 +52,7 @@ class TelegramAlbumService:
         paths = []
         materialized_paths: list[Path] = []
         total_bytes = 0
-        logger.debug(anchor("tg.album.start", target=reference(umo), images=len(images)))
+        detail_debug(logger, self, "tg.album.start", target=reference(umo), images=len(images))
         try:
             platform_id, _message_type, session_id = umo.split(":", 2)
             platform = next(
@@ -53,11 +61,12 @@ class TelegramAlbumService:
                 and meta_value(item.meta(), "name") == "telegram"
             )
             client = platform.get_client()
-            logger.debug(anchor(
+            detail_debug(
+                logger, self,
                 "tg.client", target=reference(umo),
                 local_mode=bool(getattr(client, "local_mode", False)),
                 endpoint=reference(str(getattr(client, "base_url", ""))),
-            ))
+            )
             chat_id, separator, topic_id = session_id.partition("#")
             target = {"chat_id": int(chat_id)}
             if separator:
@@ -70,10 +79,11 @@ class TelegramAlbumService:
                 paths.append(path)
                 if self._materializes_temp_file(image):
                     materialized_paths.append(path)
-                logger.debug(anchor(
+                detail_debug(
+                    logger, self,
                     "tg.image.ready", index=len(paths), bytes=path.stat().st_size,
                     elapsed=round(perf_counter() - stage_started, 2),
-                ))
+                )
             stage, stage_started = "check_images", perf_counter()
             for path in paths:
                 if path.suffix.lower() == ".gif":
@@ -91,42 +101,58 @@ class TelegramAlbumService:
                 files = [stack.enter_context(path.open("rb")) for path in paths]
                 if len(files) == 1:
                     stage, stage_started = "send_photo", perf_counter()
-                    logger.debug(anchor("tg.upload.start", stage=stage, bytes=total_bytes, images=1))
-                    result = await client.send_photo(
-                        **target, photo=files[0], caption=caption or None, parse_mode=None,
+                    detail_debug(logger, self, "tg.upload.start", stage=stage, bytes=total_bytes, images=1)
+                    async def send_photo():
+                        files[0].seek(0)
+                        return await client.send_photo(
+                            **target, photo=files[0], caption=caption or None, parse_mode=None,
+                        )
+
+                    result = await self.backoff.run(
+                        umo, send_photo,
                     )
                     succeeded = result is not None and result is not False
-                    logger.debug(anchor(
+                    detail_debug(
+                        logger, self,
                         "tg.upload.result", stage=stage, ok=succeeded,
                         elapsed=round(perf_counter() - stage_started, 2),
-                    ))
+                    )
                     return succeeded
 
                 # Telegram SDK 由官方适配器提供；QQ 等平台加载插件时不导入它。
                 from telegram import InputMediaPhoto
 
-                media = [
-                    InputMediaPhoto(
-                        media=image_file, caption=(caption or None) if index == 0 else None,
-                        parse_mode=None,
-                    )
-                    for index, image_file in enumerate(files)
-                ]
+                async def send_media_group():
+                    # SDK 可能已读取上传流；重试时重新构建媒体并复位文件指针。
+                    for image_file in files:
+                        image_file.seek(0)
+                    media = [
+                        InputMediaPhoto(
+                            media=image_file, caption=(caption or None) if index == 0 else None,
+                            parse_mode=None,
+                        )
+                        for index, image_file in enumerate(files)
+                    ]
+                    return await client.send_media_group(**target, media=media)
                 stage, stage_started = "send_media_group", perf_counter()
-                logger.debug(anchor("tg.upload.start", stage=stage, bytes=total_bytes, images=len(files)))
-                result = await client.send_media_group(**target, media=media)
+                detail_debug(logger, self, "tg.upload.start", stage=stage, bytes=total_bytes, images=len(files))
+                result = await self.backoff.run(umo, send_media_group)
                 succeeded = (
                     isinstance(result, (list, tuple)) and len(result) == len(images)
                     and all(item is not None and item is not False for item in result)
                 )
-                logger.debug(anchor(
+                detail_debug(
+                    logger, self,
                     "tg.upload.result", stage=stage, ok=succeeded,
                     received=len(result) if isinstance(result, (list, tuple)) else 0,
                     elapsed=round(perf_counter() - stage_started, 2),
-                ))
+                )
                 if not succeeded:
                     logger.warning(anchor("tg.upload.incomplete", target=reference(umo), expected=len(images)))
                 return succeeded
+        except PlatformRateLimited:
+            # 明确限流不能退回普通消息继续发送；上层保留真实回执与游标。
+            raise
         except Exception as exc:  # noqa: BLE001 - 可选 SDK 的异常在平台边界统一降级。
             reason = type(exc).__name__
             if reason == "BadRequest":

@@ -109,8 +109,8 @@ async def test_telegram_and_qq_keep_platform_specific_delivery(plugin_env, umo, 
         result = await plugin.delivery_service.flush_collected()
         assert not result.failed_authors
     tg = [chain for target, chain in calls if target == umo]
-    assert [type(part) for part in tg[0]] == [Plain, Image]
-    assert isinstance(tg[1][0], Video)
+    assert [type(part) for request in tg for part in request] == [Plain, Image, Video]
+    assert all(len(request) == 1 for request in tg)
     qq_chains = [chain for target, chain in calls if target == qq]
     assert isinstance(qq_chains[0][0], Nodes)
     assert {receipt.umo for receipt in result.delivered_tweets} == {umo, qq}
@@ -197,9 +197,9 @@ async def test_telegram_direct_commands_use_plain_text_images_and_videos(plugin_
         match = _module.TWITTER_LINK_PATTERN.search(event.message_str)
         results = [item async for item in plugin._handle_tweet_link(event, match, report_errors=True)]
     assert not any(isinstance(item, list) for item in results)
-    primary = calls[0][1]
-    assert [type(part) for part in primary] == [Plain, Image]
-    assert calls[1][0] == TG_TOPIC and isinstance(calls[1][1][0], Video)
+    assert all(target == TG_TOPIC for target, _request in calls)
+    assert [type(part) for _target, request in calls for part in request] == [Plain, Image, Video]
+    assert all(len(request) == 1 for _target, request in calls)
 
 
 @pytest.mark.asyncio
