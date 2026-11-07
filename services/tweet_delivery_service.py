@@ -133,7 +133,7 @@ class TweetDeliveryService:
         for component in chain:
             if isinstance(component, Comp.Video):
                 video_parts.append(component)
-            elif isinstance(component, Comp.Image):
+            elif isinstance(component, Comp.Image) and not getattr(chain, "group_as_single_node", False):
                 flush_text_parts()
                 nodes.append(Node(content=[component], name=nickname))
             else:
