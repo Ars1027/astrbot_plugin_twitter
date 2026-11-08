@@ -46,12 +46,6 @@
         "type": "int",
         "default": 5,
         "hint": "数据源恢复或积压较多时，每个推主每轮最多按时间顺序推送此数量，剩余推文将在后续轮询继续推送；最小值为 1"
-      },
-      "twitter_detailed_diagnostics": {
-        "description": "详细诊断日志",
-        "type": "bool",
-        "default": false,
-        "hint": "需同时将 AstrBot 日志级别设为 DEBUG。开启后输出逐请求、逐页、逐图及上传阶段日志，适合临时排查；关闭时保留推主检查摘要、新帖处理、游标提交、订阅操作和异常日志。"
       }
     }
   },

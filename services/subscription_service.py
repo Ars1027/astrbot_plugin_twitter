@@ -11,7 +11,7 @@ from typing import Any
 
 from astrbot.api import logger
 
-from ..twitter_diagnostics import anchor, exception_type_chain, reference, traced
+from ..twitter_diagnostics import anchor, exception_type_chain, reference
 
 
 KV_SUBS_KEY = "twitter_subs"
@@ -34,7 +34,6 @@ def subscription_audit(event: str):
     def decorate(operation):
         parameters = signature(operation)
 
-        @traced
         @wraps(operation)
         async def run(*args, **kwargs):
             values = parameters.bind(*args, **kwargs).arguments
@@ -43,7 +42,6 @@ def subscription_audit(event: str):
                 fields["target"] = reference(values["umo"])
             if "username" in values:
                 fields["author"] = str(values["username"] or "").strip().lstrip("@")
-            logger.debug(anchor(f"subscription.{event}.start", **fields))
             try:
                 result = await operation(*args, **kwargs)
             except (Exception, asyncio.CancelledError) as exc:

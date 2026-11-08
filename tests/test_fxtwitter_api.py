@@ -189,7 +189,6 @@ async def test_repeated_cursor_logs_page_and_redacted_cursor_reference(api_modul
         await api.get_user_timeline_items("tester")
     logs = [message for _level, message in api_module.logger.messages if "[twitter:" in message]
     assert any("timeline.cursor.repeated" in line and "page=2" in line for line in logs)
-    assert any("timeline.page.result" in line and "accepted=0" in line for line in logs)
     assert "secret-opaque-cursor" not in "\n".join(logs)
     assert api._status_cache == {}
 

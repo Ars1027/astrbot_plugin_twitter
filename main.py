@@ -25,7 +25,7 @@ from .services import (
     TweetMessageSettings,
 )
 from .services.avatar_cache_service import AvatarCacheService
-from .services.platform_support import is_telegram_event
+from .services.platform_support import is_telegram_event, meta_value, platform_instances
 from .twitter_api import (
     DATA_PROVIDER_FXTWITTER,
     DATA_PROVIDER_NITTER,
@@ -138,9 +138,6 @@ class TwitterPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        self.detailed_diagnostics = bool(
-            self._cfg("basic", "twitter_detailed_diagnostics", False)
-        )
 
         self.proxy = str(self._cfg("basic", "twitter_proxy", "") or "") or None
         self.data_provider = str(
@@ -430,12 +427,6 @@ class TwitterPlugin(Star):
             ),
         )
 
-        for service in (
-            self.twitter_api, self.subscription_service, self.message_service,
-            self.delivery_service, self.delivery_service.telegram_albums, self.polling_service,
-        ):
-            service.detailed_diagnostics = self.detailed_diagnostics
-
         self._webui_controller = None
         register_web_api = getattr(context, "register_web_api", None)
         if TwitterWebUIController is not None and callable(register_web_api):
@@ -545,20 +536,16 @@ class TwitterPlugin(Star):
     # WebUI 与现有调用方使用的兼容委托。
     async def _migrate_group_subscriptions(self) -> bool:
         """平台实例可用后迁移旧 QQ 订阅；未就绪时由后续轮询重试。"""
-        manager = getattr(self.context, "platform_manager", None)
-        instances = getattr(manager, "platform_insts", None)
-        if instances is None:
-            get_insts = getattr(manager, "get_insts", None)
-            instances = get_insts() if callable(get_insts) else []
+        instances = platform_instances(self.context)
         if not instances:
             return False
-        platform_ids = set()
-        for platform in instances:
-            meta = platform.meta()
-            name = meta.get("name") if isinstance(meta, dict) else getattr(meta, "name", None)
-            platform_id = meta.get("id") if isinstance(meta, dict) else getattr(meta, "id", None)
-            if name == "aiocqhttp" and platform_id:
-                platform_ids.add(str(platform_id))
+        platform_ids = {
+            platform_id
+            for platform in instances
+            if meta_value(platform.meta(), "name") == "aiocqhttp"
+            for platform_id in [meta_value(platform.meta(), "id")]
+            if platform_id
+        }
         count = await self.subscription_service.migrate_qq_group_sessions(platform_ids)
         if count:
             logger.info(f"已将 {count} 个 QQ 成员会话订阅归并到真实群聊")

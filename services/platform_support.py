@@ -12,9 +12,9 @@ def platform_instances(context: Any) -> list:
     return list(instances or [])
 
 
-def meta_value(meta: Any, field: str) -> str:
+def meta_value(meta: Any, field: str, default: str = "") -> str:
     value = meta.get(field) if isinstance(meta, dict) else getattr(meta, field, None)
-    return str(value or "")
+    return str(value or default)
 
 
 def is_telegram_target(context: Any, umo: str) -> bool:

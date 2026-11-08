@@ -7,6 +7,21 @@ from typing import Any
 from astrbot.api import logger
 from astrbot.api.web import error_response, json_response, request
 
+try:
+    from .services.platform_support import meta_value, platform_instances
+except ImportError:  # 作为顶层模块单独加载时，按文件路径定位同目录实现。
+    import importlib.util
+    from pathlib import Path
+
+    _SUPPORT_SPEC = importlib.util.spec_from_file_location(
+        "_twitter_platform_support",
+        Path(__file__).resolve().parent / "services" / "platform_support.py",
+    )
+    _SUPPORT_MODULE = importlib.util.module_from_spec(_SUPPORT_SPEC)
+    _SUPPORT_SPEC.loader.exec_module(_SUPPORT_MODULE)
+    meta_value = _SUPPORT_MODULE.meta_value
+    platform_instances = _SUPPORT_MODULE.platform_instances
+
 
 PLUGIN_NAME = "astrbot_plugin_twitter"
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,15}$")
@@ -81,9 +96,7 @@ class TwitterWebUIController:
 
     @staticmethod
     def _meta_value(meta: Any, field: str, default: str = "") -> str:
-        if isinstance(meta, dict):
-            return str(meta.get(field) or default)
-        return str(getattr(meta, field, None) or default)
+        return meta_value(meta, field, default)
 
     @staticmethod
     def _parse_umo(value: Any) -> tuple[str, str, str] | None:
@@ -120,14 +133,7 @@ class TwitterWebUIController:
         }
 
     def _platform_instances(self) -> list[Any]:
-        manager = getattr(self.context, "platform_manager", None)
-        if manager is None:
-            return []
-        instances = getattr(manager, "platform_insts", None)
-        if instances is None:
-            get_insts = getattr(manager, "get_insts", None)
-            instances = get_insts() if callable(get_insts) else []
-        return list(instances or [])
+        return platform_instances(self.context)
 
     def _aiocqhttp_platforms(self) -> list[Any]:
         return self._supported_platforms({"aiocqhttp"})

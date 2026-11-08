@@ -2,29 +2,6 @@
 
 import hashlib
 import json
-from contextvars import ContextVar
-from functools import wraps
-from uuid import uuid4
-
-_TRACE = ContextVar("twitter_diagnostic_trace", default="-")
-
-
-def detail_debug(logger, owner, event: str, **fields) -> None:
-    """详细阶段仅由所属插件实例的诊断开关控制，避免跨实例串扰。"""
-    if getattr(owner, "detailed_diagnostics", False):
-        logger.debug(anchor(event, **fields))
-
-
-def traced(operation):
-    """为一次操作及其子调用关联日志，异步任务之间隔离且退出后恢复。"""
-    @wraps(operation)
-    async def run(*args, **kwargs):
-        token = _TRACE.set(_TRACE.get() if _TRACE.get() != "-" else uuid4().hex[:12])
-        try:
-            return await operation(*args, **kwargs)
-        finally:
-            _TRACE.reset(token)
-    return run
 
 
 def reference(value: str) -> str:
@@ -38,7 +15,7 @@ def anchor(event: str, **fields) -> str:
         f"{key}={json.dumps(value, ensure_ascii=False)}"
         for key, value in fields.items()
     )
-    return f"[twitter:{event}] trace={_TRACE.get()} {values}".rstrip()
+    return f"[twitter:{event}] {values}".rstrip()
 
 
 def exception_type_chain(error: BaseException) -> str:

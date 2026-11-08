@@ -12,7 +12,7 @@ from astrbot.api.event import MessageChain
 import astrbot.api.message_components as Comp
 from astrbot.api.message_components import Node, Nodes
 
-from ..twitter_diagnostics import anchor, detail_debug, exception_type_chain, reference, traced
+from ..twitter_diagnostics import anchor, exception_type_chain, reference
 from .platform_support import is_telegram_target
 from .platform_send_backoff import PlatformRateLimited, PlatformSendBackoff
 from .subscription_service import DeliveredTweet, RecentDelivery, SkippedTweet, SubscriptionService
@@ -214,11 +214,6 @@ class TweetDeliveryService:
     ) -> None:
         """检查发送结果；TG 按组件和文本分段重试，不重放成功的前缀。"""
         started = perf_counter()
-        detail_debug(
-            logger, self,
-            "platform.send.start", target=reference(umo),
-            parts=len(message_chain.chain), types=[type(part).__name__ for part in message_chain.chain],
-        )
         try:
             requests = (
                 self._telegram_request_chains(message_chain)
@@ -236,11 +231,6 @@ class TweetDeliveryService:
                 elapsed=round(perf_counter() - started, 2),
             ))
             raise
-        detail_debug(
-            logger, self,
-            "platform.send.result", target=reference(umo), ok=True,
-            elapsed=round(perf_counter() - started, 2),
-        )
 
     @staticmethod
     def _telegram_request_chains(message_chain: MessageChain) -> list[MessageChain]:
@@ -367,17 +357,11 @@ class TweetDeliveryService:
             return text_sent
         return image_sent
 
-    @traced
     async def send_telegram_tweet(
         self, umo: str, chain: list, username: str, tweet_info: dict,
         *, on_primary_sent: Callable[[], None] | None = None,
     ) -> bool:
         """按帖子分组图片，链接放入说明；沿用正文回执及逐图降级规则。"""
-        detail_debug(
-            logger, self,
-            "tg.tweet.start", author=username, tweet=str(tweet_info.get("tweet_id") or ""),
-            target=reference(umo), parts=len(chain),
-        )
         images = [part for part in chain if isinstance(part, Comp.Image)]
         if not images or any(not isinstance(part, (Comp.Image, Comp.Plain)) for part in chain):
             return await self.send_plain_chain_resilient(
@@ -418,12 +402,6 @@ class TweetDeliveryService:
         for offset in range(0, len(images), 10):
             batch = images[offset:offset + 10]
             batch_caption = caption if offset == 0 else link
-            detail_debug(
-                logger, self,
-                "tg.batch.start", tweet=str(tweet_info.get("tweet_id") or ""),
-                target=reference(umo), batch=offset // 10 + 1, images=len(batch),
-                caption_units=len(batch_caption.encode("utf-16-le")) // 2,
-            )
 
             def confirm_batch(batch=batch, offset=offset) -> None:
                 remaining.difference_update(id(image) for image in batch)
@@ -449,15 +427,9 @@ class TweetDeliveryService:
                 )
             if sent:
                 confirm_batch()
-            detail_debug(
-                logger, self,
-                "tg.batch.result", batch=offset // 10 + 1, ok=sent, required_remaining=len(remaining),
-            )
 
-        detail_debug(logger, self, "tg.tweet.result", target=reference(umo), primary_sent=primary_sent)
         return primary_sent
 
-    @traced
     async def send_video_or_fallback(
         self,
         umo: str,
@@ -466,13 +438,11 @@ class TweetDeliveryService:
         """发送视频组件，失败时回退为链接。"""
         started = perf_counter()
         media_ref = reference(getattr(video_component, "file", "") or getattr(video_component, "url", ""))
-        detail_debug(logger, self, "video.start", target=reference(umo), media=media_ref)
         try:
             await self._send_message_checked(
                 umo,
                 MessageChain(chain=[video_component]),
             )
-            detail_debug(logger, self, "video.sent", target=reference(umo), media=media_ref)
             return True
         except PlatformRateLimited:
             # 已明确拒收，不能再发送链接绕过冷却。
@@ -751,7 +721,6 @@ class TweetDeliveryService:
             DeliveryState.DELIVERED, tuple(recent_deliveries), tuple(delivered_tweets), tuple(skipped_tweets)
         )
 
-    @traced
     async def send_to_subscriber(
         self,
         umo: str,
@@ -773,12 +742,6 @@ class TweetDeliveryService:
         主要内容发送成功后追加，附加媒体中断不丢弃正文回执。
         """
         receipt_recorded = False
-        started = perf_counter()
-        detail_debug(
-            logger, self,
-            "delivery.start", author=username, tweet=str(tweet_info.get("tweet_id") or ""),
-            target=reference(umo), telegram=is_telegram_target(self.context, umo),
-        )
 
         def record_sent() -> None:
             nonlocal receipt_recorded
@@ -799,11 +762,6 @@ class TweetDeliveryService:
                     self.settings.telegram_video_max_size_mb
                     if is_telegram_target(self.context, umo) else None
                 ),
-            )
-            detail_debug(
-                logger, self,
-                "delivery.prepared", parts=len(chain),
-                elapsed=round(perf_counter() - started, 2),
             )
             if not chain:
                 record_sent()
@@ -868,11 +826,6 @@ class TweetDeliveryService:
                 logger.info(f"推文已推送至 {umo}")
             else:
                 logger.error(f"推文主要内容未能推送至 {umo}")
-            detail_debug(
-                logger, self,
-                "delivery.result", author=username, tweet=str(tweet_info.get("tweet_id") or ""),
-                target=reference(umo), ok=sent, elapsed=round(perf_counter() - started, 2),
-            )
             return sent
         except Exception as exc:
             logger.error(

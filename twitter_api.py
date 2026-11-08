@@ -17,7 +17,7 @@ from bs4 import BeautifulSoup, Tag
 from astrbot.api import logger
 
 from .twitter_article import attach_article, parse_fxtwitter_article, parse_nitter_article
-from .twitter_diagnostics import anchor, detail_debug, exception_type_chain, reference, traced
+from .twitter_diagnostics import anchor, exception_type_chain, reference
 
 # 内置 Nitter 镜像站列表
 WEBSITE_LIST = [
@@ -160,11 +160,6 @@ class TwitterAPI:
         for attempt in range(attempts):
             client = await self._get_client()
             started = perf_counter()
-            detail_debug(
-                logger, self,
-                "fx.request.start", request=reference(path), attempt=attempt + 1,
-                paginated=bool((params or {}).get("cursor")), proxy=bool(self.proxy),
-            )
             try:
                 resp = await client.get(url, params=params)
             except httpx.TimeoutException as e:
@@ -194,11 +189,6 @@ class TwitterAPI:
                     self.provider_ready = False
                 return None
 
-            detail_debug(
-                logger, self,
-                "fx.request.response", request=reference(path), attempt=attempt + 1,
-                status=resp.status_code, elapsed=round(perf_counter() - started, 2),
-            )
             if resp.status_code == 429:
                 retry_after = str(resp.headers.get("Retry-After") or "").strip()
                 suffix = f"，Retry-After={retry_after}" if retry_after else ""
@@ -651,7 +641,6 @@ class TwitterAPI:
             ).strip(),
         }
 
-    @traced
     async def _get_fxtwitter_timeline_items(
         self, username: str, since_id: str = "", limit: int = 0,
         *, first_page_only: bool = False,
@@ -685,11 +674,6 @@ class TwitterAPI:
             params: dict[str, Any] = {"count": 20}
             if cursor:
                 params["cursor"] = cursor
-            detail_debug(
-                logger, self,
-                "timeline.page.start", author=username, page=page_index + 1,
-                cursor=reference(cursor), since=since_id, limit=limit,
-            )
 
             payload = await self._request_fxtwitter_json(
                 f"2/profile/{quote(username, safe='')}/statuses",
@@ -709,7 +693,6 @@ class TwitterAPI:
                 )
 
             statuses = self._flatten_fxtwitter_results(raw_results)
-            before_count = len(items)
             for status in statuses:
                 tweet_id = str(status.get("id") or "")
                 if not tweet_id or tweet_id in seen_ids or status.get("is_pinned") is True:
@@ -737,12 +720,6 @@ class TwitterAPI:
                     local_item_limit_reached = True
                     break
 
-            detail_debug(
-                logger, self,
-                "timeline.page.result", author=username, page=page_index + 1,
-                fetched=len(statuses), accepted=len(items) - before_count, total=len(items),
-                boundary_found=boundary_found, limit_reached=requested_limit_reached,
-            )
             if boundary_found or requested_limit_reached or (first_page_only and since_int is None):
                 break
             if local_item_limit_reached:
@@ -786,11 +763,6 @@ class TwitterAPI:
 
         for status in statuses_to_cache:
             self._cache_fxtwitter_status(status)
-        detail_debug(
-            logger, self,
-            "timeline.complete", author=username, accepted=len(items), exhausted=timeline_exhausted,
-            boundary_found=boundary_found,
-        )
         return self._finalize_fxtwitter_items(items, since_int, limit)
 
     @staticmethod
