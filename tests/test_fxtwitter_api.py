@@ -1,57 +1,18 @@
 import copy
-import importlib.util
 import json
 import sys
-import types
-from pathlib import Path
 
 import httpx
 import pytest
 
+from support.plugin_loader import ROOT
 
-ROOT = Path(__file__).resolve().parents[1]
+
 FIXTURES = ROOT / "tests" / "fixtures"
-
-
-class _Logger:
-    def __init__(self):
-        self.messages = []
-
-    def __getattr__(self, name):
-        def log(message, *_args, **_kwargs):
-            self.messages.append((name, str(message)))
-
-        return log
-
-
-def _load_twitter_api_module():
-    module_name = "twitter_api_fxtwitter_test"
-    sys.modules.pop(module_name, None)
-
-    astrbot = types.ModuleType("astrbot")
-    api = types.ModuleType("astrbot.api")
-    api.logger = _Logger()
-    sys.modules["astrbot"] = astrbot
-    sys.modules["astrbot.api"] = api
-
-    package_name = f"{module_name}_package"
-    package = types.ModuleType(package_name)
-    package.__path__ = [str(ROOT)]
-    sys.modules[package_name] = package
-    spec = importlib.util.spec_from_file_location(f"{package_name}.twitter_api", ROOT / "twitter_api.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 def _fixture(name):
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
-
-
-@pytest.fixture
-def api_module():
-    return _load_twitter_api_module()
 
 
 def test_provider_defaults_and_base_normalization(api_module):

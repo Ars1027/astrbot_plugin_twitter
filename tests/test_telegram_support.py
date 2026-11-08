@@ -4,84 +4,9 @@ import sys
 import types
 
 import pytest
-from test_provider_initialization import Image, Nodes, Plain, Video, _load_main_module
-from test_twitter_webui import FakeContext, FakePlatform, FakePlugin, _load_webui_module
 
-TG_GROUP = "my-bot:GroupMessage:-100123"
-TG_TOPIC = "my-bot:GroupMessage:-100123#42"
-TG_PRIVATE = "my-bot:FriendMessage:12345"
-
-
-class TelegramClient:
-    id = 9876
-
-    def __init__(self, *, status="member", error=None, is_member=False, can_send_messages=False):
-        self.status = status
-        self.error = error
-        self.is_member = is_member
-        self.can_send_messages = can_send_messages
-        self.calls = []
-
-    async def get_chat(self, *, chat_id):
-        self.calls.append(("chat", chat_id))
-        if self.error:
-            raise self.error
-        return types.SimpleNamespace(type="supergroup", title="Telegram 测试群")
-
-    async def get_chat_member(self, *, chat_id, user_id):
-        self.calls.append(("member", chat_id, user_id))
-        return types.SimpleNamespace(
-            status=self.status, is_member=self.is_member,
-            can_send_messages=self.can_send_messages,
-        )
-
-
-def telegram_platform(**options):
-    platform = FakePlatform("my-bot", name="telegram")
-    platform.client = TelegramClient(**options)
-    return platform
-
-
-@pytest.fixture
-def plugin_env():
-    previous_web = sys.modules.get("astrbot.api.web")
-    module = _load_main_module()
-    data = {}
-    calls = []
-    fail = set()
-
-    async def get(key, default):
-        return copy.deepcopy(data.get(key, default))
-
-    async def put(key, value):
-        data[key] = copy.deepcopy(value)
-
-    async def send(umo, chain):
-        calls.append((umo, chain.chain))
-        # 模拟 Telegram 对 Nodes 的静默忽略，防止假成功测试掩盖问题。
-        if umo.startswith("my-bot:"):
-            assert not any(isinstance(part, Nodes) for part in chain.chain)
-        return umo not in fail
-
-    context = FakeContext([telegram_platform(), FakePlatform("qq-bot")])
-    context.send_message = send
-
-    def make(*, collective=False):
-        plugin = module.TwitterPlugin(context, {
-            "twitter_use_node": True,
-            "twitter_collective_forward": collective,
-            "twitter_data_provider": "fxtwitter",
-        })
-        plugin.get_kv_data = get
-        plugin.put_kv_data = put
-        plugin._provider_ready = True
-        return plugin
-
-    yield module, make, data, calls, fail
-    if previous_web is None:
-        sys.modules.pop("astrbot.api.web", None)
-    else:
-        sys.modules["astrbot.api.web"] = previous_web
+from support.fakes import Image, Nodes, Plain, Video, FakeContext, FakePlugin
+from support.fakes import TG_GROUP, TG_TOPIC, TG_PRIVATE, telegram_platform, make_event
 
 
 @pytest.mark.asyncio
@@ -148,14 +73,6 @@ async def test_telegram_failure_keeps_cursor_and_retries_only_failed_session(plu
     assert [target for target, _chain in calls] == [TG_TOPIC]
 
 
-def make_event(umo, message):
-    return types.SimpleNamespace(
-        unified_msg_origin=umo, message_str=message,
-        get_platform_name=lambda: "telegram",
-        plain_result=lambda text: text, chain_result=lambda chain: chain,
-    )
-
-
 @pytest.mark.asyncio
 async def test_telegram_commands_keep_topics_and_private_chats_separate(plugin_env):
     _module, make, data, _calls, _fail = plugin_env
@@ -203,8 +120,8 @@ async def test_telegram_direct_commands_use_plain_text_images_and_videos(plugin_
 
 
 @pytest.mark.asyncio
-async def test_webui_discovers_existing_telegram_groups_and_topics_and_adds_author(plugin_env):
-    web = _load_webui_module()
+async def test_webui_discovers_existing_telegram_groups_and_topics_and_adds_author(plugin_env, webui_module):
+    web = webui_module
     plugin = FakePlugin({"tester": {"subscribers": {TG_TOPIC: {}, TG_PRIVATE: {}}}})
     platform = telegram_platform()
     controller = web.TwitterWebUIController(plugin, FakeContext([platform]))
@@ -222,8 +139,8 @@ async def test_webui_discovers_existing_telegram_groups_and_topics_and_adds_auth
 
 
 @pytest.mark.asyncio
-async def test_webui_verifies_each_telegram_chat_once_for_multiple_topics(plugin_env):
-    web = _load_webui_module()
+async def test_webui_verifies_each_telegram_chat_once_for_multiple_topics(plugin_env, webui_module):
+    web = webui_module
     second_topic = "my-bot:GroupMessage:-100123#43"
     plugin = FakePlugin({"tester": {"subscribers": {TG_TOPIC: {}, second_topic: {}}}})
     platform = telegram_platform()
@@ -240,8 +157,8 @@ async def test_webui_verifies_each_telegram_chat_once_for_multiple_topics(plugin
     ("left", None), ("kicked", None), ("restricted", None),
     ("member", RuntimeError("URL contains secret token")),
 ])
-async def test_webui_unavailable_telegram_keeps_subs_and_prevents_new_ones(plugin_env, status, error):
-    web = _load_webui_module()
+async def test_webui_unavailable_telegram_keeps_subs_and_prevents_new_ones(plugin_env, status, error, webui_module):
+    web = webui_module
     plugin = FakePlugin({"tester": {"subscribers": {TG_GROUP: {}}}})
     controller = web.TwitterWebUIController(plugin, FakeContext([telegram_platform(status=status, error=error)]))
     overview = await controller._build_overview()
@@ -256,8 +173,8 @@ async def test_webui_unavailable_telegram_keeps_subs_and_prevents_new_ones(plugi
 
 
 @pytest.mark.asyncio
-async def test_webui_cannot_create_unverified_topic_and_handles_empty_bot(plugin_env):
-    web = _load_webui_module()
+async def test_webui_cannot_create_unverified_topic_and_handles_empty_bot(plugin_env, webui_module):
+    web = webui_module
     plugin = FakePlugin()
     controller = web.TwitterWebUIController(plugin, FakeContext([telegram_platform()]))
     overview = await controller._build_overview()
@@ -269,8 +186,8 @@ async def test_webui_cannot_create_unverified_topic_and_handles_empty_bot(plugin
 
 
 @pytest.mark.asyncio
-async def test_webui_restricted_telegram_bot_requires_sending_permission(plugin_env):
-    web = _load_webui_module()
+async def test_webui_restricted_telegram_bot_requires_sending_permission(plugin_env, webui_module):
+    web = webui_module
     plugin = FakePlugin({"tester": {"subscribers": {TG_GROUP: {}}}})
     platform = telegram_platform(status="restricted", is_member=True)
     controller = web.TwitterWebUIController(plugin, FakeContext([platform]))
@@ -341,10 +258,10 @@ async def test_telegram_failed_screenshot_page_is_not_acknowledged(plugin_env, c
 
 
 @pytest.mark.asyncio
-async def test_manual_telegram_group_persists_without_subscriptions_and_is_idempotent(plugin_env):
+async def test_manual_telegram_group_persists_without_subscriptions_and_is_idempotent(plugin_env, webui_module):
     _module, make, data, _calls, _fail = plugin_env
     plugin = make()
-    web = _load_webui_module()
+    web = webui_module
     controller = web.TwitterWebUIController(plugin, plugin.context)
     web.fake_request.payload = {"platform_id": "my-bot", "group_id": " -100123 "}
     result, status = await controller.add_telegram_group()
@@ -382,10 +299,10 @@ async def test_manual_telegram_group_persists_without_subscriptions_and_is_idemp
     {"platform_id": "my-bot", "group_id": "-0"},
     {"platform_id": "my-bot", "group_id": "-" + "1" * 40},
 ])
-async def test_manual_telegram_group_rejects_invalid_target_without_saving(plugin_env, payload):
+async def test_manual_telegram_group_rejects_invalid_target_without_saving(plugin_env, payload, webui_module):
     _module, make, data, _calls, _fail = plugin_env
     plugin = make()
-    web = _load_webui_module()
+    web = webui_module
     controller = web.TwitterWebUIController(plugin, plugin.context)
     web.fake_request.payload = payload
     result, status = await controller.add_telegram_group()
@@ -395,10 +312,10 @@ async def test_manual_telegram_group_rejects_invalid_target_without_saving(plugi
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["left", "kicked", "channel", "timeout", "network", "save"])
-async def test_manual_telegram_group_failure_does_not_create_group(plugin_env, failure):
+async def test_manual_telegram_group_failure_does_not_create_group(plugin_env, failure, webui_module):
     _module, make, data, _calls, _fail = plugin_env
     plugin = make()
-    web = _load_webui_module()
+    web = webui_module
     controller = web.TwitterWebUIController(plugin, plugin.context)
     client = plugin.context.platform_manager.platform_insts[0].client
     web.fake_request.payload = {"platform_id": "my-bot", "group_id": "-100123"}
@@ -421,10 +338,10 @@ async def test_manual_telegram_group_failure_does_not_create_group(plugin_env, f
 
 
 @pytest.mark.asyncio
-async def test_registered_empty_group_stays_visible_when_bot_leaves(plugin_env):
+async def test_registered_empty_group_stays_visible_when_bot_leaves(plugin_env, webui_module):
     _module, make, data, _calls, _fail = plugin_env
     plugin = make()
-    web = _load_webui_module()
+    web = webui_module
     controller = web.TwitterWebUIController(plugin, plugin.context)
     web.fake_request.payload = {"platform_id": "my-bot", "group_id": "-100123"}
     _result, status = await controller.add_telegram_group()
@@ -493,7 +410,7 @@ async def test_screenshot_link_does_not_send_empty_text_or_repeat_screenshot(plu
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("availability", ["online", "offline", "platform_removed"])
-async def test_remove_manual_group_after_unsubscribe_preserves_other_groups_and_state(plugin_env, availability):
+async def test_remove_manual_group_after_unsubscribe_preserves_other_groups_and_state(plugin_env, availability, webui_module):
     _module, make, data, _calls, _fail = plugin_env
     plugin = make()
     service = plugin.subscription_service
@@ -505,7 +422,7 @@ async def test_remove_manual_group_after_unsubscribe_preserves_other_groups_and_
         other: {"status": True, "pending_delivery_ids": ["102"]},
     }}}
     data["twitter_retweet_dedup_seen"] = {TG_GROUP: ["99"], other: ["98"]}
-    web = _load_webui_module()
+    web = webui_module
     controller = web.TwitterWebUIController(plugin, plugin.context)
     if availability == "offline":
         plugin.context.platform_manager.platform_insts[0].client.error = RuntimeError("secret token")
@@ -546,11 +463,11 @@ async def test_remove_manual_group_after_unsubscribe_preserves_other_groups_and_
     {"umo": "qq-bot:GroupMessage:123"}, {"umo": "my-bot:GroupMessage:-0"},
     {"umo": "my-bot:GroupMessage:-" + "1" * 40},
 ])
-async def test_remove_manual_group_rejects_invalid_request(plugin_env, payload):
+async def test_remove_manual_group_rejects_invalid_request(plugin_env, payload, webui_module):
     _module, make, data, _calls, _fail = plugin_env
     plugin = make()
     await plugin.subscription_service.register_telegram_group("my-bot", {"group_id": "-100123", "group_name": "保留群"})
-    web = _load_webui_module()
+    web = webui_module
     controller = web.TwitterWebUIController(plugin, plugin.context)
     web.fake_request.payload = payload
     before = copy.deepcopy(data)
@@ -559,10 +476,10 @@ async def test_remove_manual_group_rejects_invalid_request(plugin_env, payload):
 
 
 @pytest.mark.asyncio
-async def test_cannot_remove_discovered_group_or_treat_storage_failure_as_success(plugin_env):
+async def test_cannot_remove_discovered_group_or_treat_storage_failure_as_success(plugin_env, webui_module):
     _module, make, data, _calls, _fail = plugin_env
     plugin = make()
-    web = _load_webui_module()
+    web = webui_module
     controller = web.TwitterWebUIController(plugin, plugin.context)
     data["twitter_subs"] = {"tester": {"subscribers": {TG_GROUP: {}}}}
     web.fake_request.payload = {"umo": TG_GROUP}

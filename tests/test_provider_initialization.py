@@ -5,185 +5,16 @@ import json
 import re
 import sys
 import types
-from pathlib import Path
 
 import httpx
 import pytest
 
-
-ROOT = Path(__file__).resolve().parents[1]
-
-
-class _Logger:
-    def __getattr__(self, _name):
-        return lambda *_args, **_kwargs: None
-
-
-class _Component:
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-
-class Plain(_Component):
-    def __init__(self, text):
-        super().__init__(text=text)
-
-
-class Image(_Component):
-    @staticmethod
-    def fromURL(url):
-        return Image(file=url)
-
-    @staticmethod
-    def fromFileSystem(path):
-        return Image(file=path)
-
-    @staticmethod
-    def fromBytes(data):
-        return Image(data=data)
-
-
-class Video(_Component):
-    @staticmethod
-    def fromURL(url):
-        return Video(file=url)
-
-
-class Node(_Component):
-    pass
-
-
-class Nodes(_Component):
-    def __init__(self, nodes):
-        super().__init__(nodes=nodes)
-
-
-class MessageChain(_Component):
-    pass
-
-
-def _decorator(*_args, **_kwargs):
-    return lambda func: func
-
-
-class FakeTwitterAPI:
-    instances = []
-
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-        self.provider = kwargs.get("provider", "nitter")
-        self.nitter_url = kwargs.get("nitter_url", "")
-        self.provider_ready = False
-        self.fx_checks = 0
-        self.nitter_checks = 0
-        self.closed = False
-        self.__class__.instances.append(self)
-
-    @property
-    def is_ready(self):
-        if self.provider == "fxtwitter":
-            return self.provider_ready
-        return bool(self.nitter_url)
-
-    async def check_fxtwitter_available(self):
-        self.fx_checks += 1
-        self.provider_ready = True
-        return True
-
-    async def check_website_available(self, websites):
-        self.nitter_checks += 1
-        self.nitter_url = websites[0] if websites else "https://nitter.test"
-        self.provider_ready = True
-        return self.nitter_url
-
-    async def close(self):
-        self.closed = True
-
-
-class FakeFxTwitterTimelineError(RuntimeError):
-    pass
-
-
-def _load_main_module():
-    package_name = "twitter_provider_test_package"
-    for module_name in list(sys.modules):
-        if module_name == package_name or module_name.startswith(f"{package_name}."):
-            del sys.modules[module_name]
-
-    astrbot = types.ModuleType("astrbot")
-    api = types.ModuleType("astrbot.api")
-    event = types.ModuleType("astrbot.api.event")
-    components = types.ModuleType("astrbot.api.message_components")
-    star = types.ModuleType("astrbot.api.star")
-
-    api.AstrBotConfig = dict
-    api.logger = _Logger()
-    event.AstrMessageEvent = object
-    event.MessageChain = MessageChain
-    event.filter = types.SimpleNamespace(
-        command=_decorator,
-        event_message_type=_decorator,
-        permission_type=_decorator,
-        llm_tool=_decorator,
-        on_astrbot_loaded=_decorator,
-        EventMessageType=types.SimpleNamespace(ALL="all"),
-        PermissionType=types.SimpleNamespace(ADMIN="admin"),
-    )
-    components.Plain = Plain
-    components.Image = Image
-    components.Video = Video
-    components.Node = Node
-    components.Nodes = Nodes
-
-    class Star:
-        def __init__(self, context):
-            self.context = context
-
-    star.Context = object
-    star.Star = Star
-    star.StarTools = types.SimpleNamespace()
-    sys.modules.update(
-        {
-            "astrbot": astrbot,
-            "astrbot.api": api,
-            "astrbot.api.event": event,
-            "astrbot.api.message_components": components,
-            "astrbot.api.star": star,
-        }
-    )
-
-    package = types.ModuleType(package_name)
-    package.__path__ = [str(ROOT)]
-    sys.modules[package_name] = package
-
-    twitter_api = types.ModuleType(f"{package_name}.twitter_api")
-    twitter_api.DATA_PROVIDER_NITTER = "nitter"
-    twitter_api.DATA_PROVIDER_FXTWITTER = "fxtwitter"
-    twitter_api.DATA_PROVIDER_OPTIONS = ("nitter", "fxtwitter")
-    twitter_api.DEFAULT_FXTWITTER_API_BASE = "https://api.fxtwitter.com"
-    twitter_api.FxTwitterTimelineError = FakeFxTwitterTimelineError
-    twitter_api.TwitterAPI = FakeTwitterAPI
-    twitter_api.WEBSITE_LIST = ["https://nitter.test"]
-    twitter_api.get_next_website = lambda *_args, **_kwargs: None
-    sys.modules[twitter_api.__name__] = twitter_api
-
-    spec = importlib.util.spec_from_file_location(
-        f"{package_name}.main", ROOT / "main.py"
-    )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+from support.fakes import Plain, Image, Video, Node, Nodes, MessageChain, FakeTwitterAPI, _delivery_contract
+from support.plugin_loader import ROOT
 
 
 @pytest.fixture
-def plugin_module():
-    FakeTwitterAPI.instances.clear()
-    return _load_main_module()
-
-
-@pytest.fixture
-def subscription_list_query(plugin_module):
+def subscription_list_query(provider_plugin_module):
     def make_query(count, name="x", flags=False):
         store = {
             f"u{i}": {
@@ -204,8 +35,8 @@ def subscription_list_query(plugin_module):
         async def put_kv(*_args):
             pytest.fail("查询列表不得写入 KV")
 
-        plugin = plugin_module.TwitterPlugin.__new__(plugin_module.TwitterPlugin)
-        plugin.subscription_service = plugin_module.SubscriptionService(
+        plugin = provider_plugin_module.TwitterPlugin.__new__(provider_plugin_module.TwitterPlugin)
+        plugin.subscription_service = provider_plugin_module.SubscriptionService(
             get_kv, put_kv, object(), lambda: False
         )
 
@@ -292,18 +123,12 @@ async def _wait_forever():
     await asyncio.Event().wait()
 
 
-def _delivery_contract(plugin_module):
-    return sys.modules[
-        f"{plugin_module.__package__}.services.tweet_delivery_service"
-    ]
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "use_node,collective", [(False, False), (True, False), (True, True)]
 )
 async def test_false_send_retains_cursor_and_recovers(
-    plugin_module, use_node, collective
+    provider_plugin_module, use_node, collective
 ):
     store = {
         "twitter_subs": {
@@ -353,7 +178,7 @@ async def test_false_send_retains_cursor_and_recovers(
             "status": True, "tweet_id": tweet_id, "username": username, "text": "body"
         }
 
-    plugin = plugin_module.TwitterPlugin(
+    plugin = provider_plugin_module.TwitterPlugin(
         types.SimpleNamespace(send_message=send_message),
         {
             "twitter_use_node": use_node,
@@ -408,7 +233,7 @@ async def test_false_send_retains_cursor_and_recovers(
 @pytest.mark.parametrize("data_provider", ["nitter", "fxtwitter"])
 @pytest.mark.parametrize("history_available", [True, False])
 async def test_partial_delivery_retries_only_failed_sessions_after_reload(
-    plugin_module, monkeypatch, transport, fail_all, data_provider, history_available
+    provider_plugin_module, monkeypatch, transport, fail_all, data_provider, history_available
 ):
     # Legacy subscriptions have neither delivery history nor retry receipts.
     store = {"twitter_subs": {"tester": {
@@ -456,11 +281,11 @@ async def test_partial_delivery_retries_only_failed_sessions_after_reload(
             raise RuntimeError("history unavailable")
 
         monkeypatch.setattr(
-            plugin_module.SubscriptionService, "prepare_delivery", unavailable_history
+            provider_plugin_module.SubscriptionService, "prepare_delivery", unavailable_history
         )
 
     def reload_plugin(provider):
-        plugin = plugin_module.TwitterPlugin(
+        plugin = provider_plugin_module.TwitterPlugin(
             types.SimpleNamespace(send_message=send_message), {
                 "twitter_data_provider": provider,
                 "twitter_use_node": transport != "plain",
@@ -511,7 +336,7 @@ async def test_partial_delivery_retries_only_failed_sessions_after_reload(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["plain", "node", "collective"])
-async def test_delivery_receipts_restore_retweet_dedup_after_write_failure(plugin_module, transport):
+async def test_delivery_receipts_restore_retweet_dedup_after_write_failure(provider_plugin_module, transport):
     store = {"twitter_subs": {"tester": {
         "since_id": "100", "subscribers": {"group": {"status": True}},
     }}, "twitter_retweet_dedup_seen": {}}
@@ -540,7 +365,7 @@ async def test_delivery_receipts_restore_retweet_dedup_after_write_failure(plugi
         return {"status": True, "tweet_id": tweet_id, "text": "body"}
 
     def reload_plugin():
-        plugin = plugin_module.TwitterPlugin(types.SimpleNamespace(send_message=send_message), {
+        plugin = provider_plugin_module.TwitterPlugin(types.SimpleNamespace(send_message=send_message), {
             "twitter_use_node": transport != "plain",
             "twitter_collective_forward": transport == "collective",
             "twitter_deduplicate_retweets": True,
@@ -560,7 +385,7 @@ async def test_delivery_receipts_restore_retweet_dedup_after_write_failure(plugi
 
 
 @pytest.mark.asyncio
-async def test_fxtwitter_initialization_skips_nitter(plugin_module):
+async def test_fxtwitter_initialization_skips_nitter(provider_plugin_module):
     config = {
         "basic": {
             "twitter_data_provider": "fxtwitter",
@@ -568,7 +393,7 @@ async def test_fxtwitter_initialization_skips_nitter(plugin_module):
             "twitter_nitter_url": "https://must-not-be-used.example",
         }
     }
-    plugin = plugin_module.TwitterPlugin(object(), config)
+    plugin = provider_plugin_module.TwitterPlugin(object(), config)
     plugin._poll_tweets = _wait_forever
 
     assert plugin.website_list == []
@@ -585,8 +410,8 @@ async def test_fxtwitter_initialization_skips_nitter(plugin_module):
     assert fake.closed is True
 
 
-def test_fxtwitter_readiness_stays_in_sync_with_api(plugin_module):
-    plugin = plugin_module.TwitterPlugin(
+def test_fxtwitter_readiness_stays_in_sync_with_api(provider_plugin_module):
+    plugin = provider_plugin_module.TwitterPlugin(
         object(),
         {"basic": {"twitter_data_provider": "fxtwitter"}},
     )
@@ -603,7 +428,7 @@ def test_fxtwitter_readiness_stays_in_sync_with_api(plugin_module):
 
 @pytest.mark.asyncio
 async def test_fxtwitter_initialization_failure_keeps_recovery_task(
-    plugin_module,
+    provider_plugin_module,
     monkeypatch,
 ):
     async def unavailable(self):
@@ -616,7 +441,7 @@ async def test_fxtwitter_initialization_failure_keeps_recovery_task(
         "check_fxtwitter_available",
         unavailable,
     )
-    plugin = plugin_module.TwitterPlugin(
+    plugin = provider_plugin_module.TwitterPlugin(
         object(),
         {"basic": {"twitter_data_provider": "fxtwitter"}},
     )
@@ -636,7 +461,7 @@ async def test_fxtwitter_initialization_failure_keeps_recovery_task(
 
 @pytest.mark.asyncio
 async def test_fxtwitter_health_exception_keeps_recovery_task(
-    plugin_module,
+    provider_plugin_module,
     monkeypatch,
 ):
     async def unavailable(self):
@@ -649,7 +474,7 @@ async def test_fxtwitter_health_exception_keeps_recovery_task(
         "check_fxtwitter_available",
         unavailable,
     )
-    plugin = plugin_module.TwitterPlugin(
+    plugin = provider_plugin_module.TwitterPlugin(
         object(),
         {"basic": {"twitter_data_provider": "fxtwitter"}},
     )
@@ -668,8 +493,8 @@ async def test_fxtwitter_health_exception_keeps_recovery_task(
 
 
 @pytest.mark.asyncio
-async def test_fxtwitter_polling_retries_until_recovered(plugin_module):
-    plugin = plugin_module.TwitterPlugin(
+async def test_fxtwitter_polling_retries_until_recovered(provider_plugin_module):
+    plugin = provider_plugin_module.TwitterPlugin(
         object(),
         {"basic": {"twitter_data_provider": "fxtwitter"}},
     )
@@ -708,8 +533,8 @@ async def test_fxtwitter_polling_retries_until_recovered(plugin_module):
 
 
 @pytest.mark.asyncio
-async def test_nitter_default_preserves_original_initialization(plugin_module):
-    plugin = plugin_module.TwitterPlugin(object(), {})
+async def test_nitter_default_preserves_original_initialization(provider_plugin_module):
+    plugin = provider_plugin_module.TwitterPlugin(object(), {})
     plugin._poll_tweets = _wait_forever
 
     assert plugin.data_provider == "nitter"
@@ -726,7 +551,7 @@ async def test_nitter_default_preserves_original_initialization(plugin_module):
 
 @pytest.mark.asyncio
 async def test_nitter_initialization_failure_still_skips_polling(
-    plugin_module,
+    provider_plugin_module,
     monkeypatch,
 ):
     async def unavailable(self, _websites):
@@ -740,7 +565,7 @@ async def test_nitter_initialization_failure_still_skips_polling(
         "check_website_available",
         unavailable,
     )
-    plugin = plugin_module.TwitterPlugin(object(), {})
+    plugin = provider_plugin_module.TwitterPlugin(object(), {})
     plugin._poll_tweets = _wait_forever
 
     await plugin.initialize()
@@ -755,10 +580,10 @@ async def test_nitter_initialization_failure_still_skips_polling(
     assert fake.closed is True
 
 
-def test_flat_and_grouped_provider_config_are_compatible(plugin_module):
-    assert plugin_module.TwitterWebUIController is None
+def test_flat_and_grouped_provider_config_are_compatible(provider_plugin_module):
+    assert provider_plugin_module.TwitterWebUIController is None
 
-    flat = plugin_module.TwitterPlugin(
+    flat = provider_plugin_module.TwitterPlugin(
         object(),
         {
             "twitter_data_provider": "fxtwitter",
@@ -767,7 +592,7 @@ def test_flat_and_grouped_provider_config_are_compatible(plugin_module):
             "twitter_link_recognition_enabled": False,
         },
     )
-    grouped = plugin_module.TwitterPlugin(
+    grouped = provider_plugin_module.TwitterPlugin(
         object(),
         {
             "basic": {
@@ -790,7 +615,7 @@ def test_flat_and_grouped_provider_config_are_compatible(plugin_module):
     assert grouped.poll_max_tweets_per_user == 9
     assert grouped.link_recognition_mode == "command"
 
-    defaulted = plugin_module.TwitterPlugin(object(), {})
+    defaulted = provider_plugin_module.TwitterPlugin(object(), {})
     assert defaulted.poll_max_tweets_per_user == 5
     assert defaulted.link_recognition_mode == "auto"
 
@@ -802,8 +627,8 @@ def test_flat_and_grouped_provider_config_are_compatible(plugin_module):
     ({"translation": {"twitter_translate_timeout_seconds": 0}}, 1),
     ({"twitter_translate_timeout_seconds": -2}, 1),
 ])
-def test_translation_timeout_config_compatibility(plugin_module, config, expected):
-    plugin = plugin_module.TwitterPlugin(object(), config)
+def test_translation_timeout_config_compatibility(provider_plugin_module, config, expected):
+    plugin = provider_plugin_module.TwitterPlugin(object(), config)
     assert plugin.translate_timeout_seconds == expected
     assert plugin.message_service.settings.translate_timeout_seconds == expected
     assert plugin.message_service.avatar_cache is not None
@@ -825,8 +650,8 @@ def test_translation_timeout_config_compatibility(plugin_module, config, expecte
         ("unexpected", "auto"),
     ],
 )
-def test_link_recognition_mode_normalization(plugin_module, value, expected):
-    assert plugin_module._normalize_link_recognition_mode(value) == expected
+def test_link_recognition_mode_normalization(provider_plugin_module, value, expected):
+    assert provider_plugin_module._normalize_link_recognition_mode(value) == expected
 
 
 def test_schema_exposes_link_modes_and_provider_selector():
@@ -850,7 +675,7 @@ def test_schema_exposes_link_modes_and_provider_selector():
 
 
 @pytest.mark.asyncio
-async def test_detail_failure_only_advances_cursor_to_last_success(plugin_module):
+async def test_detail_failure_only_advances_cursor_to_last_success(provider_plugin_module):
     store = {
         "tester": {
             "screen_name": "Tester",
@@ -887,24 +712,24 @@ async def test_detail_failure_only_advances_cursor_to_last_success(plugin_module
     class Delivery:
         async def push_to_subscribers(self, *_args, **_kwargs):
             delivery_module = sys.modules[
-                f"{plugin_module.__package__}.services.tweet_delivery_service"
+                f"{provider_plugin_module.__package__}.services.tweet_delivery_service"
             ]
             return delivery_module.DeliveryResult(
                 delivery_module.DeliveryState.DELIVERED
             )
 
     api = API()
-    subscriptions = plugin_module.SubscriptionService(
+    subscriptions = provider_plugin_module.SubscriptionService(
         get_kv,
         put_kv,
         api,
         lambda: True,
     )
-    polling = plugin_module.PollingService(
+    polling = provider_plugin_module.PollingService(
         api,
         subscriptions,
         Delivery(),
-        plugin_module.PollingSettings(
+        provider_plugin_module.PollingSettings(
             include_retweets=True,
             data_provider="fxtwitter",
             custom_nitter_url="",
@@ -919,7 +744,7 @@ async def test_detail_failure_only_advances_cursor_to_last_success(plugin_module
 
 
 @pytest.mark.asyncio
-async def test_timeline_failure_does_not_advance_polling_cursor(plugin_module):
+async def test_timeline_failure_does_not_advance_polling_cursor(provider_plugin_module):
     store = {
         "tester": {
             "screen_name": "Tester",
@@ -931,7 +756,7 @@ async def test_timeline_failure_does_not_advance_polling_cursor(plugin_module):
 
     class API:
         async def get_user_timeline_items(self, _username, _since_id):
-            raise plugin_module.FxTwitterTimelineError("第二页请求失败")
+            raise provider_plugin_module.FxTwitterTimelineError("第二页请求失败")
 
     async def get_kv(_key, _default):
         return copy.deepcopy(store)
@@ -945,17 +770,17 @@ async def test_timeline_failure_does_not_advance_polling_cursor(plugin_module):
             return None
 
     api = API()
-    subscriptions = plugin_module.SubscriptionService(
+    subscriptions = provider_plugin_module.SubscriptionService(
         get_kv,
         put_kv,
         api,
         lambda: True,
     )
-    polling = plugin_module.PollingService(
+    polling = provider_plugin_module.PollingService(
         api,
         subscriptions,
         Delivery(),
-        plugin_module.PollingSettings(
+        provider_plugin_module.PollingSettings(
             include_retweets=True,
             data_provider="fxtwitter",
             custom_nitter_url="",
@@ -972,13 +797,13 @@ async def test_timeline_failure_does_not_advance_polling_cursor(plugin_module):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["server_error", "repeated_cursor", "rate_limit", "transport"])
-async def test_fxtwitter_failure_scope_and_retry(plugin_module, monkeypatch, failure):
+async def test_fxtwitter_failure_scope_and_retry(provider_plugin_module, monkeypatch, failure):
     spec = importlib.util.spec_from_file_location(
-        f"{plugin_module.__package__}.real_twitter_api", ROOT / "twitter_api.py"
+        f"{provider_plugin_module.__package__}.real_twitter_api", ROOT / "twitter_api.py"
     )
     api_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(api_module)
-    polling_module = sys.modules[f"{plugin_module.__package__}.services.polling_service"]
+    polling_module = sys.modules[f"{provider_plugin_module.__package__}.services.polling_service"]
     monkeypatch.setattr(polling_module, "FxTwitterTimelineError", api_module.FxTwitterTimelineError)
 
     async def no_sleep(_seconds):
@@ -1022,7 +847,7 @@ async def test_fxtwitter_failure_scope_and_retry(plugin_module, monkeypatch, fai
     monkeypatch.setattr(api_module.httpx, "AsyncClient", lambda **_kwargs: client_type(
         transport=httpx.MockTransport(handler)
     ))
-    delivery_module = sys.modules[f"{plugin_module.__package__}.services.tweet_delivery_service"]
+    delivery_module = sys.modules[f"{provider_plugin_module.__package__}.services.tweet_delivery_service"]
 
     class Delivery:
         collective_enabled = False
@@ -1031,11 +856,11 @@ async def test_fxtwitter_failure_scope_and_retry(plugin_module, monkeypatch, fai
             sent.append(username)
             return delivery_module.DeliveryResult(delivery_module.DeliveryState.DELIVERED)
 
-    polling = plugin_module.PollingService(
+    polling = provider_plugin_module.PollingService(
         api,
-        plugin_module.SubscriptionService(get_kv, put_kv, api, lambda: True),
+        provider_plugin_module.SubscriptionService(get_kv, put_kv, api, lambda: True),
         Delivery(),
-        plugin_module.PollingSettings(
+        provider_plugin_module.PollingSettings(
             include_retweets=True, data_provider="fxtwitter", custom_nitter_url="", website_list=(),
         ),
     )
@@ -1057,7 +882,7 @@ async def test_fxtwitter_failure_scope_and_retry(plugin_module, monkeypatch, fai
         await api.close()
 
 
-def test_timeline_metadata_is_the_only_source_of_retweet_context(plugin_module):
+def test_timeline_metadata_is_the_only_source_of_retweet_context(provider_plugin_module):
     tweet_info = {
         "username": "original",
         "retweet": {
@@ -1066,13 +891,13 @@ def test_timeline_metadata_is_the_only_source_of_retweet_context(plugin_module):
         },
     }
 
-    plugin_module.TwitterPlugin._attach_timeline_item_metadata(
+    provider_plugin_module.TwitterPlugin._attach_timeline_item_metadata(
         tweet_info,
         {"username": "original", "is_retweet": False},
     )
     assert tweet_info["retweet"] is None
 
-    plugin_module.TwitterPlugin._attach_timeline_item_metadata(
+    provider_plugin_module.TwitterPlugin._attach_timeline_item_metadata(
         tweet_info,
         {
             "username": "original",
@@ -1088,8 +913,8 @@ def test_timeline_metadata_is_the_only_source_of_retweet_context(plugin_module):
 
 
 @pytest.mark.asyncio
-async def test_commands_report_timeline_failures_clearly(plugin_module):
-    plugin = plugin_module.TwitterPlugin.__new__(plugin_module.TwitterPlugin)
+async def test_commands_report_timeline_failures_clearly(provider_plugin_module):
+    plugin = provider_plugin_module.TwitterPlugin.__new__(provider_plugin_module.TwitterPlugin)
     plugin._provider_ready = True
     store = {}
 
@@ -1103,10 +928,10 @@ async def test_commands_report_timeline_failures_clearly(plugin_module):
             }
 
         async def get_user_newtimeline(self, _username):
-            raise plugin_module.FxTwitterTimelineError("首页请求失败")
+            raise provider_plugin_module.FxTwitterTimelineError("首页请求失败")
 
         async def get_user_timeline_items(self, _username):
-            raise plugin_module.FxTwitterTimelineError("首页请求失败")
+            raise provider_plugin_module.FxTwitterTimelineError("首页请求失败")
 
     class Event:
         message_str = "/推特关注 tester"
@@ -1126,7 +951,7 @@ async def test_commands_report_timeline_failures_clearly(plugin_module):
         store.clear()
         store.update(copy.deepcopy(data))
 
-    plugin.subscription_service = plugin_module.SubscriptionService(
+    plugin.subscription_service = provider_plugin_module.SubscriptionService(
         get_kv,
         put_kv,
         api,
@@ -1145,7 +970,7 @@ async def test_commands_report_timeline_failures_clearly(plugin_module):
 
 @pytest.mark.asyncio
 async def test_existing_author_subscription_reuses_cursor_without_api_calls(
-    plugin_module,
+    provider_plugin_module,
 ):
     store = {
         "Tester": {
@@ -1171,7 +996,7 @@ async def test_existing_author_subscription_reuses_cursor_without_api_calls(
         store.clear()
         store.update(copy.deepcopy(data))
 
-    service = plugin_module.SubscriptionService(
+    service = provider_plugin_module.SubscriptionService(
         get_kv,
         put_kv,
         API(),
@@ -1197,7 +1022,7 @@ async def test_existing_author_subscription_reuses_cursor_without_api_calls(
 
 @pytest.mark.asyncio
 async def test_poll_interval_save_wakes_timer_and_rolls_back_on_failure(
-    plugin_module,
+    provider_plugin_module,
 ):
     class Config(dict):
         def __init__(self, fail=False):
@@ -1210,7 +1035,7 @@ async def test_poll_interval_save_wakes_timer_and_rolls_back_on_failure(
             if self.fail:
                 raise RuntimeError("disk full")
 
-    plugin = plugin_module.TwitterPlugin.__new__(plugin_module.TwitterPlugin)
+    plugin = provider_plugin_module.TwitterPlugin.__new__(provider_plugin_module.TwitterPlugin)
     plugin.config = Config()
     plugin.poll_interval = 5
     plugin._poll_wakeup = asyncio.Event()
@@ -1242,14 +1067,14 @@ async def test_poll_interval_save_wakes_timer_and_rolls_back_on_failure(
 
 @pytest.mark.asyncio
 async def test_wait_for_next_poll_survives_legacy_asyncio_timeout(
-    plugin_module,
+    provider_plugin_module,
     monkeypatch,
 ):
     """模拟 Python 3.10：asyncio.TimeoutError 与内置 TimeoutError 是两个类。
 
     轮询等待若只捕获内置 TimeoutError，第一次等待超时就会让后台轮询任务退出。
     """
-    plugin = plugin_module.TwitterPlugin.__new__(plugin_module.TwitterPlugin)
+    plugin = provider_plugin_module.TwitterPlugin.__new__(provider_plugin_module.TwitterPlugin)
     plugin._running = True
     plugin.poll_interval = 1
     plugin._poll_wakeup = asyncio.Event()
@@ -1266,14 +1091,14 @@ async def test_wait_for_next_poll_survives_legacy_asyncio_timeout(
                 awaitable.close()
             raise LegacyTimeout
 
-    monkeypatch.setattr(plugin_module, "asyncio", FakeAsyncio)
+    monkeypatch.setattr(provider_plugin_module, "asyncio", FakeAsyncio)
     # 未修复时这里会抛出 LegacyTimeout，无法返回。
     await plugin._wait_for_next_poll()
 
 
 @pytest.mark.asyncio
 async def test_subscription_service_concurrent_adds_preserve_sessions(
-    plugin_module,
+    provider_plugin_module,
 ):
     store = {}
 
@@ -1293,7 +1118,7 @@ async def test_subscription_service_concurrent_adds_preserve_sessions(
             await asyncio.sleep(0)
             return ["500"]
 
-    service = plugin_module.SubscriptionService(
+    service = provider_plugin_module.SubscriptionService(
         get_kv,
         put_kv,
         API(),
@@ -1316,10 +1141,10 @@ async def test_subscription_service_concurrent_adds_preserve_sessions(
     assert author["since_id"] == "500"
 
 
-def test_retweet_dedup_cache_is_bounded(plugin_module):
+def test_retweet_dedup_cache_is_bounded(provider_plugin_module):
     seen_data = {}
     for tweet_id in range(505):
-        plugin_module.SubscriptionService.mark_retweet_seen(
+        provider_plugin_module.SubscriptionService.mark_retweet_seen(
             seen_data,
             "session",
             str(tweet_id),
@@ -1328,7 +1153,7 @@ def test_retweet_dedup_cache_is_bounded(plugin_module):
     assert len(seen_data["session"]) == 500
     assert seen_data["session"][0] == "5"
 
-    plugin_module.SubscriptionService.mark_retweet_seen(
+    provider_plugin_module.SubscriptionService.mark_retweet_seen(
         seen_data,
         "session",
         "100",
@@ -1338,7 +1163,7 @@ def test_retweet_dedup_cache_is_bounded(plugin_module):
 
 
 @pytest.mark.asyncio
-async def test_polling_skips_disabled_retweets_and_advances_cursor(plugin_module):
+async def test_polling_skips_disabled_retweets_and_advances_cursor(provider_plugin_module):
     store = {
         "tester": {
             "screen_name": "Tester",
@@ -1374,7 +1199,7 @@ async def test_polling_skips_disabled_retweets_and_advances_cursor(plugin_module
         return True
 
     # 使用真实发送服务验证“不发送”，允许它先完成已有回执的恢复。
-    plugin = plugin_module.TwitterPlugin(types.SimpleNamespace(send_message=send_message), {
+    plugin = provider_plugin_module.TwitterPlugin(types.SimpleNamespace(send_message=send_message), {
         "twitter_include_retweets": False,
     })
     plugin.get_kv_data, plugin.put_kv_data = get_kv, put_kv
@@ -1388,12 +1213,12 @@ async def test_polling_skips_disabled_retweets_and_advances_cursor(plugin_module
 
 @pytest.mark.asyncio
 async def test_test_command_and_link_recognition_share_prepared_delivery(
-    plugin_module,
+    provider_plugin_module,
 ):
-    plugin = plugin_module.TwitterPlugin.__new__(plugin_module.TwitterPlugin)
+    plugin = provider_plugin_module.TwitterPlugin.__new__(provider_plugin_module.TwitterPlugin)
     plugin._provider_ready = True
     plugin.include_retweets = True
-    plugin.link_recognition_mode = plugin_module.LINK_RECOGNITION_MODE_AUTO
+    plugin.link_recognition_mode = provider_plugin_module.LINK_RECOGNITION_MODE_AUTO
 
     class API:
         async def get_user_timeline_items(self, _username):
@@ -1497,8 +1322,8 @@ async def test_test_command_and_link_recognition_share_prepared_delivery(
 
 
 @pytest.mark.asyncio
-async def test_link_recognition_command_mode_and_off_mode(plugin_module):
-    plugin = plugin_module.TwitterPlugin.__new__(plugin_module.TwitterPlugin)
+async def test_link_recognition_command_mode_and_off_mode(provider_plugin_module):
+    plugin = provider_plugin_module.TwitterPlugin.__new__(provider_plugin_module.TwitterPlugin)
     plugin._provider_ready = True
     handled = []
 
@@ -1521,7 +1346,7 @@ async def test_link_recognition_command_mode_and_off_mode(plugin_module):
             return text
 
     plugin._handle_tweet_link = handle_link
-    plugin.link_recognition_mode = plugin_module.LINK_RECOGNITION_MODE_COMMAND
+    plugin.link_recognition_mode = provider_plugin_module.LINK_RECOGNITION_MODE_COMMAND
 
     automatic_results = [
         result
@@ -1547,7 +1372,7 @@ async def test_link_recognition_command_mode_and_off_mode(plugin_module):
     assert handled == [("123", True)]
     assert "用法" in missing_link_results[0]
 
-    plugin.link_recognition_mode = plugin_module.LINK_RECOGNITION_MODE_OFF
+    plugin.link_recognition_mode = provider_plugin_module.LINK_RECOGNITION_MODE_OFF
     off_event = Event("/推特解析 https://x.com/tester/status/456")
     off_results = [
         result
@@ -1560,7 +1385,7 @@ async def test_link_recognition_command_mode_and_off_mode(plugin_module):
 
 
 @pytest.mark.asyncio
-async def test_polling_limits_each_author_and_continues_next_round(plugin_module):
+async def test_polling_limits_each_author_and_continues_next_round(provider_plugin_module):
     store = {
         "tester": {
             "screen_name": "Tester",
@@ -1569,7 +1394,7 @@ async def test_polling_limits_each_author_and_continues_next_round(plugin_module
         }
     }
     saved_cursors = []
-    delivery_contract = _delivery_contract(plugin_module)
+    delivery_contract = _delivery_contract(provider_plugin_module)
 
     class API:
         async def get_user_timeline_items(self, _username, since_id):
@@ -1607,14 +1432,14 @@ async def test_polling_limits_each_author_and_continues_next_round(plugin_module
             )
 
     api = API()
-    subscriptions = plugin_module.SubscriptionService(
+    subscriptions = provider_plugin_module.SubscriptionService(
         get_kv, put_kv, api, lambda: True
     )
-    polling = plugin_module.PollingService(
+    polling = provider_plugin_module.PollingService(
         api,
         subscriptions,
         Delivery(),
-        plugin_module.PollingSettings(
+        provider_plugin_module.PollingSettings(
             include_retweets=True,
             data_provider="fxtwitter",
             custom_nitter_url="",
@@ -1633,7 +1458,7 @@ async def test_polling_limits_each_author_and_continues_next_round(plugin_module
 
 
 @pytest.mark.asyncio
-async def test_skipped_deliveries_do_not_consume_poll_limit(plugin_module):
+async def test_skipped_deliveries_do_not_consume_poll_limit(provider_plugin_module):
     store = {
         "tester": {
             "screen_name": "Tester",
@@ -1641,7 +1466,7 @@ async def test_skipped_deliveries_do_not_consume_poll_limit(plugin_module):
             "subscribers": {"session": {"status": True}},
         }
     }
-    delivery_contract = _delivery_contract(plugin_module)
+    delivery_contract = _delivery_contract(provider_plugin_module)
     states = [
         delivery_contract.DeliveryState.SKIPPED,
         delivery_contract.DeliveryState.SKIPPED,
@@ -1680,14 +1505,14 @@ async def test_skipped_deliveries_do_not_consume_poll_limit(plugin_module):
             return delivery_contract.DeliveryResult(states.pop(0))
 
     api = API()
-    subscriptions = plugin_module.SubscriptionService(
+    subscriptions = provider_plugin_module.SubscriptionService(
         get_kv, put_kv, api, lambda: True
     )
-    polling = plugin_module.PollingService(
+    polling = provider_plugin_module.PollingService(
         api,
         subscriptions,
         Delivery(),
-        plugin_module.PollingSettings(
+        provider_plugin_module.PollingSettings(
             include_retweets=True,
             data_provider="nitter",
             custom_nitter_url="https://nitter.example",
@@ -1702,7 +1527,7 @@ async def test_skipped_deliveries_do_not_consume_poll_limit(plugin_module):
 
 
 @pytest.mark.asyncio
-async def test_delivery_failure_stops_without_skipping_cursor(plugin_module):
+async def test_delivery_failure_stops_without_skipping_cursor(provider_plugin_module):
     store = {
         "tester": {
             "screen_name": "Tester",
@@ -1710,7 +1535,7 @@ async def test_delivery_failure_stops_without_skipping_cursor(plugin_module):
             "subscribers": {"session": {"status": True}},
         }
     }
-    delivery_contract = _delivery_contract(plugin_module)
+    delivery_contract = _delivery_contract(provider_plugin_module)
     attempted = []
 
     class API:
@@ -1751,14 +1576,14 @@ async def test_delivery_failure_stops_without_skipping_cursor(plugin_module):
             return delivery_contract.DeliveryResult(state)
 
     api = API()
-    subscriptions = plugin_module.SubscriptionService(
+    subscriptions = provider_plugin_module.SubscriptionService(
         get_kv, put_kv, api, lambda: True
     )
-    polling = plugin_module.PollingService(
+    polling = provider_plugin_module.PollingService(
         api,
         subscriptions,
         Delivery(),
-        plugin_module.PollingSettings(
+        provider_plugin_module.PollingSettings(
             include_retweets=True,
             data_provider="fxtwitter",
             custom_nitter_url="",
@@ -1774,7 +1599,7 @@ async def test_delivery_failure_stops_without_skipping_cursor(plugin_module):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("flush_succeeds", [True, False])
 async def test_collective_cursor_waits_for_flush(
-    plugin_module,
+    provider_plugin_module,
     flush_succeeds,
 ):
     store = {
@@ -1784,7 +1609,7 @@ async def test_collective_cursor_waits_for_flush(
             "subscribers": {"session": {"status": True}},
         }
     }
-    delivery_contract = _delivery_contract(plugin_module)
+    delivery_contract = _delivery_contract(provider_plugin_module)
 
     class API:
         async def get_user_timeline_items(self, _username, _since_id):
@@ -1828,14 +1653,14 @@ async def test_collective_cursor_waits_for_flush(
             self.has_collected = False
 
     api = API()
-    subscriptions = plugin_module.SubscriptionService(
+    subscriptions = provider_plugin_module.SubscriptionService(
         get_kv, put_kv, api, lambda: True
     )
-    polling = plugin_module.PollingService(
+    polling = provider_plugin_module.PollingService(
         api,
         subscriptions,
         Delivery(),
-        plugin_module.PollingSettings(
+        provider_plugin_module.PollingSettings(
             include_retweets=True,
             data_provider="fxtwitter",
             custom_nitter_url="",
@@ -1856,7 +1681,7 @@ async def test_collective_cursor_waits_for_flush(
 
 
 @pytest.mark.asyncio
-async def test_cursor_updates_are_monotonic(plugin_module):
+async def test_cursor_updates_are_monotonic(provider_plugin_module):
     store = {
         "tester": {
             "screen_name": "Tester",
@@ -1872,7 +1697,7 @@ async def test_cursor_updates_are_monotonic(plugin_module):
         store.clear()
         store.update(copy.deepcopy(data))
 
-    subscriptions = plugin_module.SubscriptionService(
+    subscriptions = provider_plugin_module.SubscriptionService(
         get_kv, put_kv, object(), lambda: True
     )
 
@@ -1882,7 +1707,7 @@ async def test_cursor_updates_are_monotonic(plugin_module):
 
 
 @pytest.mark.asyncio
-async def test_provider_switch_skips_already_processed_tweet_ids(plugin_module):
+async def test_provider_switch_skips_already_processed_tweet_ids(provider_plugin_module):
     """切换数据源后即使游标偏旧，也不应再次发送已处理的推文。"""
     store = {
         "tester": {
@@ -1892,7 +1717,7 @@ async def test_provider_switch_skips_already_processed_tweet_ids(plugin_module):
             "subscribers": {"session": {"status": True}},
         }
     }
-    delivery_contract = _delivery_contract(plugin_module)
+    delivery_contract = _delivery_contract(provider_plugin_module)
     detail_calls = []
     delivered = []
 
@@ -1932,17 +1757,17 @@ async def test_provider_switch_skips_already_processed_tweet_ids(plugin_module):
             )
 
     api = FxTwitterAPI()
-    subscriptions = plugin_module.SubscriptionService(
+    subscriptions = provider_plugin_module.SubscriptionService(
         get_kv,
         put_kv,
         api,
         lambda: True,
     )
-    polling = plugin_module.PollingService(
+    polling = provider_plugin_module.PollingService(
         api,
         subscriptions,
         Delivery(),
-        plugin_module.PollingSettings(
+        provider_plugin_module.PollingSettings(
             include_retweets=True,
             data_provider="fxtwitter",
             custom_nitter_url="",
@@ -1958,7 +1783,7 @@ async def test_provider_switch_skips_already_processed_tweet_ids(plugin_module):
 
 
 @pytest.mark.asyncio
-async def test_processed_tweet_history_is_bounded_and_legacy_safe(plugin_module):
+async def test_processed_tweet_history_is_bounded_and_legacy_safe(provider_plugin_module):
     store = {
         "tester": {
             "screen_name": "Tester",
@@ -1974,7 +1799,7 @@ async def test_processed_tweet_history_is_bounded_and_legacy_safe(plugin_module)
         store.clear()
         store.update(copy.deepcopy(data))
 
-    subscriptions = plugin_module.SubscriptionService(
+    subscriptions = provider_plugin_module.SubscriptionService(
         get_kv,
         put_kv,
         object(),
@@ -1996,7 +1821,7 @@ async def test_processed_tweet_history_is_bounded_and_legacy_safe(plugin_module)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("use_node,collective", [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize("outcome", ["success", "cancel_before_save", "cancel_after_save", "failure"])
-async def test_delivery_history_and_cursor_share_one_write(plugin_module, use_node, collective, outcome):
+async def test_delivery_history_and_cursor_share_one_write(provider_plugin_module, use_node, collective, outcome):
     store = {"twitter_subs": {"tester": {
         "since_id": "100", "processed_tweet_ids": ["100"],
         "subscribers": {"group": {"status": True}},
@@ -2028,7 +1853,7 @@ async def test_delivery_history_and_cursor_share_one_write(plugin_module, use_no
     async def get_tweet(_username, tweet_id):
         return {"status": True, "tweet_id": tweet_id, "text": "body"}
 
-    plugin = plugin_module.TwitterPlugin(types.SimpleNamespace(send_message=send_message), {
+    plugin = provider_plugin_module.TwitterPlugin(types.SimpleNamespace(send_message=send_message), {
         "twitter_use_node": use_node, "twitter_collective_forward": collective,
         "twitter_deduplicate_retweets": False,
     })
@@ -2086,7 +1911,7 @@ async def test_delivery_history_and_cursor_share_one_write(plugin_module, use_no
 
 
 @pytest.fixture
-def review_retry_plugin_factory(plugin_module):
+def review_retry_plugin_factory(provider_plugin_module):
     def make(store, send_message, *, transport="collective", put_kv=None, dedup=False,
              provider="nitter", max_tweets=5, include_retweets=True):
         async def get_kv(key, default):
@@ -2102,7 +1927,7 @@ def review_retry_plugin_factory(plugin_module):
         async def get_tweet(username, tweet_id):
             return {"status": True, "tweet_id": tweet_id, "username": username, "text": "body"}
 
-        plugin = plugin_module.TwitterPlugin(types.SimpleNamespace(send_message=send_message), {
+        plugin = provider_plugin_module.TwitterPlugin(types.SimpleNamespace(send_message=send_message), {
             "twitter_data_provider": provider,
             "twitter_poll_max_tweets_per_user": max_tweets,
             "twitter_use_node": transport != "plain",
@@ -2999,7 +2824,7 @@ async def test_confirmed_retweet_restores_seen_across_global_config_changes(
     ({"twitter_translate_method": "x", "twitter_translate_native_lang": "ja"}, "x", "ja"),
     ({"translation": {"twitter_translate_method": "x", "twitter_translate_native_lang": "en"}}, "x", "en"),
 ])
-def test_translation_method_config_compatibility(plugin_module, config, method, lang):
-    plugin = plugin_module.TwitterPlugin(types.SimpleNamespace(), config)
+def test_translation_method_config_compatibility(provider_plugin_module, config, method, lang):
+    plugin = provider_plugin_module.TwitterPlugin(types.SimpleNamespace(), config)
     assert plugin.message_service.settings.translate_method == method
     assert plugin.message_service.settings.translate_native_lang == lang

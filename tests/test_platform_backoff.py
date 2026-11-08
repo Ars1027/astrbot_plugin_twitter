@@ -5,30 +5,15 @@ from datetime import timedelta
 
 import httpx
 import pytest
-from test_provider_initialization import Image, Plain, Video
-from test_telegram_albums import albums as albums  # noqa: PLC0414
-from test_telegram_support import TG_GROUP, TG_PRIVATE, TG_TOPIC
-from test_telegram_support import plugin_env as plugin_env  # noqa: PLC0414
+
+from support.fakes import clock_for
+from support.fakes import Image, Plain, Video, TG_GROUP, TG_PRIVATE, TG_TOPIC
 
 
 class RetryAfter(Exception):
     def __init__(self, seconds):
         super().__init__("secret URL and token")
         self.retry_after = seconds
-
-
-def clock_for(plugin, monkeypatch):
-    module = sys.modules[type(plugin.delivery_service.send_backoff).__module__]
-    clock = types.SimpleNamespace(now=100.0, sleeps=[], logs=[])
-
-    async def sleep(seconds):
-        clock.sleeps.append(seconds)
-        clock.now += seconds
-
-    monkeypatch.setattr(module, "monotonic", lambda: clock.now)
-    monkeypatch.setattr(module, "asyncio", types.SimpleNamespace(sleep=sleep))
-    monkeypatch.setattr(module.logger, "warning", clock.logs.append)
-    return clock, module
 
 
 @pytest.mark.asyncio

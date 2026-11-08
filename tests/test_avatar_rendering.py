@@ -1,5 +1,7 @@
 """可选的本地浏览器回归测试；不增加插件运行时依赖。"""
 
+
+
 import base64
 import io
 import os
@@ -8,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from test_media_lifecycle import ROOT, plugin_module as plugin_module
+from support.plugin_loader import ROOT
 
 
 @pytest.fixture(scope="module")
@@ -29,11 +31,11 @@ def browser():
 @pytest.mark.parametrize("theme", ["dark", "light"])
 @pytest.mark.parametrize("avatar_state", ["cached", "missing", "decode-error"])
 def test_avatar_rendering_has_no_broken_images_or_layout_changes(
-    plugin_module, browser, tmp_path, theme, avatar_state
+    media_plugin_module, browser, tmp_path, theme, avatar_state
 ):
     jinja = pytest.importorskip("jinja2")
     pil = pytest.importorskip("PIL.Image")
-    renderer = sys.modules[f"{plugin_module.__package__}.twitter_renderer"]
+    renderer = sys.modules[f"{media_plugin_module.__package__}.twitter_renderer"]
     uri = (
         "data:image/png;base64,"
         + base64.b64encode((ROOT / "logo.png").read_bytes()).decode()
@@ -118,9 +120,9 @@ def test_avatar_rendering_has_no_broken_images_or_layout_changes(
 
 
 @pytest.mark.parametrize("theme", ["dark", "light"])
-def test_article_layout_retains_lists_escapes_html_and_fits_image(plugin_module, browser, theme):
+def test_article_layout_retains_lists_escapes_html_and_fits_image(media_plugin_module, browser, theme):
     jinja = pytest.importorskip("jinja2")
-    renderer = sys.modules[f"{plugin_module.__package__}.twitter_renderer"]
+    renderer = sys.modules[f"{media_plugin_module.__package__}.twitter_renderer"]
     article = {
         "title": "标题 <script>bad()</script>", "cover": "", "preview_text": "", "url": "",
         "blocks": [
@@ -162,9 +164,9 @@ def test_article_layout_retains_lists_escapes_html_and_fits_image(plugin_module,
 
 @pytest.mark.parametrize("theme", ["dark", "light"])
 @pytest.mark.parametrize("quoted", [False, True])
-def test_article_pages_keep_numbers_and_visible_link_targets(plugin_module, browser, theme, quoted):
+def test_article_pages_keep_numbers_and_visible_link_targets(media_plugin_module, browser, theme, quoted):
     jinja = pytest.importorskip("jinja2")
-    renderer = sys.modules[f"{plugin_module.__package__}.twitter_renderer"]
+    renderer = sys.modules[f"{media_plugin_module.__package__}.twitter_renderer"]
     url = "https://example.com/report.pdf?from=article&lang=zh"
     article = {"title": "列表", "cover": "", "url": "", "blocks": [
         {"type": "ordered-list-item", "text": "正文" * 180, "spans": [{"text": "正文" * 180}], "links": [url] if i == 6 else []}

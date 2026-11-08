@@ -2,11 +2,8 @@ import asyncio
 from dataclasses import replace
 
 import pytest
-from test_provider_initialization import Video
-from test_telegram_support import TG_GROUP, TG_TOPIC, make_event
-from test_telegram_support import (
-    plugin_env as plugin_env,  # noqa: PLC0414 - 复用插件 fixture。
-)
+
+from support.fakes import Video, TG_GROUP, TG_TOPIC, make_event
 
 MB = 1024 * 1024
 MAIN_VIDEO = "https://media.test/main.mp4"

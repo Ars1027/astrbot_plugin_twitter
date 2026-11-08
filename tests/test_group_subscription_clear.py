@@ -2,15 +2,13 @@ import asyncio
 import copy
 
 import pytest
-from test_provider_initialization import Plain
-from test_telegram_support import TG_GROUP, TG_TOPIC
-from test_telegram_support import plugin_env as plugin_env  # noqa: PLC0414
-from test_twitter_webui import _load_webui_module
+
+from support.fakes import Plain, TG_GROUP, TG_TOPIC
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("target", ["qq-bot:GroupMessage:100", TG_GROUP, TG_TOPIC])
-async def test_group_clear_is_atomic_and_preserves_other_sessions(plugin_env, target):
+async def test_group_clear_is_atomic_and_preserves_other_sessions(plugin_env, target, webui_module):
     _module, make, data, _calls, _fail = plugin_env
     plugin = make()
     retained = {umo: {"status": False, "pending_delivery_ids": ["102"],
@@ -34,7 +32,7 @@ async def test_group_clear_is_atomic_and_preserves_other_sessions(plugin_env, ta
         data[key] = copy.deepcopy(value)
 
     plugin.put_kv_data = put
-    web = _load_webui_module()
+    web = webui_module
     controller = web.TwitterWebUIController(plugin, plugin.context)
     web.fake_request.payload = {"umo": target}
     payload, status = await controller.clear_group_subscriptions()
@@ -54,12 +52,12 @@ async def test_group_clear_is_atomic_and_preserves_other_sessions(plugin_env, ta
 @pytest.mark.parametrize("payload", [None, [], {}, {"umo": None}, {"umo": "invalid"},
                                      {"umo": "qq-bot:FriendMessage:100"},
                                      {"umo": "qq-bot:OtherMessage:100"}])
-async def test_group_clear_rejects_invalid_or_non_group_targets(plugin_env, payload):
+async def test_group_clear_rejects_invalid_or_non_group_targets(plugin_env, payload, webui_module):
     _module, make, data, _calls, _fail = plugin_env
     plugin = make()
     data["twitter_subs"] = {"tester": {"subscribers": {"qq-bot:GroupMessage:100": {}}}}
     before = copy.deepcopy(data)
-    web = _load_webui_module()
+    web = webui_module
     controller = web.TwitterWebUIController(plugin, plugin.context)
     web.fake_request.payload = payload
     result, status = await controller.clear_group_subscriptions()
@@ -68,7 +66,7 @@ async def test_group_clear_rejects_invalid_or_non_group_targets(plugin_env, payl
 
 
 @pytest.mark.asyncio
-async def test_group_clear_storage_failure_preserves_live_state_and_returns_error(plugin_env):
+async def test_group_clear_storage_failure_preserves_live_state_and_returns_error(plugin_env, webui_module):
     _module, make, data, _calls, _fail = plugin_env
     plugin = make()
     data["twitter_subs"] = {"tester": {"since_id": "100", "subscribers": {
@@ -84,7 +82,7 @@ async def test_group_clear_storage_failure_preserves_live_state_and_returns_erro
 
     plugin.get_kv_data = get_live
     plugin.put_kv_data = failed_put
-    web = _load_webui_module()
+    web = webui_module
     controller = web.TwitterWebUIController(plugin, plugin.context)
     web.fake_request.payload = {"umo": "qq-bot:GroupMessage:100"}
     result, status = await controller.clear_group_subscriptions()

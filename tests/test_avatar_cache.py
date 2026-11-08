@@ -1,5 +1,7 @@
 """头像缓存、受限下载和截图接入的回归测试。"""
 
+
+
 import asyncio
 import base64
 import copy
@@ -12,12 +14,7 @@ import time
 import httpx
 import pytest
 
-from test_fxtwitter_api import api_module as api_module
-from test_media_lifecycle import (
-    Image,
-    _message_settings,
-    plugin_module as plugin_module,
-)
+from support.fakes import MediaImage as Image, _message_settings
 
 
 PNG = base64.b64decode(
@@ -53,17 +50,17 @@ def expire_file(path):
 
 @pytest.mark.asyncio
 async def test_cache_survives_reload_and_refreshes_expired_avatar(
-    plugin_module, tmp_path
+    media_plugin_module, tmp_path
 ):
     api = API()
-    cache = plugin_module.AvatarCacheService(api, lambda: tmp_path)
+    cache = media_plugin_module.AvatarCacheService(api, lambda: tmp_path)
     uri = await cache.get(URL)
     assert uri.startswith("data:image/png;base64,")
     assert await cache.get(URL) == uri
     assert len(api.calls) == 1
     assert api.calls[0][1] == {"timeout": 5, "max_bytes": 1024 * 1024}
     await cache.close()
-    cache = plugin_module.AvatarCacheService(api, lambda: tmp_path)
+    cache = media_plugin_module.AvatarCacheService(api, lambda: tmp_path)
     assert await cache.get(URL) == uri and len(api.calls) == 1
     expire_file(cache_file(tmp_path))
     api.result = b"GIF89a-new-avatar"
@@ -74,10 +71,10 @@ async def test_cache_survives_reload_and_refreshes_expired_avatar(
 
 @pytest.mark.asyncio
 async def test_stale_cache_survives_failure_and_new_url_does_not_reuse_it(
-    plugin_module, tmp_path
+    media_plugin_module, tmp_path
 ):
     api = API()
-    cache = plugin_module.AvatarCacheService(api, lambda: tmp_path)
+    cache = media_plugin_module.AvatarCacheService(api, lambda: tmp_path)
     uri = await cache.get(URL)
     expire_file(cache_file(tmp_path))
     api.error = httpx.ConnectError("offline")
@@ -102,11 +99,11 @@ async def test_stale_cache_survives_failure_and_new_url_does_not_reuse_it(
     ids=["empty", "html", "invalid", "oversized"],
 )
 async def test_invalid_or_oversized_response_not_cached(
-    plugin_module, tmp_path, invalid
+    media_plugin_module, tmp_path, invalid
 ):
     api = API()
     api.result = invalid
-    cache = plugin_module.AvatarCacheService(api, lambda: tmp_path)
+    cache = media_plugin_module.AvatarCacheService(api, lambda: tmp_path)
     assert await cache.get(URL) is None
     assert await cache.get(URL) is None
     assert len(api.calls) == 1
@@ -115,10 +112,10 @@ async def test_invalid_or_oversized_response_not_cached(
 
 @pytest.mark.asyncio
 async def test_corrupt_cache_and_write_failure_are_nonfatal(
-    plugin_module, tmp_path, monkeypatch
+    media_plugin_module, tmp_path, monkeypatch
 ):
     api = API()
-    cache = plugin_module.AvatarCacheService(api, lambda: tmp_path)
+    cache = media_plugin_module.AvatarCacheService(api, lambda: tmp_path)
     path = cache_file(tmp_path)
     path.parent.mkdir()
     path.write_text("broken json")
@@ -138,13 +135,13 @@ async def test_corrupt_cache_and_write_failure_are_nonfatal(
     assert await cache.get(URL + "?new")
     assert not cache_file(tmp_path, URL + "?new").exists()
     # 连目录都无法创建时，也不能让截图正文丢失。
-    inaccessible = plugin_module.AvatarCacheService(api, denied)
+    inaccessible = media_plugin_module.AvatarCacheService(api, denied)
     assert await inaccessible.get(URL)
 
 
 @pytest.mark.asyncio
 async def test_same_url_single_flight_and_one_waiter_cancellation(
-    plugin_module, tmp_path
+    media_plugin_module, tmp_path
 ):
     entered, release = asyncio.Event(), asyncio.Event()
     api = API()
@@ -156,7 +153,7 @@ async def test_same_url_single_flight_and_one_waiter_cancellation(
         return PNG
 
     api.download_media = download
-    cache = plugin_module.AvatarCacheService(api, lambda: tmp_path)
+    cache = media_plugin_module.AvatarCacheService(api, lambda: tmp_path)
     first = asyncio.create_task(cache.get(URL))
     await entered.wait()
     second = asyncio.create_task(cache.get(URL))
@@ -172,7 +169,7 @@ async def test_same_url_single_flight_and_one_waiter_cancellation(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("action", ["timeout", "cancel", "close"])
 async def test_timeout_cancellation_and_close_leave_no_download_tasks(
-    plugin_module, tmp_path, action
+    media_plugin_module, tmp_path, action
 ):
     entered = asyncio.Event()
     cancelled = []
@@ -186,7 +183,7 @@ async def test_timeout_cancellation_and_close_leave_no_download_tasks(
             cancelled.append(True)
 
     api.download_media = download
-    cache = plugin_module.AvatarCacheService(api, lambda: tmp_path)
+    cache = media_plugin_module.AvatarCacheService(api, lambda: tmp_path)
     cache.DOWNLOAD_TIMEOUT = 0.05
     tasks_before = asyncio.all_tasks()
     task = asyncio.create_task(cache.get(URL))
@@ -208,10 +205,10 @@ async def test_timeout_cancellation_and_close_leave_no_download_tasks(
 
 
 @pytest.mark.asyncio
-async def test_negative_cache_is_bounded_and_expires(plugin_module, tmp_path):
+async def test_negative_cache_is_bounded_and_expires(media_plugin_module, tmp_path):
     api = API()
     api.error = ValueError("offline")
-    cache = plugin_module.AvatarCacheService(api, lambda: tmp_path)
+    cache = media_plugin_module.AvatarCacheService(api, lambda: tmp_path)
     cache.MAX_ENTRIES = 3
     for i in range(5):
         assert await cache.get(URL + str(i)) is None
@@ -225,10 +222,10 @@ async def test_negative_cache_is_bounded_and_expires(plugin_module, tmp_path):
 
 @pytest.mark.asyncio
 async def test_cancellation_waits_for_atomic_disk_write(
-    plugin_module, tmp_path, monkeypatch
+    media_plugin_module, tmp_path, monkeypatch
 ):
     api = API()
-    cache = plugin_module.AvatarCacheService(api, lambda: tmp_path)
+    cache = media_plugin_module.AvatarCacheService(api, lambda: tmp_path)
     started, release = threading.Event(), threading.Event()
     original_write = cache._write
 
@@ -254,10 +251,10 @@ async def test_cancellation_waits_for_atomic_disk_write(
 
 @pytest.mark.asyncio
 async def test_lru_and_byte_capacity_only_clean_avatar_directory(
-    plugin_module, tmp_path
+    media_plugin_module, tmp_path
 ):
     api = API()
-    cache = plugin_module.AvatarCacheService(api, lambda: tmp_path)
+    cache = media_plugin_module.AvatarCacheService(api, lambda: tmp_path)
     cache.MAX_ENTRIES = 3
     for i in range(3):
         await cache.get(URL + str(i))
@@ -287,7 +284,7 @@ async def test_lru_and_byte_capacity_only_clean_avatar_directory(
 @pytest.mark.parametrize("pre_download", [False, True])
 @pytest.mark.parametrize("send_media", [False, True])
 async def test_screenshot_caches_both_avatars_without_changing_original_media(
-    plugin_module, tmp_path, pre_download, send_media
+    media_plugin_module, tmp_path, pre_download, send_media
 ):
     api = API()
     captured = {}
@@ -307,13 +304,13 @@ async def test_screenshot_caches_both_avatars_without_changing_original_media(
         return "https://example.test/rendered.png"
 
     api.download_media_to_data_uri = data_uri
-    cache = plugin_module.AvatarCacheService(api, lambda: tmp_path)
-    service = plugin_module.TweetMessageService(
+    cache = media_plugin_module.AvatarCacheService(api, lambda: tmp_path)
+    service = media_plugin_module.TweetMessageService(
         object(),
         api,
         render,
         _message_settings(
-            plugin_module,
+            media_plugin_module,
             pre_download_media=pre_download,
             send_media_separately=send_media,
         ),
@@ -331,21 +328,21 @@ async def test_screenshot_caches_both_avatars_without_changing_original_media(
 
 @pytest.mark.asyncio
 async def test_text_mode_never_loads_avatars_and_failed_render_stays_media_disabled(
-    plugin_module, tmp_path
+    media_plugin_module, tmp_path
 ):
     api = API()
-    cache = plugin_module.AvatarCacheService(api, lambda: tmp_path)
+    cache = media_plugin_module.AvatarCacheService(api, lambda: tmp_path)
     tweet = {
         "text": "正文",
         "avatar": URL,
         "images": ["https://example.test/photo.png"],
     }
-    service = plugin_module.TweetMessageService(
+    service = media_plugin_module.TweetMessageService(
         object(),
         api,
         None,
         _message_settings(
-            plugin_module, text_render_mode="text", send_media_separately=False
+            media_plugin_module, text_render_mode="text", send_media_separately=False
         ),
         avatar_cache=cache,
     )
@@ -355,12 +352,12 @@ async def test_text_mode_never_loads_avatars_and_failed_render_stays_media_disab
     async def failed_render(*_args, **_kwargs):
         raise ValueError("render failed")
 
-    service = plugin_module.TweetMessageService(
+    service = media_plugin_module.TweetMessageService(
         object(),
         api,
         failed_render,
         _message_settings(
-            plugin_module, send_media_separately=False, pre_download_media=False
+            media_plugin_module, send_media_separately=False, pre_download_media=False
         ),
         avatar_cache=cache,
     )

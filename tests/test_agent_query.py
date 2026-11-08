@@ -1,20 +1,14 @@
 import copy
-import sys
 import types
 
 import pytest
 
-from test_provider_initialization import _load_main_module
 
-
-module = sys.modules[f"{_load_main_module().__package__}.services.subscription_service"]
-
-
-def test_format_recent_deliveries_for_agent_empty_and_rich():
-    assert module.SubscriptionService.format_recent_deliveries_for_agent([]) == (
+def test_format_recent_deliveries_for_agent_empty_and_rich(subscription_module):
+    assert subscription_module.SubscriptionService.format_recent_deliveries_for_agent([]) == (
         "本会话暂无成功推送摘要。"
     )
-    text = module.SubscriptionService.format_recent_deliveries_for_agent([{
+    text = subscription_module.SubscriptionService.format_recent_deliveries_for_agent([{
         "username": "tester",
         "tweet_id": "1",
         "text": "你好",
@@ -30,7 +24,7 @@ def test_format_recent_deliveries_for_agent_empty_and_rich():
 
 
 @pytest.mark.asyncio
-async def test_twitter_recent_pushes_tool_respects_switch_and_session():
+async def test_twitter_recent_pushes_tool_respects_switch_and_session(subscription_module, provider_plugin_module):
     data = {"twitter_subs": {
         "tester": {
             "since_id": "1",
@@ -66,14 +60,14 @@ async def test_twitter_recent_pushes_tool_respects_switch_and_session():
     async def put(key, value):
         data[key] = copy.deepcopy(value)
 
-    service = module.SubscriptionService(get, put, None, lambda: True)
+    service = subscription_module.SubscriptionService(get, put, None, lambda: True)
     plugin = types.SimpleNamespace(
         agent_query_enabled=False,
         subscription_service=service,
     )
 
-    plugin_module = _load_main_module()
-    tool = types.MethodType(plugin_module.TwitterPlugin.twitter_recent_pushes, plugin)
+
+    tool = types.MethodType(provider_plugin_module.TwitterPlugin.twitter_recent_pushes, plugin)
 
     event_a = types.SimpleNamespace(unified_msg_origin="session-a")
     disabled = await tool(event_a)
@@ -89,7 +83,7 @@ async def test_twitter_recent_pushes_tool_respects_switch_and_session():
 
 
 @pytest.mark.asyncio
-async def test_retweet_query_preserves_source_and_original_author():
+async def test_retweet_query_preserves_source_and_original_author(subscription_module):
     data = {"twitter_subs": {"reposter": {"subscribers": {"group": {}}}}}
 
     async def get(key, default):
@@ -98,7 +92,7 @@ async def test_retweet_query_preserves_source_and_original_author():
     async def put(key, value):
         data[key] = copy.deepcopy(value)
 
-    service = module.SubscriptionService(get, put, None, lambda: True)
+    service = subscription_module.SubscriptionService(get, put, None, lambda: True)
     await service.record_delivery("group", "reposter", {
         "tweet_id": "123", "username": "original", "text": "原作者正文",
         "retweet": {"retweeter_username": "reposter"},
@@ -114,8 +108,8 @@ async def test_retweet_query_preserves_source_and_original_author():
     assert await service.list_session_recent_deliveries("other") == []
 
 
-def test_legacy_retweet_does_not_invent_original_author():
-    item = module.SubscriptionService._normalize_delivery_record({
+def test_legacy_retweet_does_not_invent_original_author(subscription_module):
+    item = subscription_module.SubscriptionService._normalize_delivery_record({
         "tweet_id": "123", "username": "reposter", "text": "旧转帖",
         "is_retweet": True, "url": "https://x.com/reposter/status/123",
     }, "reposter")
@@ -124,8 +118,8 @@ def test_legacy_retweet_does_not_invent_original_author():
 
 
 @pytest.mark.parametrize("media_key", ["images", "videos"])
-def test_quote_only_media_is_visible_to_agent(media_key):
+def test_quote_only_media_is_visible_to_agent(media_key, subscription_module):
     tweet = {"tweet_id": "124", "quote": {media_key: ["https://example.com/media"]}}
-    record = module.SubscriptionService.prepare_delivery("group", "tester", tweet)
+    record = subscription_module.SubscriptionService.prepare_delivery("group", "tester", tweet)
     assert record.record["has_media"] is True
-    assert "含媒体" in module.SubscriptionService.format_recent_deliveries_for_agent([record.record])
+    assert "含媒体" in subscription_module.SubscriptionService.format_recent_deliveries_for_agent([record.record])

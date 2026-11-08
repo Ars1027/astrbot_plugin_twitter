@@ -1,5 +1,7 @@
 """文章正常、降级与旧数据兼容路径，不调用真实模型或消息适配器。"""
 
+
+
 import copy
 import asyncio
 import json
@@ -9,8 +11,7 @@ import types
 import httpx
 import pytest
 
-from test_fxtwitter_api import api_module as api_module
-from test_media_lifecycle import Image, Nodes, Plain, _delivery_settings, _message_settings, plugin_module as plugin_module
+from support.fakes import MediaImage as Image, Nodes, Plain, _delivery_settings, _message_settings
 
 
 def status(blocks=True):
@@ -277,8 +278,8 @@ def test_nitter_multiple_embedded_tweets_keep_each_container_once(api_module):
     ]
 
 
-def test_ordered_list_numbers_survive_article_pages(plugin_module):
-    renderer = sys.modules[f"{plugin_module.__package__}.twitter_renderer"]
+def test_ordered_list_numbers_survive_article_pages(media_plugin_module):
+    renderer = sys.modules[f"{media_plugin_module.__package__}.twitter_renderer"]
     blocks = [{"type": "ordered-list-item", "text": str(i) + "正文" * 180, "spans": [{"text": str(i) + "正文" * 180}]} for i in range(1, 9)]
     article = {"title": "列表", "blocks": blocks, "cover": ""}
     context = renderer.build_tweet_card_context("author", {"article": article})
@@ -288,24 +289,24 @@ def test_ordered_list_numbers_survive_article_pages(plugin_module):
     assert "number" not in blocks[0]
 
 
-def make_service(plugin_module, **settings):
-    return plugin_module.TweetMessageService(
+def make_service(media_plugin_module, **settings):
+    return media_plugin_module.TweetMessageService(
         object(),
         object(),
         None,
-        _message_settings(plugin_module, pre_download_media=False, **settings),
+        _message_settings(media_plugin_module, pre_download_media=False, **settings),
     )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("valid", [True, False])
 async def test_article_translation_keeps_block_structure(
-    plugin_module, api_module, valid
+    media_plugin_module, api_module, valid
 ):
     tweet = api_module.TwitterAPI(provider="fxtwitter")._adapt_fxtwitter_status(
         status()
     )
-    service = make_service(plugin_module, translate_enabled=True)
+    service = make_service(media_plugin_module, translate_enabled=True)
     calls = []
     service.get_translate_provider_id = lambda _umo: async_value("model")
 
@@ -333,8 +334,8 @@ async def test_article_translation_keeps_block_structure(
 
 
 @pytest.mark.asyncio
-async def test_link_only_translation_is_not_called(plugin_module):
-    service = make_service(plugin_module, translate_enabled=True)
+async def test_link_only_translation_is_not_called(media_plugin_module):
+    service = make_service(media_plugin_module, translate_enabled=True)
     assert await service.maybe_translate(
         {"text": "https://x.com/i/article/200"}, "session"
     ) == (None, None)
@@ -343,12 +344,12 @@ async def test_link_only_translation_is_not_called(plugin_module):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("media", [True, False])
 async def test_article_screenshot_failure_returns_full_text(
-    plugin_module, api_module, media
+    media_plugin_module, api_module, media
 ):
     tweet = api_module.TwitterAPI(provider="fxtwitter")._adapt_fxtwitter_status(
         status()
     )
-    service = make_service(plugin_module, send_media_separately=media)
+    service = make_service(media_plugin_module, send_media_separately=media)
 
     async def render(*args, **kwargs):
         raise RuntimeError("render unavailable")
@@ -360,9 +361,9 @@ async def test_article_screenshot_failure_returns_full_text(
 
 
 def test_article_context_no_duplicate_cover_and_lossless_paging(
-    plugin_module, api_module
+    media_plugin_module, api_module
 ):
-    renderer = sys.modules[f"{plugin_module.__package__}.twitter_renderer"]
+    renderer = sys.modules[f"{media_plugin_module.__package__}.twitter_renderer"]
     tweet = api_module.TwitterAPI(provider="fxtwitter")._adapt_fxtwitter_status(
         status()
     )
@@ -389,7 +390,7 @@ def test_article_context_no_duplicate_cover_and_lossless_paging(
 @pytest.mark.parametrize("quoted", [False, True])
 @pytest.mark.parametrize("translated", [False, True])
 async def test_article_footer_obeys_link_setting_without_removing_body_links(
-    plugin_module, api_module, include_link, mode, quoted, translated,
+    media_plugin_module, api_module, include_link, mode, quoted, translated,
 ):
     jinja = pytest.importorskip("jinja2")
     raw = status()
@@ -403,7 +404,7 @@ async def test_article_footer_obeys_link_setting_without_removing_body_links(
         target["translated_text"] = "译文"
     tweet = {"username": "poster", "tweet_id": "300", "text": "引用附言", "quote": target} if quoted else target
     service = make_service(
-        plugin_module, include_tweet_link=include_link, send_media_separately=False,
+        media_plugin_module, include_tweet_link=include_link, send_media_separately=False,
         text_render_mode="text" if mode == "text" else "screenshot",
     )
     rendered = []
@@ -427,7 +428,7 @@ async def test_article_footer_obeys_link_setting_without_removing_body_links(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["plain", "node", "collective"])
-async def test_failed_article_page_keeps_cursor_and_only_retries_failed_session(plugin_module, api_module, transport):
+async def test_failed_article_page_keeps_cursor_and_only_retries_failed_session(media_plugin_module, api_module, transport):
     raw = status()
     raw["article"]["content"]["blocks"] = [
         {"type": "ordered-list-item", "text": "段落" * 180} for _ in range(8)
@@ -468,14 +469,14 @@ async def test_failed_article_page_keeps_cursor_and_only_retries_failed_session(
         return f"https://example.com/page-{page}.png"
 
     api = types.SimpleNamespace(get_user_timeline_items=timeline, get_tweet=detail)
-    subscriptions = plugin_module.SubscriptionService(get_kv, put_kv, api, lambda: True)
-    messages = make_service(plugin_module, include_tweet_link=True, send_media_separately=False)
+    subscriptions = media_plugin_module.SubscriptionService(get_kv, put_kv, api, lambda: True)
+    messages = make_service(media_plugin_module, include_tweet_link=True, send_media_separately=False)
     messages.html_render = render
-    delivery = plugin_module.TweetDeliveryService(
+    delivery = media_plugin_module.TweetDeliveryService(
         types.SimpleNamespace(send_message=send), subscriptions, messages,
-        _delivery_settings(plugin_module, use_node=transport != "plain", collective_forward=transport == "collective", deduplicate_retweets=True),
+        _delivery_settings(media_plugin_module, use_node=transport != "plain", collective_forward=transport == "collective", deduplicate_retweets=True),
     )
-    polling = plugin_module.PollingService(api, subscriptions, delivery, plugin_module.PollingSettings(
+    polling = media_plugin_module.PollingService(api, subscriptions, delivery, media_plugin_module.PollingSettings(
         include_retweets=True, data_provider="fxtwitter", custom_nitter_url="", website_list=(),
     ))
     await polling.check_user("tester", copy.deepcopy(store["twitter_subs"]["tester"]))
@@ -498,8 +499,8 @@ async def test_failed_article_page_keeps_cursor_and_only_retries_failed_session(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancel_at", ["second-page", "extra"])
-async def test_screenshot_receipt_only_after_all_pages_before_extra_media(plugin_module, cancel_at):
-    module = sys.modules[f"{plugin_module.__package__}.services.tweet_message_service"]
+async def test_screenshot_receipt_only_after_all_pages_before_extra_media(media_plugin_module, cancel_at):
+    module = sys.modules[f"{media_plugin_module.__package__}.services.tweet_message_service"]
     pages = [Image.fromURL(f"https://example.com/{i}.png") for i in (1, 2)]
     extra = Image.fromURL("https://example.com/extra.png")
     chain = module.TweetMessageChain([*pages, Plain("https://x.com/author/status/100"), extra], required_images=pages)
@@ -513,8 +514,8 @@ async def test_screenshot_receipt_only_after_all_pages_before_extra_media(plugin
             raise asyncio.CancelledError
         return True
 
-    delivery = plugin_module.TweetDeliveryService(
-        types.SimpleNamespace(send_message=send), object(), object(), _delivery_settings(plugin_module),
+    delivery = media_plugin_module.TweetDeliveryService(
+        types.SimpleNamespace(send_message=send), object(), object(), _delivery_settings(media_plugin_module),
     )
     plain, _videos = delivery.split_plain_chain_and_videos(chain)
     with pytest.raises(asyncio.CancelledError):

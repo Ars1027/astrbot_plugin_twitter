@@ -6,9 +6,6 @@ import types
 import httpx
 import pytest
 
-from test_fxtwitter_api import api_module as api_module
-from test_provider_initialization import plugin_module as plugin_module
-
 
 DETAIL = '''<div class="main-tweet">
 <a class="fullname">Tester</a><a class="username">@tester</a>
@@ -106,7 +103,7 @@ async def test_nitter_optional_failure_preserves_body_and_other_media(api_module
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["timeline", "detail"])
-async def test_real_nitter_failure_does_not_send_or_commit_cursor(api_module, plugin_module, monkeypatch, failure):
+async def test_real_nitter_failure_does_not_send_or_commit_cursor(api_module, provider_plugin_module, monkeypatch, failure):
     api = api_module.TwitterAPI(nitter_url="https://nitter.test")
     store = {"tester": {"since_id": "100", "subscribers": {"session": {"status": True}}}}
 
@@ -124,10 +121,10 @@ async def test_real_nitter_failure_does_not_send_or_commit_cursor(api_module, pl
         def fail_parse(*_args, **_kwargs):
             raise ValueError("broken parser")
         monkeypatch.setattr(api, "_extract_avatar", fail_parse)
-    subscriptions = plugin_module.SubscriptionService(get_kv, put_kv, api, lambda: True)
-    polling = plugin_module.PollingService(
+    subscriptions = provider_plugin_module.SubscriptionService(get_kv, put_kv, api, lambda: True)
+    polling = provider_plugin_module.PollingService(
         api, subscriptions, types.SimpleNamespace(push_to_subscribers=send, collective_enabled=False),
-        plugin_module.PollingSettings(include_retweets=True, data_provider="nitter", custom_nitter_url="", website_list=()),
+        provider_plugin_module.PollingSettings(include_retweets=True, data_provider="nitter", custom_nitter_url="", website_list=()),
     )
 
     def respond(request):
@@ -144,12 +141,12 @@ async def test_real_nitter_failure_does_not_send_or_commit_cursor(api_module, pl
 
 
 @pytest.mark.asyncio
-async def test_nitter_timeline_failure_commands_do_not_create_empty_cursor(api_module, plugin_module, monkeypatch):
+async def test_nitter_timeline_failure_commands_do_not_create_empty_cursor(api_module, provider_plugin_module, monkeypatch):
     api = api_module.TwitterAPI(nitter_url="https://nitter.test")
-    plugin = plugin_module.TwitterPlugin.__new__(plugin_module.TwitterPlugin)
+    plugin = provider_plugin_module.TwitterPlugin.__new__(provider_plugin_module.TwitterPlugin)
     plugin._provider_ready = True
     plugin.twitter_api = api
-    monkeypatch.setattr(plugin_module, "FxTwitterTimelineError", api_module.TwitterTimelineError)
+    monkeypatch.setattr(provider_plugin_module, "FxTwitterTimelineError", api_module.TwitterTimelineError)
 
     async def user_info(_username):
         return {"status": True, "screen_name": "Tester", "user_name": "tester"}
@@ -161,7 +158,7 @@ async def test_nitter_timeline_failure_commands_do_not_create_empty_cursor(api_m
         pytest.fail("初始化时间线失败时不得创建订阅")
 
     monkeypatch.setattr(api, "get_user_info", user_info)
-    plugin.subscription_service = plugin_module.SubscriptionService(get_kv, put_kv, api, lambda: True)
+    plugin.subscription_service = provider_plugin_module.SubscriptionService(get_kv, put_kv, api, lambda: True)
     event = types.SimpleNamespace(
         unified_msg_origin="session", plain_result=lambda text: text,
         message_str="/推特关注 tester",

@@ -4,13 +4,13 @@
 
 # Twitter 推文转发
 
-将关注的 X/Twitter 推文自动送到 AstrBot 会话；也可在聊天中解析链接、翻译推文，并通过 WebUI 管理订阅。
+将关注的 X/Twitter 推文自动送到 QQ 或 Telegram 会话；也可在聊天中解析链接、翻译推文，并通过 WebUI 管理订阅。
 
 [![AstrBot 插件](https://img.shields.io/badge/AstrBot-Plugin-3178c6?style=flat-square)](https://github.com/AstrBotDevs/AstrBot)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776ab?style=flat-square)](https://www.python.org/)
 [![MIT License](https://img.shields.io/badge/License-MIT-238636?style=flat-square)](./LICENSE)
 
-**[快速开始](#快速开始) · [效果展示](#效果展示) · [指令](#聊天指令) · [配置](#配置参考)**
+**[快速开始](#快速开始) · [效果展示](#效果展示) · [平台差异](#平台差异) · [指令](#聊天指令) · [配置](#配置参考)**
 
 </div>
 
@@ -18,9 +18,9 @@
 
 ## 效果展示
 
-推文可按普通消息或合并转发发送；截图模式可将正文渲染成仿推特风格的时间线卡片。
+QQ 支持普通消息与合并转发，Telegram 按帖子发送文字、照片或图片相册；两者均可使用截图模式，将正文渲染成仿推特风格的时间线卡片。
 
-<p align="center"><strong>合并转发推送</strong><br><img src="./asset/readme/forward-delivery.png" alt="群聊中收到的推文合并转发消息" width="440"></p>
+<p align="center"><strong>QQ · 合并转发推送</strong><br><img src="./asset/readme/forward-delivery.png" alt="群聊中收到的推文合并转发消息" width="440"></p>
 
 <p align="center"><strong>截图模式 · 仿推特风格渲染</strong><br><a href="./asset/readme/tweet-screenshot-render.png"><img src="./asset/readme/tweet-screenshot-render.png" alt="截图模式将推文与引用内容渲染为仿推特风格的深色时间线卡片；点击查看原图" width="320"></a></p>
 
@@ -49,25 +49,25 @@
    pip install -r requirements.txt
    ```
 
-2. 在 AstrBot 中加载插件。默认数据源是 Nitter；也可将 `twitter_data_provider` 改为 `fxtwitter`，请配置可用的 `twitter_nitter_url`或`twitter_fxtwitter_api_base`，保存后重载插件。
+2. 在 AstrBot 中连接 QQ 或 Telegram 适配器并加载插件。默认数据源是 Nitter；也可将 `twitter_data_provider` 改为 `fxtwitter`，请配置可用的 `twitter_nitter_url` 或 `twitter_fxtwitter_api_base`，保存后重载插件。
 3. 在要接收推送的会话中发送 `/推特关注 <用户名>`，然后用 `/推特测试 <用户名>` 检查消息效果；发送 `/推特列表` 可查看当前会话的订阅。
 
 首次将新推主加入插件时，会以当前最新推文建立增量游标，之后的自动轮询推送新内容；需要立即查看一条推文时可使用 `/推特测试`。
 
 ## 主要功能
 
-- **按会话订阅**：群聊、私聊各自维护订阅与推送开关；支持指令和 WebUI 管理。
+- **按会话订阅**：QQ、Telegram 的群聊和私聊各自维护订阅与推送开关；Telegram 超级群话题也可独立订阅，支持指令和 WebUI 管理。
 - **定时追踪**：从 Nitter 或 FxTwitter 读取增量推文，按旧到新推送；每个推主每轮可限制推送数量。
-- **失败补发**：保存各会话已发送或按配置跳过的结果，重试只向未完成的会话补发。
+- **失败补发**：记录各会话的推送结果，失败后只向未完成的会话重试。
 - **消息呈现**：支持普通消息、单条或集体合并转发、深浅色截图、图片与视频，以及可选的转帖去重。
 - **按需解析与翻译**：手动或自动解析 `twitter.com` / `x.com` 链接；可选择 X 自带翻译（仅 FxTwitter）或 LLM 翻译。
-- **Agent 推送摘要**：可选开启，供模型通过工具按需查询本会话最近成功推送的摘要，推送时不主动追加 LLM 对话历史。
+- **推送历史检索**：可选开启，供模型通过工具按需查询本会话最近成功推送的摘要，让机器人“知道”自己最近推送了什么消息。
 
 ### WebUI 订阅管理
 
-在支持 **Plugin Pages API** 的 AstrBot 版本中，可从 Dashboard 打开“Twitter 订阅管理”。页面提供会话搜索、订阅开关、R18 与仅媒体设置、群级推送开关和轮询间隔调整。
+在支持 **Plugin Pages API** 的 AstrBot 版本中，可从 Dashboard 打开“Twitter 订阅管理”。页面提供会话搜索、订阅开关、R18 与仅媒体设置、群级推送开关和轮询间隔调整；也可清空指定群的订阅，或一键复制当前会话的推主列表。
 
-下图使用**模拟数据**展示 WebUI，不是真实群聊或推送记录。
+下图使用**模拟数据**展示 WebUI。
 
 ![使用模拟数据预览的 Twitter 订阅管理 WebUI](./asset/readme/webui-preview.png)
 
@@ -75,13 +75,29 @@
 
 旧版 AstrBot 若缺少 Plugin Pages API，插件主体仍可加载，订阅可继续通过聊天指令管理。
 
-### 失败重试与补发
+### 平台差异
 
-同一推主向多个会话推送时，普通消息、单条合并转发和集体转发都会保存各会话的处理结果。一个会话发送失败后，重试会跳过已成功发送或按配置跳过的会话；这些记录跨插件重载和数据源切换保留。
+两种平台共用关注、测试和解析指令，主要差异如下：
 
-每位推主每次最多接纳 **500 条**重试条目，窗口未完成前，同一推主的新批次等待。失败会话恢复、暂停或退订后，继续处理窗口；如果仍有未完成会话且推文详情不可用，则保留游标等待重试。已有订阅数据继续使用，旧回执按批恢复。
+| 项目 | QQ（`aiocqhttp`） | Telegram（`telegram`） |
+| --- | --- | --- |
+| 订阅会话 | 群聊、私聊 | 群聊、私聊、超级群话题 |
+| 消息形式 | 普通消息或合并转发 | 按帖发送文字、照片或图片相册 |
+| 集体转发 | 轮询结束后汇总为合并转发 | 轮询结束后逐帖发送 |
+| WebUI 群列表 | 自动读取机器人所在群 | 显示已有订阅的群及手动添加的群 |
+| 默认视频直发上限 | 256 MB | 50 MB，可独立配置 |
 
-已成功发送的转帖记录会在重试时补存，先于当前配置判断；暂时关闭转帖去重或转帖推送，不会抹去这次发送记录。配置跳过和仅排队的推文不会被记为实际发送。
+**群组与话题**：Telegram 无法自动列出机器人加入的全部群聊。可在 WebUI 点击“添加 Telegram 群组”，选择机器人并填写完整负数群 ID，例如 `-1001234567890`；机器人需已入群且有发言权限。话题订阅需先在对应话题中通过指令建立，之后可在 WebUI 管理。两种平台的私聊订阅均显示在“其他会话”中。
+
+手动添加的 Telegram 群组在暂无订阅时也会保留；清空订阅后，可点击“删除群组”移除列表记录。
+
+**图片与正文**：Telegram 同一帖的图片超过 10 张时分批发送相册，短正文与帖子链接可附在图片说明中，长正文和视频单独发送。
+
+#### Telegram 视频发送限制
+
+`twitter_telegram_video_max_size_mb` 默认 **50 MB**，与 QQ 的视频上限分别设置。超限时改发视频链接，上传失败时尝试降级为链接，明确限流时先等待冷却；关闭独立媒体发送后，不再追加视频或降级链接。
+
+公共 Bot API 的视频上传上限目前为 [50 MB](https://core.telegram.org/bots/api#sendvideo)。发送更大视频需自建并启用 `--local` 的 Bot API 服务（[最高 2000 MB](https://core.telegram.org/bots/api#using-a-local-bot-api-server)），再提高插件的 Telegram 视频上限。仅调大插件配置无法突破服务端限制，也不能调整适配器的上传超时。网络不稳定时，未超限的视频也可能发送失败。
 
 ## 聊天指令
 
@@ -93,13 +109,13 @@
 | `/推特批量关注 <用户1> <用户2> ... [r18] [媒体]` | `/twitter_batch_follow` | 批量关注，选项应用于本次所有推主 |
 | `/推特取关 <用户名>` | `/twitter_unfollow` | 取消当前会话中的订阅 |
 | `/推特批量取关 <用户1> <用户2> ...` | `/twitter_batch_unfollow` | 批量取消当前会话中的订阅 |
-| `/推特列表` | `/twitter_list` | 以分段合并转发列出当前会话的订阅 |
+| `/推特列表` | `/twitter_list` | 查看当前会话的订阅：QQ 合并转发，Telegram 文字分段 |
 | `/推特推送 <开启\|关闭>` | `/twitter_push` | 开关当前会话的全部推送 |
 | `/推特测试 <用户名>` | `/twitter_test` | 立即获取并发送该推主的最新推文 |
 | `/推特解析 <推文链接>` | `/twitter_parse` | 手动解析指定推文链接 |
 | `/推特清空订阅` | `/twitter_clear_all` | 清空所有会话的订阅；需要 AstrBot 管理员权限 |
 
-`/推特列表` 会把完整列表分成多个合并转发节点，每段最多 50 条订阅、正文不超过 1000 个字符；名称较长时每段可能少于 50 条。
+`/推特列表` 每段最多 50 条订阅、正文不超过 1000 个字符；名称较长时每段可能少于 50 条。QQ 将各段汇总为合并转发，Telegram 逐段发送文字。
 
 ## 配置参考
 
@@ -134,15 +150,16 @@
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| `twitter_use_node` | `true` | 单条推文使用合并转发 |
+| `twitter_use_node` | `true` | QQ 单条推文使用合并转发；Telegram 按帖发送图片相册与文字 |
 | `twitter_no_text` | `false` | 推文含媒体时不输出文字 |
 | `twitter_text_render_mode` | `text` | `text` 文字，或 `screenshot` 截图 |
 | `twitter_screenshot_theme` | `dark` | 截图使用 `dark` 或 `light` 主题 |
 | `twitter_send_media_separately` | `true` | 正文或截图之外继续发送原图、视频及视频降级链接 |
 | `twitter_image_quality` | `orig` | `large` 缩略图，或 `orig` 原图 |
-| `twitter_video_max_size_mb` | `256` | 视频直发大小上限，超过后发送链接 |
-| `twitter_collective_forward` | `false` | 将一轮轮询的多条推文汇总为合并转发；需同时开启 `twitter_use_node` |
-| `twitter_collective_max_authors` | `5` | 单条集体转发消息中的最多推主数 |
+| `twitter_video_max_size_mb` | `256` | QQ 等非 Telegram 平台的视频直发上限（MB），超过后发送链接 |
+| `twitter_telegram_video_max_size_mb` | `50` | Telegram 视频直发上限（MB），详见上方视频发送限制 |
+| `twitter_collective_forward` | `false` | 轮询结束后统一发送；QQ 汇总为合并转发，Telegram 逐帖发送；需同时开启 `twitter_use_node` |
+| `twitter_collective_max_authors` | `5` | QQ 单条集体转发消息中的最多推主数 |
 | `twitter_include_tweet_link` | `true` | 在推送、测试和解析消息末尾附带帖子链接 |
 
 ### 内容与翻译
@@ -169,7 +186,7 @@
 ## 使用前了解
 
 - **Nitter 镜像**：nitter镜像站目前已不可用 2026/8/27；需要自行部署时可参考 [Nitter 项目](https://github.com/zedeus/nitter)及[本地部署教程](https://mib7kzqsrf5.feishu.cn/wiki/O1ztwWl3GiBc4AknKvIcyaKsnFb?from=from_copylink)。
-- **FxTwitter 数据**：FxTwitter 是第三方公开 JSON API，并非 X/Twitter 官方 API；接口、限流和可用性由其服务决定。也可参考 [FxTwitter 官方仓库（FxEmbed）](https://github.com/FxEmbed/FxEmbed) 自行部署，并将 `twitter_fxtwitter_api_base` 设置为自建实例的 API 地址。
+- **FxTwitter 数据**：FxTwitter 是第三方公开 JSON API，并非 X/Twitter 官方 API；接口、限流和可用性由其服务决定，因此随时都有可能像Nitter一样挂掉。也可参考 [FxTwitter 官方仓库（FxEmbed）](https://github.com/FxEmbed/FxEmbed) 自行本地部署，并将 `twitter_fxtwitter_api_base` 设置为自建实例的 API 地址。
 - **历史补发范围**：已进入重试窗口的推文按保存的条目继续尝试；尚未接纳、且数据源已删除或不再返回的推文，无法保证补齐。停机时间过长或数据源分页不足也会影响历史补发范围。
 - **重复发送边界**：群消息发送与本地状态保存无法原子提交。发送成功后进程被强制终止，或本地 KV 持续写入失败时，下次轮询可能再次发送。
 - **会话隔离**：私聊和群聊分别保存订阅；在一处取关或关闭推送，不影响其他会话。
@@ -177,6 +194,6 @@
 
 ## 参考与反馈
 
-本插件参考了 [nonebot-plugin-twitter](https://github.com/nek0us/nonebot-plugin-twitter) 的 Nitter 抓取思路、[astrbot_plugin_rsshub](https://github.com/FlanChanXwO/astrbot_plugin_rsshub) 的订阅管理与 KV 存储模式，以及 [astrbot_plugin_qq_group_daily_analysis](https://github.com/SXP-Simon/astrbot_plugin_qq_group_daily_analysis) 的 LLM Provider 选择思路。
+本插件参考了 [nonebot-plugin-twitter](https://github.com/nek0us/nonebot-plugin-twitter) 的 Nitter 抓取思路、[astrbot_plugin_rsshub](https://github.com/FlanChanXwO/astrbot_plugin_rsshub) 的订阅管理与 KV 存储模式。
 
 项目代码由 Codex 辅助生成与迭代。遇到问题欢迎提交 [Issue](https://github.com/Ars1027/astrbot_plugin_twitter/issues)，也欢迎提交 Pull Request。代码采用 [MIT License](./LICENSE)。

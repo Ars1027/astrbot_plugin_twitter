@@ -20,9 +20,9 @@ from .platform_support import meta_value, platform_instances
 class TelegramAlbumService:
     """仅负责一批图片的 SDK 调用；降级和推文回执由发送服务统一处理。"""
 
-    def __init__(self, context: Any, backoff: PlatformSendBackoff | None = None) -> None:
+    def __init__(self, context: Any, backoff: PlatformSendBackoff) -> None:
         self.context = context
-        self.backoff = backoff if backoff is not None else PlatformSendBackoff()
+        self.backoff = backoff
 
     @staticmethod
     def _materializes_temp_file(image: Any) -> bool:

@@ -1,16 +1,11 @@
 import copy
 import json
-import sys
 
 import pytest
-from test_provider_initialization import _load_main_module
-
-
-module = sys.modules[f"{_load_main_module().__package__}.services.subscription_service"]
 
 
 @pytest.fixture
-def store():
+def store(subscription_module):
     data = {"twitter_subs": {"tester": {
         "since_id": "999", "processed_tweet_ids": ["999"],
         "subscribers": {"group-a": {"status": True}, "group-b": {"status": True}},
@@ -22,12 +17,12 @@ def store():
     async def put(key, value):
         data[key] = copy.deepcopy(value)
 
-    service = module.SubscriptionService(get, put, None, lambda: True)
+    service = subscription_module.SubscriptionService(get, put, None, lambda: True)
     return data, get, put, service
 
 
 @pytest.mark.asyncio
-async def test_history_is_bounded_isolated_and_survives_reload(store):
+async def test_history_is_bounded_isolated_and_survives_reload(store, subscription_module):
     data, get, put, service = store
     assert await service.get_recent_deliveries("group-a", "tester") == []
     for i in range(7):
@@ -37,7 +32,7 @@ async def test_history_is_bounded_isolated_and_survives_reload(store):
         })
     await service.record_delivery("group-a", "tester", {"tweet_id": "4", "text": "again"})
     # A new instance reads the same persisted snapshot, with no network lookup.
-    reloaded = module.SubscriptionService(get, put, None, lambda: False)
+    reloaded = subscription_module.SubscriptionService(get, put, None, lambda: False)
     records = await reloaded.get_recent_deliveries("group-a", "tester")
     assert [item["tweet_id"] for item in records] == ["4", "6", "5", "3", "2"]
     assert len(records[1]["text"]) == 500
@@ -71,14 +66,14 @@ async def test_unsubscribe_clears_only_its_history_and_late_write_does_not_recre
 
 
 @pytest.mark.asyncio
-async def test_history_failure_does_not_mutate_live_subscription_snapshot(store):
+async def test_history_failure_does_not_mutate_live_subscription_snapshot(store, subscription_module):
     data, get, _put, _service = store
     before = copy.deepcopy(data)
 
     async def fail(_key, _value):
         raise OSError("KV unavailable")
 
-    service = module.SubscriptionService(get, fail, None, lambda: True)
+    service = subscription_module.SubscriptionService(get, fail, None, lambda: True)
     with pytest.raises(OSError):
         await service.record_delivery("group-a", "tester", {"tweet_id": "1"})
     assert data == before
@@ -137,16 +132,16 @@ async def test_list_session_recent_deliveries_sorts_filters_and_backfills(store)
 
 
 @pytest.mark.asyncio
-async def test_pending_deliveries_are_isolated_preserved_and_cleaned(store):
+async def test_pending_deliveries_are_isolated_preserved_and_cleaned(store, subscription_module):
     data, _get, _put, service = store
     data["twitter_subs"]["other"] = {
         "since_id": "999", "subscribers": {"group-a": {"status": True}},
     }
     ids = [str(i) for i in range(1000, 1007)]
-    receipts = tuple(module.DeliveredTweet("group-a", "TESTER", tweet_id) for tweet_id in ids)
+    receipts = tuple(subscription_module.DeliveredTweet("group-a", "TESTER", tweet_id) for tweet_id in ids)
     await service.save_pending_deliveries(receipts + (
-        module.DeliveredTweet("group-b", "tester", "1001"),
-        module.DeliveredTweet("group-a", "other", "1000"),
+        subscription_module.DeliveredTweet("group-b", "tester", "1001"),
+        subscription_module.DeliveredTweet("group-a", "other", "1000"),
     ))
     author = data["twitter_subs"]["tester"]
     assert author["since_id"] == "999"
@@ -169,12 +164,12 @@ async def test_pending_deliveries_are_isolated_preserved_and_cleaned(store):
                for sub in data["twitter_subs"]["tester"]["subscribers"].values())
 
 
-def test_prepare_delivery_rejects_empty_username():
+def test_prepare_delivery_rejects_empty_username(subscription_module):
     for username in ("@", "  ", "@@@", "", None, "  @  "):
-        assert module.SubscriptionService.prepare_delivery(
+        assert subscription_module.SubscriptionService.prepare_delivery(
             "group-a", username, {"tweet_id": "1000"}
         ) is None
-    record = module.SubscriptionService.prepare_delivery(
+    record = subscription_module.SubscriptionService.prepare_delivery(
         "group-a", "@tester", {"tweet_id": "1000"}
     )
     assert record is not None
@@ -183,7 +178,7 @@ def test_prepare_delivery_rejects_empty_username():
 
 
 @pytest.mark.asyncio
-async def test_pending_delivery_write_failure_does_not_mutate_snapshot(store):
+async def test_pending_delivery_write_failure_does_not_mutate_snapshot(store, subscription_module):
     data, get, _put, _service = store
     before = copy.deepcopy(data)
     writes = []
@@ -192,11 +187,11 @@ async def test_pending_delivery_write_failure_does_not_mutate_snapshot(store):
         writes.append((key, copy.deepcopy(value)))
         raise OSError("KV unavailable")
 
-    service = module.SubscriptionService(get, fail, None, lambda: True)
-    history = module.SubscriptionService.prepare_delivery("group-a", "tester", {"tweet_id": "1000"})
+    service = subscription_module.SubscriptionService(get, fail, None, lambda: True)
+    history = subscription_module.SubscriptionService.prepare_delivery("group-a", "tester", {"tweet_id": "1000"})
     with pytest.raises(OSError):
         await service.save_pending_deliveries(
-            (module.DeliveredTweet("group-a", "tester", "1000"),),
+            (subscription_module.DeliveredTweet("group-a", "tester", "1000"),),
             recent_deliveries=(history,),
         )
     assert data == before
@@ -211,9 +206,9 @@ async def test_pending_delivery_write_failure_does_not_mutate_snapshot(store):
 
 
 @pytest.mark.asyncio
-async def test_unsubscribe_discards_pending_deliveries_and_ignores_late_results(store):
+async def test_unsubscribe_discards_pending_deliveries_and_ignores_late_results(store, subscription_module):
     data, _get, _put, service = store
-    receipts = tuple(module.DeliveredTweet(umo, "tester", "1000")
+    receipts = tuple(subscription_module.DeliveredTweet(umo, "tester", "1000")
                      for umo in ("group-a", "group-b"))
     await service.save_pending_deliveries(receipts)
     await service.remove("group-a", "tester")
@@ -239,12 +234,12 @@ async def test_cursor_commit_cleans_receipts_for_missing_timeline_items(store, c
 
 
 @pytest.mark.asyncio
-async def test_pending_window_preserves_retweet_metadata_and_shares_cursor_cleanup(store):
+async def test_pending_window_preserves_retweet_metadata_and_shares_cursor_cleanup(store, subscription_module):
     data, _get, _put, service = store
     items = [{"tweet_id": tweet_id, "username": "original", "is_retweet": True,
               "retweeter_username": "tester", "retweeter_screen_name": "Tester",
               "unused_full_text": "large payload"} for tweet_id in ("1000", "1001")]
-    receipts = tuple(module.DeliveredTweet("group-a", "tester", tweet_id)
+    receipts = tuple(subscription_module.DeliveredTweet("group-a", "tester", tweet_id)
                      for tweet_id in ("1000", "1001"))
     await service.save_pending_deliveries(receipts, pending_tweet_items={"TESTER": items})
     author = data["twitter_subs"]["tester"]
@@ -267,7 +262,7 @@ async def test_pending_window_preserves_retweet_metadata_and_shares_cursor_clean
 
 
 @pytest.mark.asyncio
-async def test_failed_window_write_does_not_mutate_live_snapshot(store):
+async def test_failed_window_write_does_not_mutate_live_snapshot(store, subscription_module):
     data, get, _put, _service = store
     before = copy.deepcopy(data)
     writes = []
@@ -276,10 +271,10 @@ async def test_failed_window_write_does_not_mutate_live_snapshot(store):
         writes.append((key, copy.deepcopy(value)))
         raise OSError("KV unavailable")
 
-    service = module.SubscriptionService(get, fail, None, lambda: True)
+    service = subscription_module.SubscriptionService(get, fail, None, lambda: True)
     with pytest.raises(OSError):
         await service.save_pending_deliveries(
-            (module.DeliveredTweet("group-a", "tester", "1000"),),
+            (subscription_module.DeliveredTweet("group-a", "tester", "1000"),),
             pending_tweet_items={"tester": [{"tweet_id": "1000", "username": "original", "is_retweet": True}]},
         )
     assert data == before
@@ -291,9 +286,9 @@ async def test_failed_window_write_does_not_mutate_live_snapshot(store):
 
 
 @pytest.mark.asyncio
-async def test_skip_confirmations_survive_reconfiguration_and_share_cursor_cleanup(store):
+async def test_skip_confirmations_survive_reconfiguration_and_share_cursor_cleanup(store, subscription_module):
     data, _get, _put, service = store
-    skipped = (module.SkippedTweet("group-a", "tester", "1000"),)
+    skipped = (subscription_module.SkippedTweet("group-a", "tester", "1000"),)
     await service.save_pending_deliveries((), skipped_tweets=skipped,
                                          pending_tweet_items={"tester": [{"tweet_id": "1000"}]})
     await service.add("group-a", "tester", media_only=True)

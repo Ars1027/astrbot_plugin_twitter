@@ -58,7 +58,7 @@
         "description": "单条推文使用合并转发消息发送",
         "type": "bool",
         "default": true,
-        "hint": "开启后 QQ 使用合并转发。Telegram 按帖子发送：多图组成相册，单图发送照片，链接附于说明；长正文和视频单独发送。"
+        "hint": "开启后 QQ 使用合并转发。Telegram 按帖子发送。"
       },
       "twitter_no_text": {
         "description": "推文含媒体时不输出文字内容",
@@ -93,22 +93,22 @@
         "hint": "large=缩略图，orig=原图（默认）"
       },
       "twitter_video_max_size_mb": {
-        "description": "视频直发大小上限（MB）",
+        "description": "QQ 视频直发大小上限（MB）",
         "type": "int",
         "default": 256,
-        "hint": "用于 QQ 等非 Telegram 平台。发送视频前会探测文件大小；超过上限时改为发送说明和视频链接。默认=256"
+        "hint": "用于 QQ，发送视频前会探测文件大小；超过上限时改为发送说明和视频链接。默认=256"
       },
       "twitter_telegram_video_max_size_mb": {
         "description": "Telegram 视频文件直发大小上限（MB）",
         "type": "int",
         "default": 50,
-        "hint": "视频超限时改发链接。公共 API 上限 50 MB；更大文件需自建 --local Bot API（最高 2000 MB）。上传超时等限制详见 README 的「Telegram 视频发送限制」。"
+        "hint": "用于TG，视频超限时改发链接。公共 API 上限 50 MB；更大文件需自建 --local Bot API（最高 2000 MB）。"
       },
       "twitter_collective_forward": {
         "description": "轮询时汇总多条新推文为一条合并转发消息",
         "type": "bool",
         "default": false,
-        "hint": "仅影响轮询推送。开启后会缓存本轮轮询期间获取到的新推文，轮询结束后统一打包发送；需同时开启“单条推文使用合并转发消息发送”，否则不会生效。Telegram 在轮询结束后逐条发送。"
+        "hint": "仅影响轮询推送。开启后会缓存本轮轮询期间获取到的新推文，轮询结束后统一打包发送；需同时开启“单条推文使用合并转发消息发送”，否则不会生效。TG 在轮询结束后逐条发送。"
       },
       "twitter_collective_max_authors": {
         "description": "集体转发时单条消息包含的最大推主数",

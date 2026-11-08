@@ -1,5 +1,7 @@
 """模拟 Provider 阻塞，验证翻译预算和轮询自愈，不调用真实 LLM。"""
 
+
+
 import asyncio
 import copy
 import sys
@@ -7,13 +9,7 @@ import types
 
 import pytest
 
-from test_media_lifecycle import (
-    Nodes,
-    Plain,
-    _delivery_settings,
-    _message_settings,
-    plugin_module as plugin_module,
-)
+from support.fakes import Nodes, Plain, _delivery_settings, _message_settings
 
 
 class Context:
@@ -43,13 +39,13 @@ class Context:
         return types.SimpleNamespace(completion_text="译文")
 
 
-def make_service(plugin_module, context, **settings):
-    return plugin_module.TweetMessageService(
+def make_service(media_plugin_module, context, **settings):
+    return media_plugin_module.TweetMessageService(
         context,
         object(),
         None,
         _message_settings(
-            plugin_module,
+            media_plugin_module,
             translate_enabled=True,
             translate_timeout_seconds=0.04,
             **settings,
@@ -57,16 +53,16 @@ def make_service(plugin_module, context, **settings):
     )
 
 
-def cycle_type(plugin_module):
+def cycle_type(media_plugin_module):
     return sys.modules[
-        f"{plugin_module.__package__}.services.tweet_message_service"
+        f"{media_plugin_module.__package__}.services.tweet_message_service"
     ].TranslationCycleState
 
 
 @pytest.mark.asyncio
-async def test_timeout_cancels_llm_and_clears_old_quote_translation(plugin_module):
+async def test_timeout_cancels_llm_and_clears_old_quote_translation(media_plugin_module):
     context = Context()
-    service = make_service(plugin_module, context)
+    service = make_service(media_plugin_module, context)
     tweet = {"text": "原文", "quote": {"text": "引用原文", "translated_text": "旧译文"}}
     tasks_before = asyncio.all_tasks()
     assert await service.maybe_translate(tweet, "session") == (None, None)
@@ -80,10 +76,10 @@ async def test_timeout_cancels_llm_and_clears_old_quote_translation(plugin_modul
 
 @pytest.mark.asyncio
 async def test_main_success_survives_quote_timeout_with_one_shared_budget(
-    plugin_module, monkeypatch
+    media_plugin_module, monkeypatch
 ):
     context = Context()
-    service = make_service(plugin_module, context)
+    service = make_service(media_plugin_module, context)
     original_generate = context.llm_generate
     original_wait_for = asyncio.wait_for
     budgets = []
@@ -107,9 +103,9 @@ async def test_main_success_survives_quote_timeout_with_one_shared_budget(
 
 
 @pytest.mark.asyncio
-async def test_provider_selection_and_retry_sleep_share_timeout(plugin_module):
+async def test_provider_selection_and_retry_sleep_share_timeout(media_plugin_module):
     context = Context()
-    service = make_service(plugin_module, context)
+    service = make_service(media_plugin_module, context)
     cancelled = []
 
     async def select(umo):
@@ -119,7 +115,7 @@ async def test_provider_selection_and_retry_sleep_share_timeout(plugin_module):
             cancelled.append(True)
 
     context.get_current_chat_provider_id = select
-    state = cycle_type(plugin_module)()
+    state = cycle_type(media_plugin_module)()
     assert await service.maybe_translate({"text": "正文"}, "session", state) == (
         None,
         None,
@@ -145,11 +141,11 @@ async def test_provider_selection_and_retry_sleep_share_timeout(plugin_module):
 
 @pytest.mark.asyncio
 async def test_cycle_skips_after_two_failures_but_manual_and_new_cycle_recover(
-    plugin_module,
+    media_plugin_module,
 ):
     context = Context()
-    service = make_service(plugin_module, context)
-    state = cycle_type(plugin_module)()
+    service = make_service(media_plugin_module, context)
+    state = cycle_type(media_plugin_module)()
     for _ in range(3):
         assert await service.maybe_translate({"text": "正文"}, "session", state) == (
             None,
@@ -164,7 +160,7 @@ async def test_cycle_skips_after_two_failures_but_manual_and_new_cycle_recover(
         "model",
     )
     assert state.failures == {"provider-a": 2}
-    fresh = cycle_type(plugin_module)()
+    fresh = cycle_type(media_plugin_module)()
     assert await service.maybe_translate({"text": "正文"}, "session", fresh) == (
         "译文",
         "model",
@@ -179,10 +175,10 @@ async def test_cycle_skips_after_two_failures_but_manual_and_new_cycle_recover(
 
 
 @pytest.mark.asyncio
-async def test_success_resets_counter_and_empty_tweets_do_not_count(plugin_module):
+async def test_success_resets_counter_and_empty_tweets_do_not_count(media_plugin_module):
     context = Context()
-    service = make_service(plugin_module, context)
-    state = cycle_type(plugin_module)()
+    service = make_service(media_plugin_module, context)
+    state = cycle_type(media_plugin_module)()
     await service.maybe_translate({"text": "正文"}, "session", state)
     await service.maybe_translate({"text": " "}, "session", state)
     assert state.failures == {"provider-a": 1}
@@ -197,16 +193,16 @@ async def test_success_resets_counter_and_empty_tweets_do_not_count(plugin_modul
 
 
 @pytest.mark.asyncio
-async def test_disabled_or_missing_provider_does_not_count(plugin_module):
+async def test_disabled_or_missing_provider_does_not_count(media_plugin_module):
     context = Context()
-    state = cycle_type(plugin_module)()
-    disabled = plugin_module.TweetMessageService(
-        context, object(), None, _message_settings(plugin_module)
+    state = cycle_type(media_plugin_module)()
+    disabled = media_plugin_module.TweetMessageService(
+        context, object(), None, _message_settings(media_plugin_module)
     )
     tweet = {"text": "正文", "quote": {"translated_text": "旧译文"}}
     assert await disabled.maybe_translate(tweet, "session", state) == (None, None)
     assert "translated_text" not in tweet["quote"]
-    service = make_service(plugin_module, context)
+    service = make_service(media_plugin_module, context)
     context.provider = None
     context.get_all_providers = lambda: []
     assert await service.maybe_translate(tweet, "session", state) == (None, None)
@@ -214,16 +210,16 @@ async def test_disabled_or_missing_provider_does_not_count(plugin_module):
 
 
 @pytest.mark.asyncio
-async def test_quote_only_translation_and_external_cancel(plugin_module):
+async def test_quote_only_translation_and_external_cancel(media_plugin_module):
     context = Context()
     context.block = False
-    service = make_service(plugin_module, context)
+    service = make_service(media_plugin_module, context)
     tweet = {"quote": {"text": "引用原文"}}
     assert await service.maybe_translate(tweet, "session") == (None, "model")
     assert tweet["quote"]["translated_text"] == "译文"
     context.block = True
     context.entered.clear()
-    state = cycle_type(plugin_module)()
+    state = cycle_type(media_plugin_module)()
     task = asyncio.create_task(
         service.maybe_translate({"text": "正文"}, "session", state)
     )
@@ -237,16 +233,16 @@ async def test_quote_only_translation_and_external_cancel(plugin_module):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failing_part", ["正文", "引用"])
 async def test_partial_failure_counts_once_and_keeps_successful_part(
-    plugin_module, monkeypatch, failing_part
+    media_plugin_module, monkeypatch, failing_part
 ):
     context = Context()
     service = make_service(
-        plugin_module,
+        media_plugin_module,
         context,
         translate_custom_prompt_enabled=True,
         translate_custom_prompt="翻译为{target_lang}",
     )
-    module = sys.modules[f"{plugin_module.__package__}.services.tweet_message_service"]
+    module = sys.modules[f"{media_plugin_module.__package__}.services.tweet_message_service"]
 
     async def no_delay(_seconds):
         pass
@@ -267,7 +263,7 @@ async def test_partial_failure_counts_once_and_keeps_successful_part(
         ),
     )
     context.llm_generate = generate
-    state = cycle_type(plugin_module)()
+    state = cycle_type(media_plugin_module)()
     tweet = {"text": "正文", "quote": {"text": "引用"}}
     text, model = await service.maybe_translate(tweet, "session", state)
     assert state.failures == {"provider-a": 1}
@@ -282,7 +278,7 @@ async def test_partial_failure_counts_once_and_keeps_successful_part(
 @pytest.mark.parametrize("provider", ["nitter", "fxtwitter"])
 @pytest.mark.parametrize("collective", [False, True])
 async def test_blocked_translation_still_delivers_and_commits_cursors(
-    plugin_module, monkeypatch, provider, collective
+    media_plugin_module, monkeypatch, provider, collective
 ):
     store = {
         "twitter_subs": {
@@ -341,27 +337,27 @@ async def test_blocked_translation_still_delivers_and_commits_cursors(
         pass
 
     polling_module = sys.modules[
-        f"{plugin_module.__package__}.services.polling_service"
+        f"{media_plugin_module.__package__}.services.polling_service"
     ]
     monkeypatch.setattr(
         polling_module, "asyncio", types.SimpleNamespace(sleep=no_delay)
     )
     api = API()
-    subscriptions = plugin_module.SubscriptionService(get_kv, put_kv, api, lambda: True)
-    messages = make_service(plugin_module, context, text_render_mode="text")
-    delivery = plugin_module.TweetDeliveryService(
+    subscriptions = media_plugin_module.SubscriptionService(get_kv, put_kv, api, lambda: True)
+    messages = make_service(media_plugin_module, context, text_render_mode="text")
+    delivery = media_plugin_module.TweetDeliveryService(
         context,
         subscriptions,
         messages,
         _delivery_settings(
-            plugin_module, use_node=collective, collective_forward=collective
+            media_plugin_module, use_node=collective, collective_forward=collective
         ),
     )
-    polling = plugin_module.PollingService(
+    polling = media_plugin_module.PollingService(
         api,
         subscriptions,
         delivery,
-        plugin_module.PollingSettings(True, provider, "https://nitter.test", ()),
+        media_plugin_module.PollingSettings(True, provider, "https://nitter.test", ()),
     )
     await asyncio.wait_for(polling.check_all(), 2)
     assert len(context.calls) == context.cancelled == 2
@@ -388,7 +384,7 @@ async def test_blocked_translation_still_delivers_and_commits_cursors(
     ("fxtwitter", None, (None, None)),
     ("nitter", {"text": "不可使用"}, (None, None)),
 ])
-async def test_native_translation_preserves_original_and_avoids_llm(plugin_module, provider, result, expected):
+async def test_native_translation_preserves_original_and_avoids_llm(media_plugin_module, provider, result, expected):
     context = Context()
     calls = []
 
@@ -396,7 +392,7 @@ async def test_native_translation_preserves_original_and_avoids_llm(plugin_modul
         calls.append(args)
         return result
 
-    service = make_service(plugin_module, context, translate_method="x")
+    service = make_service(media_plugin_module, context, translate_method="x")
     service.twitter_api = types.SimpleNamespace(provider=provider, get_tweet_translation=translate)
     tweet = {"username": "tester", "tweet_id": "123", "text": "original",
              "quote": {"text": "quote", "translated_text": "旧译文"}}
@@ -408,7 +404,7 @@ async def test_native_translation_preserves_original_and_avoids_llm(plugin_modul
 
 
 @pytest.mark.asyncio
-async def test_native_translation_timeout_keeps_original(plugin_module):
+async def test_native_translation_timeout_keeps_original(media_plugin_module):
     context = Context()
     cancelled = []
 
@@ -418,7 +414,7 @@ async def test_native_translation_timeout_keeps_original(plugin_module):
         finally:
             cancelled.append(True)
 
-    service = make_service(plugin_module, context, translate_method="x")
+    service = make_service(media_plugin_module, context, translate_method="x")
     service.twitter_api = types.SimpleNamespace(provider="fxtwitter", get_tweet_translation=translate)
     assert await service.maybe_translate({"text": "original"}, "session") == (None, None)
     assert cancelled == [True]

@@ -1,19 +1,15 @@
 """使用真实 SDK 检查 multipart 请求，不连接 Telegram 或发送真实消息。"""
 
+
+
 import base64
 import json
 import sys
 
 import httpx
 import pytest
-from test_platform_backoff import clock_for
-from test_telegram_support import (
-    TG_TOPIC,
-    Image,
-)
-from test_telegram_support import (
-    plugin_env as plugin_env,  # noqa: PLC0414 - 复用插件 fixture。
-)
+
+from support.fakes import clock_for, TG_TOPIC, Image
 
 telegram = pytest.importorskip("telegram")
 # 必须先检查可选依赖；缺失时跳过本模块，再导入 SDK。

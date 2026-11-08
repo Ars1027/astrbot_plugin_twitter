@@ -1,66 +1,11 @@
 import asyncio
 import re
 import sys
-import types
 from dataclasses import replace
 
 import pytest
-from test_telegram_support import (
-    TG_GROUP,
-    TG_PRIVATE,
-    TG_TOPIC,
-    Image,
-    Plain,
-    make_event,
-)
-from test_telegram_support import (
-    plugin_env as plugin_env,  # noqa: PLC0414 - 复用其他测试模块的 fixture。
-)
 
-
-@pytest.fixture
-def albums(plugin_env, monkeypatch, tmp_path):
-    module, make, data, ordinary, _fail = plugin_env
-    sent = []
-    converted = []
-
-    class InputMediaPhoto:
-        def __init__(self, *, media, caption, parse_mode):
-            self.media = media
-            self.caption = caption
-            self.parse_mode = parse_mode
-
-    monkeypatch.setitem(sys.modules, "telegram", types.SimpleNamespace(InputMediaPhoto=InputMediaPhoto))
-
-    async def convert(image):
-        converted.append(image)
-        path = tmp_path / f"{len(converted)}.png"
-        path.write_bytes(getattr(image, "data", b"image"))
-        return str(path)
-
-    monkeypatch.setattr(Image, "convert_to_file_path", convert, raising=False)
-
-    async def send_media_group(**payload):
-        sent.append(("album", payload))
-        return tuple(object() for _ in payload["media"])
-
-    async def send_photo(**payload):
-        sent.append(("photo", payload))
-        return object()
-
-    plugin = make()
-    client = plugin.context.platform_manager.platform_insts[0].client
-    client.send_media_group = send_media_group
-    client.send_photo = send_photo
-    message_module = sys.modules[f"{module.__package__}.services.tweet_message_service"]
-
-    def chain(images, *, body="", required=True, link="https://x.com/tester/status/101"):
-        return message_module.TweetMessageChain(
-            [*([Plain(body)] if body else []), *images, *([Plain(link)] if link else [])],
-            required_images=images if required else (),
-        )
-
-    return plugin, data, ordinary, sent, converted, client, chain
+from support.fakes import TG_GROUP, TG_PRIVATE, TG_TOPIC, Image, make_event
 
 
 @pytest.mark.asyncio
