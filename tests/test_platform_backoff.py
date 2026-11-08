@@ -78,7 +78,10 @@ async def test_telegram_limit_on_later_component_does_not_replay_successful_pref
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("text", ["a" * 9000, "🌿" * 4500, "a" * 4095 + "🌿" + "末尾"])
+@pytest.mark.parametrize(
+    "text", ["a" * 9000, "🌿" * 4500, "a" * 4095 + "🌿" + "末尾"],
+    ids=["long-ascii", "long-emoji", "utf16-boundary"],
+)
 async def test_telegram_long_text_is_split_before_retry_boundary(plugin_env, monkeypatch, text):
     plugin = plugin_env[1]()
     clock, _module = clock_for(plugin, monkeypatch)

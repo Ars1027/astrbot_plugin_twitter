@@ -16,8 +16,9 @@ from test_telegram_support import (
 )
 
 telegram = pytest.importorskip("telegram")
-from telegram.ext import ExtBot
-from telegram.request import BaseRequest, HTTPXRequest
+# 必须先检查可选依赖；缺失时跳过本模块，再导入 SDK。
+from telegram.ext import ExtBot  # noqa: E402
+from telegram.request import BaseRequest, HTTPXRequest  # noqa: E402
 
 
 class AlbumRequest(BaseRequest):

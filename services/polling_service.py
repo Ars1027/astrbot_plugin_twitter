@@ -96,7 +96,6 @@ class PollingService:
         username: str,
         tweet_id: str,
         recent_deliveries: tuple[RecentDelivery, ...] = (),
-        *, pending_tweet_items: list[dict] | None = None,
     ) -> None:
         """普通模式立即落盘，集体转发模式延迟到实际发送后。"""
         if getattr(self.delivery, "collective_enabled", False):
@@ -107,7 +106,6 @@ class PollingService:
             username,
             [tweet_id],
             tweet_id,
-            pending_tweet_items=pending_tweet_items,
             **({"recent_deliveries": recent_deliveries} if recent_deliveries else {}),
         )
         logger.debug(anchor("cursor.commit.result", author=username, tweet=tweet_id, accepted=bool(accepted)))
@@ -175,7 +173,6 @@ class PollingService:
                     username,
                     pending_tweet_ids.get(username, []),
                     tweet_id,
-                    pending_tweet_items=pending_tweet_items.get(username, []),
                     **({"recent_deliveries": tuple(
                         item for item in recent_deliveries if item.username == username
                     )} if recent_deliveries else {}),
@@ -370,7 +367,7 @@ class PollingService:
                     logger.info(
                         f"跳过 @{username} 已处理的重复推文: {tweet_id}"
                     )
-                    await self._record_processed_cursor(username, tweet_id, pending_tweet_items=new_tweet_items)
+                    await self._record_processed_cursor(username, tweet_id)
                     handled_count += 1
                     continue
 
@@ -466,7 +463,6 @@ class PollingService:
                 try:
                     await self._record_processed_cursor(
                         username, tweet_id, delivery_result.recent_deliveries,
-                        pending_tweet_items=new_tweet_items,
                     )
                 except (Exception, asyncio.CancelledError):
                     await self._save_partial_deliveries(
