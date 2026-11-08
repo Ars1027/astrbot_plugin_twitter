@@ -5,11 +5,18 @@ import copy
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import wraps
+from inspect import signature
 from typing import Any
+
+from astrbot.api import logger
+
+from ..twitter_diagnostics import anchor, exception_type_chain, reference
 
 
 KV_SUBS_KEY = "twitter_subs"
 KV_RETWEET_DEDUP_KEY = "twitter_retweet_dedup_seen"
+KV_TELEGRAM_GROUPS_KEY = "twitter_telegram_groups"
 RETWEET_DEDUP_MAX_ITEMS = 500
 PROCESSED_TWEET_MAX_ITEMS = 500
 PENDING_TWEET_MAX_ITEMS = 500
@@ -20,6 +27,51 @@ AGENT_RECENT_DELIVERY_MAX_LIMIT = 20
 KVGetter = Callable[[str, Any], Awaitable[Any]]
 KVSetter = Callable[[str, Any], Awaitable[None]]
 ProviderReady = Callable[[], bool]
+
+
+def subscription_audit(event: str):
+    """为管理入口统一记录结果；日志仅取白名单字段，不记录异常正文。"""
+    def decorate(operation):
+        parameters = signature(operation)
+
+        @wraps(operation)
+        async def run(*args, **kwargs):
+            values = parameters.bind(*args, **kwargs).arguments
+            fields = {}
+            if "umo" in values:
+                fields["target"] = reference(values["umo"])
+            if "username" in values:
+                fields["author"] = str(values["username"] or "").strip().lstrip("@")
+            try:
+                result = await operation(*args, **kwargs)
+            except (Exception, asyncio.CancelledError) as exc:
+                logger.warning("订阅操作未完成: " + anchor(
+                    f"subscription.{event}.failed", **fields,
+                    cancelled=isinstance(exc, asyncio.CancelledError),
+                    causes=exception_type_chain(exc),
+                ))
+                raise
+            if isinstance(result, dict):
+                fields.update({
+                    key: result[key] for key in (
+                        "ok", "reason", "created_author", "replaced", "author_removed", "authors", "relations",
+                    ) if key in result
+                })
+                if "username" in result:
+                    fields["author"] = result["username"]
+            else:
+                fields["affected"] = result
+            if event == "session_status":
+                fields["enabled"] = bool(values["enabled"])
+            if event == "update":
+                fields["changes"] = {
+                    key: bool(value) for key, value in values["changes"].items()
+                    if key in {"enabled", "r18", "media_only"}
+                }
+            logger.info("订阅操作结果: " + anchor(f"subscription.{event}.result", **fields))
+            return result
+        return run
+    return decorate
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +130,42 @@ class SubscriptionService:
         """获取不会被并发写入影响的订阅快照。"""
         async with self._lock:
             return copy.deepcopy(await self.get_all())
+
+    async def get_telegram_groups(self) -> dict:
+        """独立保存手动添加的群，即使还没有推主订阅也能在列表中显示。"""
+        async with self._lock:
+            data = await self._get_kv_data(KV_TELEGRAM_GROUPS_KEY, {})
+            return copy.deepcopy(data) if isinstance(data, dict) else {}
+
+    async def register_telegram_group(self, platform_id: str, group: dict) -> bool:
+        """保存已验证的群信息，返回是否首次添加；不更改订阅或轮询游标。"""
+        umo = f"{platform_id}:GroupMessage:{group['group_id']}"
+        async with self._lock:
+            data = await self._get_kv_data(KV_TELEGRAM_GROUPS_KEY, {})
+            groups = copy.deepcopy(data) if isinstance(data, dict) else {}
+            created = umo not in groups
+            groups[umo] = {
+                "group_id": group["group_id"], "group_name": group["group_name"],
+            }
+            await self._put_kv_data(KV_TELEGRAM_GROUPS_KEY, groups)
+            return created
+
+    async def remove_telegram_group(self, umo: str) -> dict:
+        """仅移除没有订阅的手动群记录，与订阅增删共享锁以防并发误删。"""
+        async with self._lock:
+            data = await self._get_kv_data(KV_TELEGRAM_GROUPS_KEY, {})
+            if not isinstance(data, dict) or umo not in data:
+                return {"ok": False, "reason": "not_found"}
+            subs = await self.get_all()
+            if any(
+                isinstance(author, dict) and umo in author.get("subscribers", {})
+                for author in subs.values()
+            ):
+                return {"ok": False, "reason": "has_subscriptions"}
+            groups = copy.deepcopy(data)
+            del groups[umo]
+            await self._put_kv_data(KV_TELEGRAM_GROUPS_KEY, groups)
+            return {"ok": True}
 
     @staticmethod
     def session_target(event: Any) -> str:
@@ -178,6 +266,7 @@ class SubscriptionService:
             None,
         )
 
+    @subscription_audit("add")
     async def add(
         self,
         umo: str,
@@ -219,6 +308,7 @@ class SubscriptionService:
                         session_config[field] = list(pending_ids)
                 subscribers[umo] = session_config
                 await self.save_all(subs)
+                self._log_subscription_cursor(umo, existing_key, author, source="existing")
                 return {
                     "ok": True,
                     "username": existing_key,
@@ -239,6 +329,10 @@ class SubscriptionService:
 
         latest_ids = await self.twitter_api.get_user_newtimeline(username)
         since_id = str(latest_ids[-1]) if latest_ids else ""
+        logger.info("首次订阅游标候选: " + anchor(
+            "subscription.cursor.selected", author=username, target=reference(umo),
+            since=since_id, returned_ids=len(latest_ids), strategy="initial_batch_max_id",
+        ))
         screen_name = str(user_info.get("screen_name") or username)
 
         # 网络请求期间可能已有另一个入口添加了同一推主，保存前再次检查。
@@ -266,6 +360,7 @@ class SubscriptionService:
                         session_config[field] = list(pending_ids)
                 subscribers[umo] = session_config
                 await self.save_all(subs)
+                self._log_subscription_cursor(umo, existing_key, author, source="concurrent_existing")
                 return {
                     "ok": True,
                     "username": existing_key,
@@ -284,6 +379,7 @@ class SubscriptionService:
                 "subscribers": {umo: session_config},
             }
             await self.save_all(subs)
+            self._log_subscription_cursor(umo, username, subs[username], source="new")
 
         return {
             "ok": True,
@@ -294,6 +390,19 @@ class SubscriptionService:
             "replaced": False,
         }
 
+    @staticmethod
+    def _log_subscription_cursor(umo: str, username: str, author: dict, *, source: str) -> None:
+        """只在成功持久化后记录最终游标，区分网络请求期间创建的并发订阅。"""
+        subscriber = author.get("subscribers", {}).get(umo, {})
+        logger.info("订阅已保存: " + anchor(
+            "subscription.cursor.saved", author=username, target=reference(umo), source=source,
+            since=str(author.get("since_id") or ""),
+            subscribers=len(author.get("subscribers", {})),
+            enabled=bool(subscriber.get("status", True)),
+            r18=bool(subscriber.get("r18", False)), media_only=bool(subscriber.get("media", False)),
+        ))
+
+    @subscription_audit("update")
     async def update(self, umo: str, username: str, changes: dict) -> dict:
         """修改单个会话中的订阅选项。"""
         async with self._lock:
@@ -540,23 +649,7 @@ class SubscriptionService:
                 if key is None:
                     continue
                 author_info = subs[key]
-                pending_items = self.pending_tweet_items(author_info)
-                known_ids = {item["tweet_id"] for item in pending_items}
-                for item in items:
-                    # 旧孤立回执的元数据尚未恢复，保留原回执作为重试入口。
-                    if item.get("metadata_missing"):
-                        continue
-                    tweet_id = str(item.get("tweet_id") or "")
-                    if tweet_id in known_ids or not is_uncommitted(username, tweet_id):
-                        continue
-                    pending_items.append({
-                        "tweet_id": tweet_id,
-                        "username": str(item.get("username") or username),
-                        "is_retweet": bool(item.get("is_retweet")),
-                        "retweeter_username": str(item.get("retweeter_username") or ""),
-                        "retweeter_screen_name": str(item.get("retweeter_screen_name") or ""),
-                    })
-                    known_ids.add(tweet_id)
+                pending_items = self._merge_pending_items(author_info, username, items)
                 if pending_items != author_info.get("pending_tweet_items", []):
                     if pending_items:
                         author_info["pending_tweet_items"] = pending_items
@@ -577,12 +670,36 @@ class SubscriptionService:
             if isinstance(item, dict) and str(item.get("tweet_id") or "").isdigit()
         ])
 
+    @classmethod
+    def _merge_pending_items(cls, author_info: dict, username: str, items: list[dict]) -> list[dict]:
+        """合并尚未提交的窗口，供失败保存和成功游标提交共用。"""
+        pending_items = cls.pending_tweet_items(author_info)
+        known_ids = {str(item["tweet_id"]) for item in pending_items}
+        cursor = str(author_info.get("since_id") or "")
+        for item in items:
+            # 元数据尚未恢复的旧条目仍由孤立回执提供重试入口。
+            tweet_id = str(item.get("tweet_id") or "")
+            if item.get("metadata_missing") or not tweet_id.isdigit() or tweet_id in known_ids:
+                continue
+            if cursor.isdigit() and int(tweet_id) <= int(cursor):
+                continue
+            pending_items.append({
+                "tweet_id": tweet_id,
+                "username": str(item.get("username") or username),
+                "is_retweet": bool(item.get("is_retweet")),
+                "retweeter_username": str(item.get("retweeter_username") or ""),
+                "retweeter_screen_name": str(item.get("retweeter_screen_name") or ""),
+            })
+            known_ids.add(tweet_id)
+        return pending_items
+
     async def record_delivery(self, umo: str, username: str, tweet_info: dict) -> None:
         """直接调用时持久化有界摘要，不更改轮询游标。"""
         delivery = self.prepare_delivery(umo, username, tweet_info)
         if delivery is not None:
             await self.save_recent_deliveries((delivery,))
 
+    @subscription_audit("remove")
     async def remove(self, umo: str, username: str) -> dict:
         """移除订阅关系，并清理没有订阅者的推主。"""
         async with self._lock:
@@ -605,6 +722,26 @@ class SubscriptionService:
                 "author_removed": author_removed,
             }
 
+    @subscription_audit("clear_session")
+    async def clear_session(self, umo: str) -> dict:
+        """一次写入清空指定会话；保留其他会话的配置、游标和重试状态。"""
+        async with self._lock:
+            subs = copy.deepcopy(await self.get_all())
+            relations = authors = 0
+            for username, author in list(subs.items()):
+                subscribers = author.get("subscribers", {})
+                if umo not in subscribers:
+                    continue
+                subscribers.pop(umo)
+                relations += 1
+                if not subscribers:
+                    subs.pop(username)
+                    authors += 1
+            if relations:
+                await self.save_all(subs)
+            return {"authors": authors, "relations": relations}
+
+    @subscription_audit("session_status")
     async def set_session_status(self, umo: str, enabled: bool) -> int:
         """统一修改一个会话中的全部推送状态。"""
         async with self._lock:
@@ -619,6 +756,7 @@ class SubscriptionService:
                 await self.save_all(subs)
             return count
 
+    @subscription_audit("clear")
     async def clear(self) -> dict:
         """清空全部订阅并返回清理前统计。"""
         async with self._lock:
@@ -701,8 +839,9 @@ class SubscriptionService:
         since_id: str,
         *,
         recent_deliveries: tuple[RecentDelivery, ...] = (),
+        pending_tweet_items: list[dict] | None = None,
     ) -> bool:
-        """一次 KV 写入提交已处理条目、单调游标及成功会话的历史。"""
+        """一次 KV 写入提交游标、历史及剩余窗口，避免限额尾部丢失。"""
         normalized_ids = [
             str(tweet_id).strip()
             for tweet_id in tweet_ids
@@ -753,14 +892,14 @@ class SubscriptionService:
                         else:
                             subscriber.pop(field, None)
                         changed = True
-            pending_items = self.pending_tweet_items(author_info)
+            pending_items = self._merge_pending_items(author_info, username, pending_tweet_items or [])
             remaining_items = [
                 item for item in pending_items
                 if str(item["tweet_id"]) not in committed_ids and not (
                     cursor_value is not None and int(item["tweet_id"]) <= cursor_value
                 )
             ]
-            if remaining_items != pending_items:
+            if remaining_items != author_info.get("pending_tweet_items", []):
                 if remaining_items:
                     author_info["pending_tweet_items"] = remaining_items
                 else:

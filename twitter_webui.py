@@ -7,11 +7,27 @@ from typing import Any
 from astrbot.api import logger
 from astrbot.api.web import error_response, json_response, request
 
+try:
+    from .services.platform_support import meta_value, platform_instances
+except ImportError:  # 作为顶层模块单独加载时，按文件路径定位同目录实现。
+    import importlib.util
+    from pathlib import Path
+
+    _SUPPORT_SPEC = importlib.util.spec_from_file_location(
+        "_twitter_platform_support",
+        Path(__file__).resolve().parent / "services" / "platform_support.py",
+    )
+    _SUPPORT_MODULE = importlib.util.module_from_spec(_SUPPORT_SPEC)
+    _SUPPORT_SPEC.loader.exec_module(_SUPPORT_MODULE)
+    meta_value = _SUPPORT_MODULE.meta_value
+    platform_instances = _SUPPORT_MODULE.platform_instances
+
 
 PLUGIN_NAME = "astrbot_plugin_twitter"
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 MESSAGE_TYPES = {"GroupMessage", "FriendMessage", "OtherMessage"}
 GROUP_LIST_TIMEOUT_SECONDS = 6
+TELEGRAM_GROUP_VERIFY_CONCURRENCY = 4
 
 
 class TwitterWebUIController:
@@ -25,6 +41,8 @@ class TwitterWebUIController:
     def _register_routes(self) -> None:
         routes = (
             ("overview", self.overview, ["GET"], "Twitter 订阅概览"),
+            ("groups/telegram/add", self.add_telegram_group, ["POST"], "验证并添加 Telegram 群聊"),
+            ("groups/telegram/remove", self.remove_telegram_group, ["POST"], "移除空的 Telegram 手动群聊"),
             (
                 "subscriptions/recent",
                 self.recent_deliveries,
@@ -61,6 +79,12 @@ class TwitterWebUIController:
                 ["POST"],
                 "移除 Twitter 订阅",
             ),
+            (
+                "subscriptions/group-clear",
+                self.clear_group_subscriptions,
+                ["POST"],
+                "清空指定群聊的 Twitter 订阅",
+            ),
         )
         for endpoint, handler, methods, description in routes:
             self.context.register_web_api(
@@ -72,9 +96,7 @@ class TwitterWebUIController:
 
     @staticmethod
     def _meta_value(meta: Any, field: str, default: str = "") -> str:
-        if isinstance(meta, dict):
-            return str(meta.get(field) or default)
-        return str(getattr(meta, field, None) or default)
+        return meta_value(meta, field, default)
 
     @staticmethod
     def _parse_umo(value: Any) -> tuple[str, str, str] | None:
@@ -111,27 +133,26 @@ class TwitterWebUIController:
         }
 
     def _platform_instances(self) -> list[Any]:
-        manager = getattr(self.context, "platform_manager", None)
-        if manager is None:
-            return []
-        instances = getattr(manager, "platform_insts", None)
-        if instances is None:
-            get_insts = getattr(manager, "get_insts", None)
-            instances = get_insts() if callable(get_insts) else []
-        return list(instances or [])
+        return platform_instances(self.context)
 
     def _aiocqhttp_platforms(self) -> list[Any]:
+        return self._supported_platforms({"aiocqhttp"})
+
+    def _supported_platforms(self, names=None) -> list[Any]:
+        names = names or {"aiocqhttp", "telegram"}
         result = []
         for platform in self._platform_instances():
             try:
                 meta = platform.meta()
             except Exception:
                 continue
-            if self._meta_value(meta, "name").casefold() == "aiocqhttp":
+            if self._meta_value(meta, "name").casefold() in names:
                 result.append(platform)
         return result
 
     async def _fetch_platform_groups(self, platform: Any) -> dict:
+        if self._meta_value(platform.meta(), "name") == "telegram":
+            return await self._fetch_telegram_groups(platform)
         meta = platform.meta()
         platform_id = self._meta_value(meta, "id")
         platform_label = self._meta_value(meta, "name", "aiocqhttp")
@@ -179,8 +200,104 @@ class TwitterWebUIController:
             logger.warning(f"获取 QQ 群列表失败 ({platform_id}): {exc}")
         return result
 
+    async def _telegram_chat(self, platform: Any, chat_id: str) -> str:
+        """校验真实群和机器人身份，返回群标题；chat_id 不含话题号。"""
+        if not re.fullmatch(r"-[1-9]\d*", chat_id):
+            raise ValueError("Telegram 群 ID 格式不正确")
+        numeric_id = int(chat_id)
+        client = platform.get_client()
+        chat = await client.get_chat(chat_id=numeric_id)
+        member = await client.get_chat_member(chat_id=numeric_id, user_id=client.id)
+        if str(chat.type) not in {"group", "supergroup"}:
+            raise ValueError("目标不是 Telegram 群聊")
+        if str(member.status) in {"left", "kicked"} or (
+            str(member.status) == "restricted" and not getattr(member, "is_member", False)
+        ):
+            raise ValueError("机器人当前不在这个 Telegram 群聊中")
+        if str(member.status) == "restricted" and not getattr(member, "can_send_messages", False):
+            raise ValueError("机器人当前没有 Telegram 群聊发言权限")
+        return str(chat.title or numeric_id)
+
+    async def _telegram_group(self, platform: Any, session_id: str) -> dict:
+        """检查真实群和机器人身份；保留 AstrBot 的 chat_id#topic_id 路由。"""
+        if not re.fullmatch(r"-[1-9]\d*(?:#[1-9]\d*)?", session_id):
+            raise ValueError("Telegram 群 ID 格式不正确")
+        chat_id, separator, topic_id = session_id.partition("#")
+        title = await self._telegram_chat(platform, chat_id)
+        if separator:
+            title += f" · 话题 {topic_id}"
+        return {"group_id": session_id, "group_name": title}
+
+    async def _fetch_telegram_groups(self, platform: Any) -> dict:
+        platform_id = self._meta_value(platform.meta(), "id")
+        result = {
+            "platform_id": platform_id, "platform_name": "telegram",
+            "available": True, "error": None, "groups": [],
+        }
+        subs = await self.plugin._get_subscriptions_snapshot()
+        registered = await self.plugin.subscription_service.get_telegram_groups()
+        session_ids = set()
+        registered_by_id = {}
+        for umo, group in registered.items():
+            parsed = self._parse_umo(umo)
+            if parsed and parsed[:2] == (platform_id, "GroupMessage") and isinstance(group, dict):
+                session_ids.add(parsed[2])
+                registered_by_id[parsed[2]] = group
+        for author in subs.values():
+            if not isinstance(author, dict):
+                continue
+            subscribers = author.get("subscribers", {})
+            if not isinstance(subscribers, dict):
+                continue
+            for umo in subscribers:
+                parsed = self._parse_umo(umo)
+                if parsed and parsed[:2] == (platform_id, "GroupMessage"):
+                    session_ids.add(parsed[2])
+
+        # 同一群的多个话题共用一次校验，避免按话题重复请求 Telegram。
+        chats: dict[str, list[tuple[str, str]]] = {}
+        for session_id in sorted(session_ids):
+            chat_id, separator, topic_id = session_id.partition("#")
+            chats.setdefault(chat_id, []).append((session_id, topic_id if separator else ""))
+
+        semaphore = asyncio.Semaphore(TELEGRAM_GROUP_VERIFY_CONCURRENCY)
+
+        async def verify(chat_id: str) -> str:
+            async with semaphore:
+                return await asyncio.wait_for(
+                    self._telegram_chat(platform, chat_id),
+                    timeout=GROUP_LIST_TIMEOUT_SECONDS,
+                )
+
+        verified = await asyncio.gather(
+            *(verify(chat_id) for chat_id in chats),
+            return_exceptions=True,
+        )
+        for (chat_id, entries), outcome in zip(chats.items(), verified):
+            if isinstance(outcome, asyncio.CancelledError):
+                raise outcome
+            if isinstance(outcome, Exception):
+                # 不回传 SDK 异常，避免错误消息包含 Bot Token。
+                result["available"] = False
+                result["error"] = "部分 Telegram 群聊暂时无法访问"
+                for session_id, _topic in entries:
+                    if session_id in registered_by_id:
+                        result["groups"].append({
+                            "group_id": session_id,
+                            "group_name": str(
+                                registered_by_id[session_id].get("group_name") or session_id
+                            ),
+                            "available": False,
+                        })
+                continue
+            base_title = str(outcome) or chat_id
+            for session_id, topic_id in entries:
+                group_name = f"{base_title} · 话题 {topic_id}" if topic_id else base_title
+                result["groups"].append({"group_id": session_id, "group_name": group_name})
+        return result
+
     async def _load_group_sources(self) -> list[dict]:
-        platforms = self._aiocqhttp_platforms()
+        platforms = self._supported_platforms()
         if not platforms:
             return []
         return list(
@@ -198,9 +315,10 @@ class TwitterWebUIController:
         return f"{labels.get(message_type, message_type)} {session_id}"
 
     async def _build_overview(self) -> dict:
-        subs, group_sources = await asyncio.gather(
+        subs, group_sources, registered = await asyncio.gather(
             self.plugin._get_subscriptions_snapshot(),
             self._load_group_sources(),
+            self.plugin.subscription_service.get_telegram_groups(),
         )
 
         session_subscriptions: dict[str, list[dict]] = {}
@@ -231,9 +349,19 @@ class TwitterWebUIController:
                     "platform_id": platform_id,
                     "group_id": group["group_id"],
                     "group_name": group["group_name"] or f"群聊 {group['group_id']}",
-                    "available": True,
+                    "available": bool(group.get("available", True)),
                     "subscriptions": [],
                 }
+
+        # 平台暂未加载时，也保留已经验证并手动添加过的空群。
+        for umo, group in registered.items():
+            parsed = self._parse_umo(umo)
+            if parsed and parsed[1] == "GroupMessage" and isinstance(group, dict):
+                groups_by_umo.setdefault(umo, {
+                    "umo": umo, "platform_id": parsed[0], "group_id": parsed[2],
+                    "group_name": str(group.get("group_name") or f"群聊 {parsed[2]}"),
+                    "available": False, "subscriptions": [],
+                })
 
         other_sessions = []
         for umo, rows in session_subscriptions.items():
@@ -278,6 +406,7 @@ class TwitterWebUIController:
 
         groups = list(groups_by_umo.values())
         for group in groups:
+            group["manually_added"] = group["umo"] in registered
             group["subscriptions"].sort(key=lambda row: row["username"].casefold())
         for session in other_sessions:
             session["subscriptions"].sort(
@@ -322,6 +451,10 @@ class TwitterWebUIController:
             ],
             "groups": groups,
             "other_sessions": other_sessions,
+            "telegram_platforms": [
+                {"id": source["platform_id"], "label": source["platform_id"]}
+                for source in group_sources if source["platform_name"] == "telegram"
+            ],
         }
 
     @staticmethod
@@ -340,13 +473,34 @@ class TwitterWebUIController:
         platform = next(
             (
                 item
-                for item in self._aiocqhttp_platforms()
+                for item in self._supported_platforms()
                 if self._meta_value(item.meta(), "id") == platform_id
             ),
             None,
         )
         if platform is None:
-            return "未找到对应的 aiocqhttp 平台实例", 400
+            return "未找到对应的 QQ 或 Telegram 平台实例", 400
+
+        if self._meta_value(platform.meta(), "name") == "telegram":
+            # Bot API 不能枚举或验证任意话题，话题只能从已建立的订阅中选择。
+            if "#" in session_id:
+                subs = await self.plugin._get_subscriptions_snapshot()
+                umo = ":".join(parsed_umo)
+                if not any(
+                    isinstance(author, dict) and umo in author.get("subscribers", {})
+                    for author in subs.values()
+                ):
+                    return "请先在目标 Telegram 话题内通过指令建立订阅", 400
+            try:
+                await asyncio.wait_for(
+                    self._telegram_group(platform, session_id),
+                    timeout=GROUP_LIST_TIMEOUT_SECONDS,
+                )
+            except ValueError as exc:
+                return str(exc), 400
+            except Exception:  # noqa: BLE001 - SDK 异常可能带鉴权 URL，只返回固定错误。
+                return "暂时无法确认 Telegram 群聊或机器人身份", 503
+            return None
 
         source = await self._fetch_platform_groups(platform)
         if not source["available"]:
@@ -361,6 +515,63 @@ class TwitterWebUIController:
         except Exception as exc:
             logger.exception(f"生成 Twitter 订阅概览失败: {exc}")
             return error_response("读取订阅数据失败", status_code=500)
+
+    async def add_telegram_group(self):
+        payload = await self._payload()
+        if payload is None:
+            return error_response("请求内容必须是 JSON 对象", status_code=400)
+        platform_id = payload.get("platform_id")
+        group_id = payload.get("group_id")
+        if not isinstance(platform_id, str) or not isinstance(group_id, str):
+            return error_response("请选择 Telegram 机器人并填写群 ID", status_code=400)
+        group_id = group_id.strip()
+        if len(group_id) > 32 or not re.fullmatch(r"-[1-9]\d*", group_id):
+            return error_response("请填写负数群 ID，例如 -1001234567890；话题请在聊天中建立订阅", status_code=400)
+        platform = next((
+            item for item in self._supported_platforms({"telegram"})
+            if self._meta_value(item.meta(), "id") == platform_id
+        ), None)
+        if platform is None:
+            return error_response("未找到对应的 Telegram 平台实例", status_code=400)
+        try:
+            group = await asyncio.wait_for(
+                self._telegram_group(platform, group_id), timeout=GROUP_LIST_TIMEOUT_SECONDS,
+            )
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        except Exception:  # noqa: BLE001 - Telegram SDK 异常可能包含鉴权 URL。
+            return error_response("无法确认机器人是否在群内，请检查群 ID、机器人入群情况和网络后重试", status_code=503)
+        try:
+            created = await self.plugin.subscription_service.register_telegram_group(platform_id, group)
+        except Exception:  # noqa: BLE001 - KV 写入失败不能作为添加成功返回。
+            logger.error("保存手动添加的 Telegram 群聊失败")
+            return error_response("群聊验证通过，但保存失败，请重试", status_code=500)
+        return json_response({
+            "saved": True, "created": created,
+            "umo": f"{platform_id}:GroupMessage:{group_id}",
+            **group,
+        })
+
+    async def remove_telegram_group(self):
+        payload = await self._payload()
+        if payload is None:
+            return error_response("请求内容必须是 JSON 对象", status_code=400)
+        parsed = self._parse_umo(payload.get("umo"))
+        if (
+            parsed is None or parsed[1] != "GroupMessage"
+            or len(parsed[2]) > 32 or not re.fullmatch(r"-[1-9]\d*", parsed[2])
+        ):
+            return error_response("Telegram 群聊 UMO 格式不正确", status_code=400)
+        try:
+            result = await self.plugin.subscription_service.remove_telegram_group(payload["umo"])
+        except Exception:  # noqa: BLE001 - KV 保存失败不能当作删除成功。
+            logger.error("删除手动添加的 Telegram 群聊失败")
+            return error_response("群聊删除失败，请重试", status_code=500)
+        if result.get("reason") == "has_subscriptions":
+            return error_response("请先移除该群的全部订阅，再删除群组", status_code=409)
+        if not result["ok"]:
+            return error_response("未找到手动添加的 Telegram 群组，请刷新列表", status_code=404)
+        return json_response({"removed": True, "umo": payload["umo"]})
 
     async def recent_deliveries(self):
         payload = await self._payload()
@@ -489,6 +700,20 @@ class TwitterWebUIController:
         if not count:
             return error_response("这个群当前没有订阅", status_code=404)
         return json_response({"saved": True, "updated": count})
+
+    async def clear_group_subscriptions(self):
+        payload = await self._payload()
+        if payload is None:
+            return error_response("请求内容必须是 JSON 对象", status_code=400)
+        parsed = self._parse_umo(payload.get("umo"))
+        if parsed is None or parsed[1] != "GroupMessage":
+            return error_response("群聊 UMO 格式不正确", status_code=400)
+        try:
+            result = await self.plugin.subscription_service.clear_session(payload["umo"])
+        except Exception:  # noqa: BLE001 - 保存失败不能当作清空成功。
+            logger.error("WebUI 清空群聊订阅失败")
+            return error_response("清空订阅失败，请重试", status_code=500)
+        return json_response({"saved": True, "removed": result["relations"]})
 
     async def remove_subscription(self):
         payload = await self._payload()

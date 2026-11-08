@@ -25,6 +25,7 @@ from .services import (
     TweetMessageSettings,
 )
 from .services.avatar_cache_service import AvatarCacheService
+from .services.platform_support import is_telegram_event, meta_value, platform_instances
 from .twitter_api import (
     DATA_PROVIDER_FXTWITTER,
     DATA_PROVIDER_NITTER,
@@ -269,6 +270,10 @@ class TwitterPlugin(Star):
                 )
             ),
         )
+        self.telegram_video_max_size_mb = max(
+            1,
+            int(self._cfg("message_format", "twitter_telegram_video_max_size_mb", 50)),
+        )
         self.collective_max_authors = max(
             1,
             int(
@@ -406,6 +411,7 @@ class TwitterPlugin(Star):
                 collective_forward=self.collective_forward,
                 collective_max_authors=self.collective_max_authors,
                 deduplicate_retweets=self.deduplicate_retweets,
+                telegram_video_max_size_mb=self.telegram_video_max_size_mb,
             ),
         )
         self.polling_service = PollingService(
@@ -530,20 +536,16 @@ class TwitterPlugin(Star):
     # WebUI 与现有调用方使用的兼容委托。
     async def _migrate_group_subscriptions(self) -> bool:
         """平台实例可用后迁移旧 QQ 订阅；未就绪时由后续轮询重试。"""
-        manager = getattr(self.context, "platform_manager", None)
-        instances = getattr(manager, "platform_insts", None)
-        if instances is None:
-            get_insts = getattr(manager, "get_insts", None)
-            instances = get_insts() if callable(get_insts) else []
+        instances = platform_instances(self.context)
         if not instances:
             return False
-        platform_ids = set()
-        for platform in instances:
-            meta = platform.meta()
-            name = meta.get("name") if isinstance(meta, dict) else getattr(meta, "name", None)
-            platform_id = meta.get("id") if isinstance(meta, dict) else getattr(meta, "id", None)
-            if name == "aiocqhttp" and platform_id:
-                platform_ids.add(str(platform_id))
+        platform_ids = {
+            platform_id
+            for platform in instances
+            if meta_value(platform.meta(), "name") == "aiocqhttp"
+            for platform_id in [meta_value(platform.meta(), "id")]
+            if platform_id
+        }
         count = await self.subscription_service.migrate_qq_group_sessions(platform_ids)
         if count:
             logger.info(f"已将 {count} 个 QQ 成员会话订阅归并到真实群聊")
@@ -667,7 +669,9 @@ class TwitterPlugin(Star):
                     self._poll_wakeup.wait(),
                     timeout=self.poll_interval * 60,
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:
+                # Python 3.10 的 asyncio.TimeoutError 不是内置 TimeoutError，
+                # 必须显式捕获，否则轮询任务会在第一次等待超时后退出。
                 return
 
     async def _poll_tweets(self) -> None:
@@ -942,9 +946,15 @@ class TwitterPlugin(Star):
             yield event.plain_result("当前没有订阅任何推主")
             return
 
+        chunks = self._subscription_list_chunks(lines)
+        if is_telegram_event(event):
+            for text in chunks:
+                yield event.plain_result(text)
+            return
+
         nodes = [
             Node(content=[Plain(text)], name="推特订阅列表", uin=event.get_self_id())
-            for text in self._subscription_list_chunks(lines)
+            for text in chunks
         ]
         yield event.chain_result([Nodes(nodes)])
 
@@ -1041,6 +1051,7 @@ class TwitterPlugin(Star):
             tweet_info,
             translated_text=translated_text,
             translate_model=translate_model,
+            video_max_size_mb=(self.telegram_video_max_size_mb if is_telegram_event(event) else None),
         )
         if not chain:
             yield event.plain_result(f"未找到 @{username} 的推文内容")
@@ -1057,9 +1068,16 @@ class TwitterPlugin(Star):
         prepared = self.delivery_service.prepare_event_delivery(
             chain,
             nickname,
+            **({"use_node": False} if is_telegram_event(event) else {}),
         )
         if prepared.primary_chain:
-            yield event.chain_result(prepared.primary_chain)
+            if is_telegram_event(event):
+                if not await self.delivery_service.send_telegram_tweet(
+                    umo, prepared.primary_chain, username, tweet_info,
+                ):
+                    yield event.plain_result("推文主要内容发送失败，请稍后重试")
+            else:
+                yield event.chain_result(prepared.primary_chain)
         else:
             yield event.plain_result(f"未找到 @{username} 的推文内容")
         await self.delivery_service.send_prepared_videos(
@@ -1098,6 +1116,7 @@ class TwitterPlugin(Star):
                 {"r18": True, "media": False, "status": True},
                 translated_text=translated_text,
                 translate_model=translate_model,
+                video_max_size_mb=(self.telegram_video_max_size_mb if is_telegram_event(event) else None),
             )
             if not chain:
                 if report_errors:
@@ -1115,9 +1134,16 @@ class TwitterPlugin(Star):
             prepared = self.delivery_service.prepare_event_delivery(
                 chain,
                 nickname,
+                **({"use_node": False} if is_telegram_event(event) else {}),
             )
             if prepared.primary_chain:
-                yield event.chain_result(prepared.primary_chain)
+                if is_telegram_event(event):
+                    if not await self.delivery_service.send_telegram_tweet(
+                        umo, prepared.primary_chain, username, tweet_info,
+                    ) and report_errors:
+                        yield event.plain_result("推文主要内容发送失败，请稍后重试")
+                else:
+                    yield event.chain_result(prepared.primary_chain)
             elif report_errors and not prepared.videos:
                 yield event.plain_result("未找到可发送的推文内容")
             await self.delivery_service.send_prepared_videos(

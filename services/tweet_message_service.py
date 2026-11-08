@@ -6,6 +6,7 @@ import json
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Any
 
 from astrbot.api import logger
@@ -18,6 +19,7 @@ from ..twitter_renderer import (
     tweet_card_page_contexts,
 )
 from .avatar_cache_service import AvatarCacheService
+from ..twitter_diagnostics import anchor, exception_type_chain, reference
 from ..twitter_article import article_text
 
 
@@ -131,20 +133,25 @@ class TweetMessageService:
         self,
         video_url: str,
         size_bytes: int | None = None,
+        *,
+        video_max_size_mb: int | None = None,
     ) -> str:
         """构建超限视频降级为链接时展示给用户的文本。"""
         size_note = ""
         if size_bytes:
             size_mb = size_bytes / 1024 / 1024
             size_note = f"（约 {size_mb:.1f} MB）"
+        limit = self.settings.video_max_size_mb if video_max_size_mb is None else video_max_size_mb
         return (
-            f"\n视频大小超过 {self.settings.video_max_size_mb} MB{size_note}，"
+            f"\n视频大小超过 {limit} MB{size_note}，"
             f"已改为发送链接：{video_url}"
         )
 
     async def video_exceeds_size_limit(
         self,
         video_url: str,
+        *,
+        video_max_size_mb: int | None = None,
     ) -> tuple[bool, int | None]:
         """尽量检查视频大小；未知大小和流媒体 URL 默认放行。"""
         if self.is_stream_video_url(video_url):
@@ -154,7 +161,8 @@ class TweetMessageService:
         if size_bytes is None:
             return False, None
 
-        limit_bytes = self.settings.video_max_size_mb * 1024 * 1024
+        limit = self.settings.video_max_size_mb if video_max_size_mb is None else video_max_size_mb
+        limit_bytes = limit * 1024 * 1024
         return size_bytes > limit_bytes, size_bytes
 
     async def append_media_components(
@@ -163,6 +171,8 @@ class TweetMessageService:
         images: list,
         videos: list,
         context_label: str = "推文",
+        *,
+        video_max_size_mb: int | None = None,
     ) -> None:
         """把图片和视频追加到消息链，供主贴和引用帖复用。"""
         if not self.settings.send_media_separately:
@@ -180,7 +190,7 @@ class TweetMessageService:
             video_url = str(video)
             try:
                 exceeds_limit, size_bytes = await self.video_exceeds_size_limit(
-                    video_url
+                    video_url, video_max_size_mb=video_max_size_mb,
                 )
                 if exceeds_limit:
                     logger.warning(
@@ -188,7 +198,9 @@ class TweetMessageService:
                     )
                     chain.append(
                         Comp.Plain(
-                            str(self.video_limit_message(video_url, size_bytes))
+                            str(self.video_limit_message(
+                                video_url, size_bytes, video_max_size_mb=video_max_size_mb,
+                            ))
                         )
                     )
                     continue
@@ -215,8 +227,13 @@ class TweetMessageService:
             return Comp.Image.fromURL(img_url)
 
         try:
+            started = perf_counter()
             data = await self.twitter_api.download_media(img_url)
         except Exception as exc:
+            logger.debug(anchor(
+                "image.download.failed", media=reference(img_url), causes=exception_type_chain(exc),
+                elapsed=round(perf_counter() - started, 2),
+            ))
             logger.warning(
                 f"通过代理下载图片失败 {img_url}: {exc}，回退为远程 URL"
             )
@@ -491,6 +508,8 @@ class TweetMessageService:
         sub_config: dict | None = None,
         translated_text: str | None = None,
         translate_model: str | None = None,
+        *,
+        video_max_size_mb: int | None = None,
     ) -> list:
         """构建纯文本模式下的推文消息链。"""
         if sub_config is None:
@@ -535,6 +554,7 @@ class TweetMessageService:
 
         await self.append_media_components(
             chain, tweet_info.get("images") or [], tweet_info.get("videos") or [],
+            video_max_size_mb=video_max_size_mb,
         )
 
         if quote:
@@ -553,6 +573,7 @@ class TweetMessageService:
             await self.append_media_components(
                 chain, quote.get("images") or [], quote.get("videos") or [],
                 context_label="引用推文",
+                video_max_size_mb=video_max_size_mb,
             )
 
         if tweet_id and self.settings.include_tweet_link:
@@ -608,6 +629,8 @@ class TweetMessageService:
         sub_config: dict | None = None,
         translated_text: str | None = None,
         translate_model: str | None = None,
+        *,
+        video_max_size_mb: int | None = None,
     ) -> list:
         """按当前文本渲染模式构建推文消息链。"""
         if self.settings.text_render_mode != "screenshot":
@@ -617,6 +640,7 @@ class TweetMessageService:
                 sub_config,
                 translated_text=translated_text,
                 translate_model=translate_model,
+                video_max_size_mb=video_max_size_mb,
             )
 
         try:
@@ -626,15 +650,20 @@ class TweetMessageService:
                 sub_config,
                 translated_text=translated_text,
                 translate_model=translate_model,
+                video_max_size_mb=video_max_size_mb,
             )
         except Exception as exc:
-            logger.warning(f"推文截图渲染失败，已回退为文本消息: {exc}")
+            logger.warning(
+                f"推文截图渲染失败，已回退为文本消息: {exception_type_chain(exc)}; "
+                f"{anchor('render.fallback', author=username, tweet=str(tweet_info.get('tweet_id') or ''))}"
+            )
             return await self.build_tweet_chain(
                 username,
                 tweet_info,
                 sub_config,
                 translated_text=translated_text,
                 translate_model=translate_model,
+                video_max_size_mb=video_max_size_mb,
             )
 
     async def build_screenshot_tweet_chain(
@@ -644,6 +673,8 @@ class TweetMessageService:
         sub_config: dict | None = None,
         translated_text: str | None = None,
         translate_model: str | None = None,
+        *,
+        video_max_size_mb: int | None = None,
     ) -> list:
         """构建正文以 X 风格卡片截图展示的消息链。"""
         if sub_config is None:
@@ -665,7 +696,8 @@ class TweetMessageService:
                 theme=self.settings.screenshot_theme,
                 include_tweet_link=self.settings.include_tweet_link,
             )
-            for page_context in tweet_card_page_contexts(context):
+            pages = tweet_card_page_contexts(context)
+            for page_number, page_context in enumerate(pages, 1):
                 rendered_url = await self.html_render(
                     load_tweet_card_template(), page_context,
                     options=tweet_card_render_options(page_context),
@@ -678,24 +710,26 @@ class TweetMessageService:
 
         link_comp = self.tweet_link_component(tweet_info, username)
         if link_comp is not None:
-            if chain:
-                chain.append(Comp.Plain("\n"))
+            # TG 逐组件发送，独立的换行会成为空消息并触发截图降级重发。
             chain.append(link_comp)
 
-        await self.append_tweet_media(chain, tweet_info)
+        await self.append_tweet_media(chain, tweet_info, video_max_size_mb=video_max_size_mb)
 
         return TweetMessageChain(
             [component for component in chain if component is not None],
             required_images=required_images,
         )
 
-    async def append_tweet_media(self, chain: list, tweet_info: dict) -> None:
+    async def append_tweet_media(
+        self, chain: list, tweet_info: dict, *, video_max_size_mb: int | None = None,
+    ) -> None:
         """按主帖、引用帖的顺序追加截图外的附加媒体。"""
         for part, label in ((tweet_info, "推文"), (tweet_info.get("quote"), "引用推文")):
             if part:
                 await self.append_media_components(
                     chain, part.get("images") or [], part.get("videos") or [],
                     context_label=label,
+                    video_max_size_mb=video_max_size_mb,
                 )
 
     async def prepare_screenshot_media(self, tweet_info: dict) -> dict:
