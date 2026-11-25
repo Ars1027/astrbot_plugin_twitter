@@ -171,12 +171,15 @@ class FxTwitterProviderMixin:
 
         user_name = str(user.get("screen_name") or username).strip().lstrip("@")
         screen_name = str(user.get("name") or user_name).strip()
-        return {
+        profile = {
             "status": bool(user_name),
             "screen_name": screen_name,
             "bio": str(user.get("description") or ""),
             "user_name": user_name or username,
         }
+        if "followers" in user:
+            profile["followers"] = user["followers"]
+        return profile
 
     @staticmethod
     def _flatten_fxtwitter_results(results: list) -> list[dict]:
