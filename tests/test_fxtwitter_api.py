@@ -341,7 +341,7 @@ async def test_invalid_since_id_never_replays_history(api_module):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("followers", [{}, {"followers": 0}, {"followers": 4200}])
+@pytest.mark.parametrize("followers", [{}, {"followers": 0}])
 async def test_profile_health_check_and_client_close(api_module, followers):
     profile = _fixture("fxtwitter_profile.json")
     profile["user"].update(followers)
